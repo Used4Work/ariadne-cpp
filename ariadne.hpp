@@ -147,7 +147,7 @@ struct ProviderConfig {
     }
     static ProviderConfig github_models(const std::string& token,
                                          const std::string& model = "openai/gpt-4o-mini",
-                                         double max_rps = 0.25) {  // 15 RPM default
+                                         double max_rps = 0.1) {  // 6 RPM per tier (safe under GH Models limits)  // 15 RPM default
         ProviderConfig c;
         c.type             = ProviderType::OPENAI_CHAT;
         c.api_key          = token;
@@ -439,8 +439,9 @@ struct Step {
     ModelTier                model_tier  = ModelTier::SUBAGENT;
     // ── LLM step extensions ──────────────────────────────
     std::string              system_prompt;   ///< per-step system prompt (LLM steps)
-    bool                     json_mode = false; ///< force JSON output from LLM
-    json                     output_schema;   ///< JSON schema to validate LLM output against
+    bool                     json_mode = false;    ///< force JSON output from LLM
+    json                     output_schema;      ///< JSON schema to validate LLM output against
+    double                   temperature = -1.0; ///< LLM temperature (-1 = use provider default)
 };
 
 struct WorkflowPlan {
@@ -556,15 +557,15 @@ public:
                                const WorkflowContext& ctx = {},
                                int max_attempts = 3) const;
 
-    /** @deprecated 保留向下兼容；内部调用 plan() */
-    json         analyze_task(const std::string& task,
+    /** @deprecated since v0.2.0 — use plan() directly */
+    [[deprecated("use plan() instead")]] json analyze_task(const std::string& task,
                                const std::vector<ToolDef>& tools,
                                const WorkflowContext& ctx = {}) const;
-    WorkflowPlan plan_static (const std::string& task,
+    [[deprecated("use plan() instead")]] WorkflowPlan plan_static(const std::string& task,
                                const json& analysis,
                                const std::vector<ToolDef>& tools,
                                int max_attempts = 3) const;
-    WorkflowPlan replan      (const std::string& task,
+    [[deprecated("use plan() instead")]] WorkflowPlan replan(const std::string& task,
                                const WorkflowPlan& current,
                                const std::vector<json>& failures) const;
 
