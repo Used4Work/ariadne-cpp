@@ -213,10 +213,28 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
             { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
             return res;
         } catch (const std::exception& e) {
-            slot.breaker.on_failure();
-            { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
-            last_error = slot.provider->provider_name() + "/" + slot.provider->model_name()
-                       + ": " + e.what();
+            std::string emsg = e.what();
+            // R2: detect HTTP 429 rate-limit signal (GitHub Models returns plain text)
+            // "Too Many Requests" → json::parse throws: "parse error...last read: 'T'"
+            bool is_rate_limit =
+                (emsg.find("parse error") != std::string::npos &&
+                 emsg.find("last read: \'T\'") != std::string::npos) ||
+                 emsg.find("429") != std::string::npos ||
+                 emsg.find("Too Many") != std::string::npos;
+
+            if (is_rate_limit) {
+                // Rate limiting: do NOT open circuit breaker — sleep and let caller retry
+                std::cerr << "[RATE_LIMIT] sleeping 6s\n";
+                std::this_thread::sleep_for(std::chrono::seconds(6));
+                last_error = slot.provider->provider_name() + "/" +
+                             slot.provider->model_name() + " [RATE_LIMITED, retrying]";
+                // No record_failure → breaker stays closed
+            } else {
+                slot.breaker.on_failure();
+                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                last_error = slot.provider->provider_name() + "/" + slot.provider->model_name()
+                           + ": " + emsg;
+            }
         }
     }
     throw AllProvidersExhaustedError(
