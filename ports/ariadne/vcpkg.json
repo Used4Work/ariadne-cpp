@@ -1,0 +1,11 @@
+{
+  "name": "ariadne",
+  "version": "0.2.0",
+  "description": "C++ LLM workflow orchestration — DAG planning, ReACT agent loops, auto-probe providers",
+  "homepage": "https://github.com/Used4Work/ariadne-cpp",
+  "license": "MIT",
+  "dependencies": [
+    "curl",
+    "nlohmann-json"
+  ]
+}

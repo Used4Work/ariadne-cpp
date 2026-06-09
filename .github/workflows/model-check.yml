@@ -1,0 +1,41 @@
+name: Model Registry Update
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+permissions:
+  contents: write
+  models: read
+jobs:
+  update-models:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch GitHub Models catalog
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               https://models.github.ai/catalog/models -o /tmp/catalog.json || echo '[]' > /tmp/catalog.json
+      - name: Update registry and README
+        run: |
+          python3 << 'PY'
+          import json,re
+          from datetime import date
+          r=json.load(open("models.json"))
+          try:
+              gh=json.load(open("/tmp/catalog.json"))
+              if isinstance(gh,list):
+                  cur={m["id"] for m in r["providers"]["github_models"]["models"]}
+                  for mid in sorted({m.get("id","") for m in gh if m.get("id")}-cur)[:5]:
+                      r["providers"]["github_models"]["models"].append({"id":mid,"role":"subagent","note":"auto"})
+          except: pass
+          r["_updated"]=str(date.today())
+          json.dump(r,open("models.json","w"),indent=2)
+          PY
+      - name: Commit if changed
+        run: |
+          git config user.email "bot@noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git diff --quiet models.json || (git add models.json && git commit -m "chore: update models [$(date +%Y-%m-%d)]" && git push)

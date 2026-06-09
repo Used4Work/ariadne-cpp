@@ -1,0 +1,41 @@
+name: Eval Harness (GitHub Models — free)
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Model ID"
+        required: false
+        default: "openai/gpt-4o-mini"
+permissions:
+  contents: read
+  models: read
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update -q && sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev
+      - name: Build
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel 4
+      - name: Unit tests sanity check
+        run: ./build/unit_tests
+      - name: Run Eval Harness
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVAL_MODEL: ${{ github.event.inputs.model || 'openai/gpt-4o-mini' }}
+        run: cd build && ./eval_runner
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.run_number }}
+          path: build/eval_report.json
+          retention-days: 30
+      - name: Fail if below threshold
+        run: python3 -c "import json,sys; r=json.load(open('build/eval_report.json')); sys.exit(0 if r['ci_pass'] else 1)"
