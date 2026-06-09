@@ -9,7 +9,12 @@ find_package(nlohmann_json 3.9 REQUIRED)
 option(ARIADNE_BUILD_TESTS    "Build unit tests"  ON)
 option(ARIADNE_BUILD_EXAMPLES "Build examples"    ON)
 
-add_compile_options(-Wall -Wextra)
+# Compiler warnings — MSVC uses different flags than GCC/Clang
+if(MSVC)
+    add_compile_options(/W3 /wd4068 /wd4702)  # W3 moderate, silence pragma/unreachable warnings
+else()
+    add_compile_options(-Wall -Wextra -Wno-unused-parameter)
+endif()
 
 # ── Core library ──────────────────────────────────────────────────
 add_library(ariadne STATIC ariadne.cpp)
