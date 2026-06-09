@@ -48,7 +48,8 @@ std::string HttpProvider::http_post(const std::string& url,
 
 std::string AnthropicProvider::complete(const std::string& prompt,
                                           const std::string& sys,
-                                          double temp) const {
+                                          double temp,
+                                          bool /*force_json*/) const {
     json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
                   {"temperature", temp},
                   {"messages", {{{"role","user"}, {"content", prompt}}}}};
@@ -74,12 +75,14 @@ static std::string rtrim_slash(const std::string& s) {
 
 std::string OpenAIChatProvider::complete(const std::string& prompt,
                                            const std::string& sys,
-                                           double temp) const {
+                                           double temp,
+                                           bool force_json) const {
     json msgs = json::array();
     if (!sys.empty()) msgs.push_back({{"role","system"}, {"content", sys}});
     msgs.push_back({{"role","user"}, {"content", prompt}});
     json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
                   {"temperature", temp}, {"messages", msgs}};
+    if (force_json) body["response_format"] = {{"type","json_object"}};
     std::string base = cfg_.base_url.empty() ? "https://api.openai.com" : rtrim_slash(cfg_.base_url);
     std::string path = cfg_.completions_path.empty() ? "/v1/chat/completions" : cfg_.completions_path;
     auto raw = http_post(base + path,
@@ -96,7 +99,8 @@ std::string OpenAIChatProvider::complete(const std::string& prompt,
 
 std::string OpenAIResponsesProvider::complete(const std::string& prompt,
                                                 const std::string& sys,
-                                                double temp) const {
+                                                double temp,
+                                                bool /*force_json*/) const {
     json body = {{"model", cfg_.model}, {"max_output_tokens", cfg_.max_tokens},
                   {"temperature", temp},
                   {"input", {{{"role","user"}, {"content", prompt}}}}};
@@ -186,7 +190,8 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                                    const std::string& prompt,
                                    const std::string& system,
                                    double temperature,
-                                   ModelTier tier) const {
+                                   ModelTier tier,
+                                   bool force_json) const {
     std::string last_error;
     for (const auto& slot : slots) {
         if (!slot.breaker.try_allow()) {
@@ -203,7 +208,7 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                 continue;
             }
         try {
-            auto res = slot.provider->complete(prompt, system, temperature);
+            auto res = slot.provider->complete(prompt, system, temperature, force_json);
             slot.breaker.on_success();
             { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
             return res;
@@ -220,9 +225,10 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
 }
 
 std::string LLMClient::complete_as(ModelTier tier, const std::string& prompt,
-                                     const std::string& system, double temperature) const {
+                                     const std::string& system, double temperature,
+                                     bool force_json) const {
     const auto& slots = (tier == ModelTier::ORCHESTRATOR) ? orchestrators_ : subagents_;
-    return try_slots(slots, prompt, system, temperature, tier);
+    return try_slots(slots, prompt, system, temperature, tier, force_json);
 }
 
 std::vector<ProviderStats> LLMClient::stats(ModelTier tier) const {
@@ -547,7 +553,7 @@ WorkflowPlan WorkflowPlanner::plan(const std::string& task,
         try {
             auto raw  = extract_json(llm_.complete_as(
                 ModelTier::ORCHESTRATOR, p, PLANNER_SYS_V2,
-                temps[std::min(i, (int)temps.size()-1)]));
+                temps[std::min(i, (int)temps.size()-1)], /*force_json=*/true));
             auto plan = parse_plan(raw, task);
             validate_dag(plan);
             return plan;
@@ -863,7 +869,6 @@ std::string WorkflowResult::summary() const {
 // ════════════════════════════════════════════════════════════════
 
 WorkflowEngine::WorkflowEngine(const EngineConfig& cfg) : config_(cfg) {
-    pool_     = std::make_unique<ThreadPool>(cfg.max_concurrency);
     llm_      = std::make_unique<LLMClient>(cfg.orchestrator, cfg.subagent);
     tools_    = std::make_unique<ToolRegistry>();
     planner_  = std::make_unique<WorkflowPlanner>(*llm_);
@@ -1254,7 +1259,6 @@ WorkflowResult WorkflowEngine::run_with_recovery(const std::string& task,
         if (!plan.success) { result.error_message = "Recovery failed: " + plan.error; break; }
         config_.orchestrator = plan.config.orchestrator;
         config_.subagent     = plan.config.subagent;
-        pool_     = std::make_unique<ThreadPool>(config_.max_concurrency);
         llm_      = std::make_unique<LLMClient>(config_.orchestrator, config_.subagent);
         planner_  = std::make_unique<WorkflowPlanner>(*llm_);
         executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, config_.max_concurrency);
@@ -1303,7 +1307,7 @@ WorkflowResult WorkflowEngine::run_stream(const std::string& task,
                 std::vector<std::pair<Step, std::future<FT>>> futs;
                 for (const auto& step : batch)
                     futs.emplace_back(step,
-                        pool_->submit([this, step, &state]() -> FT {
+                        executor_->submit_task([this, step, &state]() -> FT {
                             std::vector<TraceEntry> tr;
                             try { return {true, executor_->run_step_pub(step, state, tr), tr}; }
                             catch (const std::exception& e) {
