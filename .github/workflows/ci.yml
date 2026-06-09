@@ -11,74 +11,64 @@ permissions:
 
 jobs:
   build-and-test:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Linux (primary)
           - os: ubuntu-latest
-            deps: |
-              sudo apt-get update -q
-              sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev
-            cmake_opts: ""
-            lib_name: libariadne.a
-
-          # Windows (MSVC + vcpkg)
+            name: Linux x64
           - os: windows-latest
-            deps: |
-              vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static
-            cmake_opts: >-
-              -DCMAKE_TOOLCHAIN_FILE=${{ '${{env.VCPKG_ROOT}}' }}/scripts/buildsystems/vcpkg.cmake
-              -DVCPKG_TARGET_TRIPLET=x64-windows-static
-            lib_name: Release\ariadne.lib
+            name: Windows x64
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache vcpkg (Windows)
-        if: runner.os == 'Windows'
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:/vcpkg/installed
-            C:/vcpkg/packages
-          key: vcpkg-windows-${{ hashFiles('vcpkg.json') }}
-
-      - name: Install dependencies (Linux)
+      - name: Install deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev
 
-      - name: Install dependencies (Windows)
+      - name: Cache vcpkg (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: C:/vcpkg/installed
+          key: vcpkg-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: vcpkg install --triplet x64-windows-static
+
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DARIADNE_BUILD_TESTS=ON -DARIADNE_BUILD_EXAMPLES=OFF
+
+      - name: Configure (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static
-
-      - name: Configure
-        shell: bash
-        run: |
-          cmake -B build -DCMAKE_BUILD_TYPE=Release \
-            -DARIADNE_BUILD_TESTS=ON \
-            -DARIADNE_BUILD_EXAMPLES=OFF \
-            ${{ matrix.cmake_opts }}
+          $root = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:/vcpkg" }
+          cmake -B build -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+            -DARIADNE_BUILD_TESTS=ON `
+            -DARIADNE_BUILD_EXAMPLES=OFF
 
       - name: Build
         run: cmake --build build --config Release --parallel 4
 
       - name: Run unit tests
-        run: |
-          cd build
-          ctest -C Release --output-on-failure
+        run: cd build && ctest -C Release --output-on-failure
 
-      - name: Upload test binary on failure
+      - name: Upload on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: unit-tests-${{ matrix.os }}-${{ github.run_number }}
+          name: unit-tests-${{ matrix.name }}-${{ github.run_number }}
           path: |
             build/unit_tests
             build/Release/unit_tests.exe
