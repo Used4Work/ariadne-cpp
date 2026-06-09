@@ -1,3 +1,7 @@
+#ifdef _WIN32
+#  define NOMINMAX
+#  define WIN32_LEAN_AND_MEAN
+#endif
 #include "ariadne.hpp"
 #include <thread>
 #include <sstream>
@@ -240,7 +244,8 @@ std::vector<ProviderStats> LLMClient::stats(ModelTier tier) const {
 
 void LLMClient::print_status() const {
     auto print_tier = [](const char* name, const std::vector<ProviderStats>& sv) {
-        std::cout << "── " << name << " ──\n";
+        std::cout << "── " << name << " ──
+";
         for (const auto& s : sv) {
             const char* cs = s.circuit_state == CircuitBreaker::State::CLOSED ? "CLOSED   " :
                              s.circuit_state == CircuitBreaker::State::OPEN   ? "OPEN     " : "HALF_OPEN";
@@ -249,7 +254,8 @@ void LLMClient::print_status() const {
                       << " calls=" << s.total_calls << " ok=" << s.successes << " fail=" << s.failures;
             if (s.circuit_state == CircuitBreaker::State::OPEN)
                 std::cout << " (retry in " << (int)s.secs_to_retry << "s)";
-            std::cout << "\n";
+            std::cout << "
+";
         }
     };
     print_tier("ORCHESTRATOR", stats(ModelTier::ORCHESTRATOR));
@@ -440,9 +446,13 @@ void WorkflowContext::record(const std::string& task, const json& output) {
 }
 std::string WorkflowContext::to_prompt_prefix() const {
     if (history_.empty()) return "";
-    std::string ctx = "Previous conversation context (use if relevant):\n";
+    std::string ctx = "Previous conversation context (use if relevant):
+";
     for (const auto& [t, o] : history_)
-        ctx += "  Task: " + t + "\n  Result summary: " + o + "\n\n";
+        ctx += "  Task: " + t + "
+  Result summary: " + o + "
+
+";
     return ctx;
 }
 
@@ -531,16 +541,25 @@ WorkflowPlan WorkflowPlanner::plan(const std::string& task,
 
     std::string prefix = ctx.to_prompt_prefix();
     std::string base = prefix
-        + "Available tools:\n" + tj.dump(2)
-        + "\n\nTask: " + task
-        + "\n\nGenerate the workflow DAG:";
+        + "Available tools:
+" + tj.dump(2)
+        + "
+
+Task: " + task
+        + "
+
+Generate the workflow DAG:";
 
     std::string errors;
     const std::vector<double> temps = {0.0, 0.2, 0.4};
     for (int i = 0; i < max_attempts; ++i) {
         std::string p = base;
         if (!errors.empty())
-            p += "\n\nPrevious validation errors (fix them):\n" + errors + "\nReturn ONLY JSON.";
+            p += "
+
+Previous validation errors (fix them):
+" + errors + "
+Return ONLY JSON.";
         try {
             auto raw  = extract_json(llm_.complete_as(
                 ModelTier::ORCHESTRATOR, p, PLANNER_SYS_V2,
@@ -549,11 +568,13 @@ WorkflowPlan WorkflowPlanner::plan(const std::string& task,
             validate_dag(plan);
             return plan;
         } catch (const std::exception& e) {
-            errors += "[Attempt " + std::to_string(i+1) + "] " + e.what() + "\n";
+            errors += "[Attempt " + std::to_string(i+1) + "] " + e.what() + "
+";
         }
     }
     throw PlanningError("plan() failed after " + std::to_string(max_attempts)
-                        + " attempts:\n" + errors);
+                        + " attempts:
+" + errors);
 }
 
 WorkflowPlanner::WorkflowPlanner(LLMClient& llm) : llm_(llm) {}
@@ -565,10 +586,13 @@ json WorkflowPlanner::analyze_task(const std::string& task,
     for (const auto& t : tools) ta.push_back({{"name", t.name}, {"description", t.description}});
     std::string prefix = ctx.to_prompt_prefix();
     std::string p = prefix +
-        "Analyze the task. Return ONLY JSON:\n"
+        "Analyze the task. Return ONLY JSON:
+"
         "{\"intent\":\"...\",\"required_tools\":[...],\"subtasks\":[{\"order\":1,\"description\":\"...\",\"tool\":\"name or null\"}],"
-        "\"complexity\":\"simple|moderate|complex\"}\n"
-        "Available tools: " + ta.dump() + "\nTask: " + task;
+        "\"complexity\":\"simple|moderate|complex\"}
+"
+        "Available tools: " + ta.dump() + "
+Task: " + task;
     return extract_json(llm_.complete_as(ModelTier::ORCHESTRATOR, p));
 }
 
@@ -578,16 +602,28 @@ WorkflowPlan WorkflowPlanner::plan_static(const std::string& task, const json& a
     json tj = json::array();
     for (const auto& t : tools)
         tj.push_back({{"name", t.name}, {"description", t.description}, {"inputs", t.input_schema}});
-    std::string base = "Tools:\n" + tj.dump(2)
-                     + "\n\nTask: " + task
-                     + "\n\nAnalysis:\n" + analysis.dump(2)
-                     + "\n\nGenerate the workflow DAG:";
+    std::string base = "Tools:
+" + tj.dump(2)
+                     + "
+
+Task: " + task
+                     + "
+
+Analysis:
+" + analysis.dump(2)
+                     + "
+
+Generate the workflow DAG:";
     std::string errors;
     std::vector<double> temps = {0.0, 0.2, 0.4};
     for (int i = 0; i < max_attempts; ++i) {
         std::string p = base;
         if (!errors.empty())
-            p += "\n\nPrevious validation errors (fix them):\n" + errors + "\nReturn ONLY JSON.";
+            p += "
+
+Previous validation errors (fix them):
+" + errors + "
+Return ONLY JSON.";
         try {
             auto raw  = extract_json(llm_.complete_as(ModelTier::ORCHESTRATOR, p, PLANNER_SYS,
                                      temps[std::min(i, (int)temps.size()-1)]));
@@ -595,10 +631,12 @@ WorkflowPlan WorkflowPlanner::plan_static(const std::string& task, const json& a
             validate_dag(plan);
             return plan;
         } catch (const std::exception& e) {
-            errors += "[Attempt " + std::to_string(i+1) + "] " + e.what() + "\n";
+            errors += "[Attempt " + std::to_string(i+1) + "] " + e.what() + "
+";
         }
     }
-    throw PlanningError("plan_static failed after " + std::to_string(max_attempts) + " attempts:\n" + errors);
+    throw PlanningError("plan_static failed after " + std::to_string(max_attempts) + " attempts:
+" + errors);
 }
 
 WorkflowPlan WorkflowPlanner::replan(const std::string& task, const WorkflowPlan& cur,
@@ -608,12 +646,18 @@ WorkflowPlan WorkflowPlanner::replan(const std::string& task, const WorkflowPlan
         const auto& f = failures[i];
         fb += "Case " + std::to_string(i+1) + ": input=" +
               f.value("input", json{}).dump().substr(0, 200) +
-              " reason=" + f.value("reason", std::string{}).substr(0, 300) + "\n";
+              " reason=" + f.value("reason", std::string{}).substr(0, 300) + "
+";
     }
     json dag = json::array();
     for (const auto& s : cur.steps) dag.push_back({{"id", s.id}, {"description", s.description}});
-    std::string p = "Task: " + task + "\nCurrent DAG:\n" + dag.dump(2)
-                  + "\nFailures:\n" + fb + "\nImprove the plan. Return ONLY JSON: {\"steps\":[...]}";
+    std::string p = "Task: " + task + "
+Current DAG:
+" + dag.dump(2)
+                  + "
+Failures:
+" + fb + "
+Improve the plan. Return ONLY JSON: {\"steps\":[...]}";
     auto raw  = extract_json(llm_.complete_as(ModelTier::ORCHESTRATOR, p, PLANNER_SYS, 0.3));
     auto plan = parse_plan(raw, task);
     validate_dag(plan);
@@ -741,16 +785,25 @@ json WorkflowExecutor::exec_tool(const Step& s, const json& in) const {
 json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
     std::string prompt = s.action;
     if (!in.empty())
-        prompt += "\n\nContext:\n" + in.dump(2);
+        prompt += "
+
+Context:
+" + in.dump(2);
 
     // B1: Structured output / JSON mode
     if (s.json_mode || !s.output_schema.empty()) {
         if (!s.output_schema.empty())
-            prompt += "\n\nReturn ONLY a JSON object matching this exact schema:\n"
+            prompt += "
+
+Return ONLY a JSON object matching this exact schema:
+"
                     + s.output_schema.dump(2)
-                    + "\nNo markdown, no explanation — JSON only.";
+                    + "
+No markdown, no explanation — JSON only.";
         else
-            prompt += "\n\nReturn ONLY valid JSON. No markdown, no explanation.";
+            prompt += "
+
+Return ONLY valid JSON. No markdown, no explanation.";
 
         auto raw = llm_.complete_as(s.model_tier, prompt, s.system_prompt, 0.0);
         try {
@@ -760,9 +813,11 @@ json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
                 auto violations = validate_json_schema(result, s.output_schema);
                 if (!violations.empty()) {
                     // 记录违规但不抛异常（LLM 输出的容错性）
-                    std::cerr << "[schema] Step '" << s.id << "' violations:\n";
+                    std::cerr << "[schema] Step '" << s.id << "' violations:
+";
                     for (const auto& v : violations)
-                        std::cerr << "  " << v.path << ": " << v.message << "\n";
+                        std::cerr << "  " << v.path << ": " << v.message << "
+";
                 }
             }
             return result;
@@ -786,7 +841,8 @@ json WorkflowExecutor::exec_transform(const Step& s, const json& in) const {
         return items;
     }
     if (s.action == "join") {
-        std::string sep = in.value("separator", "\n"), r;
+        std::string sep = in.value("separator", "
+"), r;
         for (const auto& it : in.value("items", json::array())) {
             if (!r.empty()) r += sep;
             r += it.is_string() ? it.get<std::string>() : it.dump();
@@ -964,10 +1020,11 @@ struct SseParser {
         }
         buffer.append(data, len);
         size_t pos;
-        while ((pos = buffer.find('\n')) != std::string::npos) {
+        while ((pos = buffer.find('
+')) != std::string::npos) {
             std::string line = buffer.substr(0, pos);
             buffer = buffer.substr(pos + 1);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (!line.empty() && line.back() == '') line.pop_back();
             if (line.size() < 6 || line.substr(0,6) != "data: ") continue;
             std::string payload = line.substr(6);
             if (payload == "[DONE]") { done = true; continue; }
@@ -1132,12 +1189,14 @@ ProbeResult ProviderAutoPlanner::probe_one(const Candidate& c,
 ProviderAutoPlanner::PlanResult
 ProviderAutoPlanner::build_plan(const std::vector<ProbeResult>& results,
                                   const std::string& prefix) const {
-    std::cout << "[" << prefix << "] Probe results (" << results.size() << " candidates):\n";
+    std::cout << "[" << prefix << "] Probe results (" << results.size() << " candidates):
+";
     for (const auto& r : results) {
         std::cout << "  " << (r.alive ? "OK  " : "FAIL") << " [" << r.tier << "] "
                   << std::left << std::setw(22) << r.name << " " << r.latency_ms << "ms";
         if (!r.alive) std::cout << "  — " << r.error.substr(0,60);
-        std::cout << "\n";
+        std::cout << "
+";
     }
 
     using PC = std::pair<long, ProviderConfig>;
@@ -1159,7 +1218,8 @@ ProviderAutoPlanner::build_plan(const std::vector<ProbeResult>& results,
     if (strong_v.empty()) {
         plan.success = false;
         plan.error   = "No providers responded";
-        std::cerr << "[" << prefix << "] ERROR: " << plan.error << "\n";
+        std::cerr << "[" << prefix << "] ERROR: " << plan.error << "
+";
         return plan;
     }
 
@@ -1175,7 +1235,8 @@ ProviderAutoPlanner::build_plan(const std::vector<ProbeResult>& results,
     for (const auto& [_, c] : strong_v) plan.alive_strong.push_back(c.model);
     for (const auto& [_, c] : fast_v)   plan.alive_fast.push_back(c.model);
     std::cout << "[" << prefix << "] → ORCHESTRATOR=" << plan.alive_strong[0]
-              << "  SUBAGENT=" << plan.alive_fast[0] << "\n";
+              << "  SUBAGENT=" << plan.alive_fast[0] << "
+";
     return plan;
 }
 
@@ -1199,17 +1260,20 @@ ProviderAutoPlanner::probe_and_plan(std::chrono::seconds timeout) const {
 
 ProviderAutoPlanner::PlanResult
 ProviderAutoPlanner::repair(std::chrono::seconds timeout) const {
-    std::cout << "[REPAIR] Re-probing after provider failure...\n";
+    std::cout << "[REPAIR] Re-probing after provider failure...
+";
     return probe_and_plan(timeout);
 }
 
 void ProviderAutoPlanner::print_last_report() const {
-    if (last_results_.empty()) { std::cout << "(no probe run yet)\n"; return; }
+    if (last_results_.empty()) { std::cout << "(no probe run yet)
+"; return; }
     for (const auto& r : last_results_) {
         std::cout << "  " << (r.alive ? "✓" : "✗") << " [" << r.tier << "] "
                   << r.name << "  " << r.latency_ms << "ms";
         if (!r.alive) std::cout << " — " << r.error;
-        std::cout << "\n";
+        std::cout << "
+";
     }
 }
 
@@ -1246,7 +1310,8 @@ WorkflowResult WorkflowEngine::run_with_recovery(const std::string& task,
 
     for (int attempt = 0; attempt < max_repair_attempts
                         && is_provider_err(result.error_message); ++attempt) {
-        std::cout << "[RECOVERY] Attempt " << (attempt+1) << "/" << max_repair_attempts << "\n";
+        std::cout << "[RECOVERY] Attempt " << (attempt+1) << "/" << max_repair_attempts << "
+";
         auto plan = planner.repair();
         if (!plan.success) { result.error_message = "Recovery failed: " + plan.error; break; }
         config_.orchestrator = plan.config.orchestrator;
@@ -1257,7 +1322,8 @@ WorkflowResult WorkflowEngine::run_with_recovery(const std::string& task,
         executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, config_.max_concurrency);
         result = run(task);
         if (result.success) {
-            std::cout << "[RECOVERY] Success on attempt " << (attempt+1) << "\n";
+            std::cout << "[RECOVERY] Success on attempt " << (attempt+1) << "
+";
             return result;
         }
     }
@@ -1290,7 +1356,10 @@ WorkflowResult WorkflowEngine::run_stream(const std::string& task,
                 const auto& step   = batch[0];
                 auto        inputs = state.resolve_inputs(step.inputs);
                 std::string prompt = step.action;
-                if (!inputs.empty()) prompt += "\n\nContext:\n" + inputs.dump(2);
+                if (!inputs.empty()) prompt += "
+
+Context:
+" + inputs.dump(2);
                 std::string acc;
                 llm_->complete_as_stream(step.model_tier, prompt, "", 0.0,
                     [&](const std::string& chunk){ acc += chunk; on_chunk(chunk); });
@@ -1406,11 +1475,18 @@ static std::string build_agent_prompt(const std::string& task,
     for (const auto& t : tools)
         tool_list.push_back({{"name",t.name},{"description",t.description},{"inputs",t.input_schema}});
 
-    std::string prompt = "Available tools:\n" + tool_list.dump(2) + "\n\n";
-    prompt += "Task: " + task + "\n";
+    std::string prompt = "Available tools:
+" + tool_list.dump(2) + "
+
+";
+    prompt += "Task: " + task + "
+";
     if (!history.empty())
-        prompt += "\nWork done so far:\n" + history;
-    prompt += "\nRespond with your next action as a JSON object.";
+        prompt += "
+Work done so far:
+" + history;
+    prompt += "
+Respond with your next action as a JSON object.";
     return prompt;
 }
 
@@ -1471,20 +1547,30 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
             // L2: Truncate large observations to avoid context window overflow
             std::string obs_str = obs.dump();
             if (obs_str.size() > 800) obs_str = obs_str.substr(0, 800) + "...[truncated]";
-            history += "[iter " + std::to_string(iter+1) + "]\n"
-                    +  "Thought: " + action.thought + "\n"
-                    +  "Called: " + action.tool_name + "(" + action.tool_args.dump() + ")\n"
-                    +  "Result: " + obs_str + "\n\n";
+            history += "[iter " + std::to_string(iter+1) + "]
+"
+                    +  "Thought: " + action.thought + "
+"
+                    +  "Called: " + action.tool_name + "(" + action.tool_args.dump() + ")
+"
+                    +  "Result: " + obs_str + "
+
+";
             // L2: Trim history if it exceeds 4000 chars (keep last 2/3)
             if (history.size() > 4000) {
-                auto cut = history.find("\n[iter ", history.size() / 3);
+                auto cut = history.find("
+[iter ", history.size() / 3);
                 if (cut != std::string::npos) history = history.substr(cut);
             }
 
         } else if (action.type == AgentAction::Type::LOOP_BACK) {
-            history += "[iter " + std::to_string(iter+1) + " — reconsidering]\n"
-                    +  "Thought: " + action.thought + "\n"
-                    +  "Reason: " + action.reason + "\n\n";
+            history += "[iter " + std::to_string(iter+1) + " — reconsidering]
+"
+                    +  "Thought: " + action.thought + "
+"
+                    +  "Reason: " + action.reason + "
+
+";
         }
 
         step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
