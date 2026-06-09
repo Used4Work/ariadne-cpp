@@ -170,7 +170,8 @@ public:
     virtual ~ILLMProvider() = default;
     virtual std::string complete(const std::string& prompt,
                                   const std::string& system     = "",
-                                  double             temperature = 0.0) const = 0;
+                                  double             temperature = 0.0,
+                                  bool               force_json  = false) const = 0;
     virtual void complete_stream(const std::string& prompt,
                                   const std::string& system,
                                   double             temperature,
@@ -203,7 +204,8 @@ public:
     explicit AnthropicProvider(const ProviderConfig& cfg) : HttpProvider(cfg) {}
     std::string complete(const std::string& prompt,
                           const std::string& system,
-                          double temperature) const override;
+                          double temperature,
+                          bool force_json = false) const override;
     void complete_stream(const std::string& prompt,
                           const std::string& system,
                           double temperature,
@@ -218,7 +220,8 @@ public:
     explicit OpenAIChatProvider(const ProviderConfig& cfg) : HttpProvider(cfg) {}
     std::string complete(const std::string& prompt,
                           const std::string& system,
-                          double temperature) const override;
+                          double temperature,
+                          bool force_json = false) const override;
     void complete_stream(const std::string& prompt,
                           const std::string& system,
                           double temperature,
@@ -235,7 +238,8 @@ public:
     explicit OpenAIResponsesProvider(const ProviderConfig& cfg) : HttpProvider(cfg) {}
     std::string complete(const std::string& prompt,
                           const std::string& system,
-                          double temperature) const override;
+                          double temperature,
+                          bool force_json = false) const override;
     void complete_stream(const std::string& prompt,
                           const std::string& system,
                           double temperature,
@@ -375,7 +379,8 @@ public:
     std::string complete_as(ModelTier tier,
                              const std::string& prompt,
                              const std::string& system     = "",
-                             double             temperature = 0.0) const;
+                             double             temperature = 0.0,
+                             bool               force_json  = false) const;
 
     /** 流式：chunk 通过 on_chunk 回调推送 */
     void complete_as_stream(ModelTier tier,
@@ -409,7 +414,8 @@ private:
                            const std::string& prompt,
                            const std::string& system,
                            double temperature,
-                           ModelTier tier) const;
+                           ModelTier tier,
+                           bool force_json = false) const;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -668,6 +674,9 @@ public:
     json run_step_pub(const Step& s, const WorkflowState& st, std::vector<TraceEntry>& tr) const {
         return run_step(s, st, tr);
     }
+    /** Submit task to executor's thread pool (used by run_stream) */
+    template<typename F>
+    auto submit_task(F&& f) { return pool_.submit(std::forward<F>(f)); }
 
 private:
     LLMClient&    llm_;
@@ -707,7 +716,7 @@ struct MetricEvent {
     long        duration_ms = 0;
     bool        success     = true;
     std::string error;
-    json        extra;          // 附加上下文（可选）
+    json        extra = {};     // 附加上下文（可选）
 };
 
 /** 指标收集器接口 */
@@ -953,13 +962,7 @@ public:
      */
     void set_metrics(std::shared_ptr<IMetricsCollector> collector);
 
-    /**
-     * ReACT Agent 循环：LLM 自主决策调用哪些工具、何时结束。
-     * 与 run() 的区别：步骤不是预先规划的 DAG，而是每次迭代动态决定。
-     * @param max_iterations 防止无限循环，默认 10
-     */
-    AgentResult run_agent(const std::string& task,
-                           int max_iterations = 10);
+    // run_agent: see 3-param overload with on_step callback above
 
 private:
     EngineConfig                      config_;
@@ -967,7 +970,6 @@ private:
     std::unique_ptr<ToolRegistry>     tools_;
     std::unique_ptr<WorkflowPlanner>  planner_;
     std::unique_ptr<WorkflowExecutor> executor_;
-    std::unique_ptr<ThreadPool>       pool_;      ///< shared pool for run_stream
     std::string                       custom_planner_prompt_;
     std::string                       custom_agent_prompt_;
     std::shared_ptr<IMetricsCollector> metrics_{std::make_shared<NoOpMetrics>()};
