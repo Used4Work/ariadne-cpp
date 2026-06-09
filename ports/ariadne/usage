@@ -1,0 +1,5 @@
+ariadne provides CMake targets:
+
+    find_package(ariadne CONFIG REQUIRED)
+    target_link_libraries(main PRIVATE ariadne::ariadne)
+

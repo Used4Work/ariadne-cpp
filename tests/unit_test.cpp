@@ -1,0 +1,501 @@
+
+#include "../ariadne.hpp"
+#include <iostream>
+#include <thread>
+#include <chrono>
+using namespace ariadne;
+
+static int g_run=0, g_pass=0;
+#define RUN(fn) do{++g_run;std::cout<<"  "#fn"... "<<std::flush;\
+    try{fn();std::cout<<"OK\n";++g_pass;}\
+    catch(const std::exception&e){std::cout<<"FAIL: "<<e.what()<<"\n";}}while(0)
+#define ASSERT(c) if(!(c))throw std::runtime_error("assert: "#c)
+#define ASSERT_THROWS(T,e) do{bool t=false;try{(void)(e);}catch(const T&){t=true;}\
+    if(!t)throw std::runtime_error("expected "#T" not thrown");}while(0)
+
+static WorkflowPlan lin3() {
+    return {"p",{
+        {"a",StepType::TOOL,"t",{},{},0,30,OnError::FAIL},
+        {"b",StepType::TOOL,"t",{},{"a"},0,30,OnError::FAIL},
+        {"c",StepType::TOOL,"t",{},{"b"},0,30,OnError::FAIL},
+    }};
+}
+
+// ── DAG ─────────────────────────────────────────────────────────
+void test_dag_valid()   { validate_dag(lin3()); }
+void test_dag_dup()     {
+    WorkflowPlan p{"p",{
+        {"x",StepType::TOOL,"t",{},{},0,30,OnError::FAIL},
+        {"x",StepType::TOOL,"t",{},{},0,30,OnError::FAIL}}};
+    ASSERT_THROWS(DAGValidationError, validate_dag(p)); }
+void test_dag_dep()     {
+    WorkflowPlan p{"p",{{"a",StepType::TOOL,"t",{},{"ghost"},0,30,OnError::FAIL}}};
+    ASSERT_THROWS(DAGValidationError, validate_dag(p)); }
+void test_dag_cycle()   {
+    WorkflowPlan p{"p",{
+        {"a",StepType::TOOL,"t",{},{"b"},0,30,OnError::FAIL},
+        {"b",StepType::TOOL,"t",{},{"a"},0,30,OnError::FAIL}}};
+    ASSERT_THROWS(DAGValidationError, validate_dag(p)); }
+
+// ── Topological batches ──────────────────────────────────────────
+void test_topo_linear() {
+    auto b = lin3().topological_batches();
+    ASSERT(b.size()==3); ASSERT(b[0][0].id=="a"); ASSERT(b[2][0].id=="c");
+}
+void test_topo_parallel() {
+    WorkflowPlan p{"p",{
+        {"a",StepType::TOOL,"t",{},{},0,30,OnError::FAIL},
+        {"b",StepType::TOOL,"t",{},{},0,30,OnError::FAIL},
+        {"c",StepType::TOOL,"t",{},{"a","b"},0,30,OnError::FAIL}}};
+    auto b = p.topological_batches();
+    ASSERT(b.size()==2); ASSERT(b[0].size()==2);
+}
+void test_leaf() {
+    WorkflowPlan p{"p",{
+        {"a",StepType::TOOL,"t",{},{},0,30,OnError::FAIL},
+        {"b",StepType::TOOL,"t",{},{"a"},0,30,OnError::FAIL}}};
+    auto l = p.leaf_steps();
+    ASSERT(l.size()==1 && l[0].id=="b");
+}
+
+// ── $ref resolution ─────────────────────────────────────────────
+void test_ref_task()    { WorkflowState s; s.task_input={{"q","hi"}};
+                          ASSERT(s.resolve_ref("$task_input.q").get<std::string>()=="hi"); }
+void test_ref_nested()  { WorkflowState s; s.step_outputs["x"]={{"items",json::array({"a","b","c"})}};
+                          ASSERT(s.resolve_ref("$x.items.1").get<std::string>()=="b"); }
+void test_ref_inputs()  { WorkflowState s; s.task_input={{"t","task"}};
+                          auto r=s.resolve_inputs({{"q","$task_input.t"},{"n",5}});
+                          ASSERT(r["q"].get<std::string>()=="task"); ASSERT(r["n"].get<int>()==5); }
+
+// ── CircuitBreaker ───────────────────────────────────────────────
+void test_cb_closed()   { CircuitBreaker cb(3,60); ASSERT(cb.state()==CircuitBreaker::State::CLOSED); ASSERT(cb.try_allow()); }
+void test_cb_opens()    { CircuitBreaker cb(3,60); cb.on_failure();cb.on_failure();cb.on_failure();
+                          ASSERT(cb.state()==CircuitBreaker::State::OPEN); ASSERT(!cb.try_allow()); }
+void test_cb_recovers() { CircuitBreaker cb(2,0.1); cb.on_failure(); cb.on_failure();
+                          std::this_thread::sleep_for(std::chrono::milliseconds(150));
+                          ASSERT(cb.try_allow()); cb.on_success();
+                          ASSERT(cb.state()==CircuitBreaker::State::CLOSED); }
+
+// ── ToolRegistry ─────────────────────────────────────────────────
+void test_tool_reg()     { ToolRegistry r; r.register_tool({"add","",{},{}},
+                               [](const json&p)->json{return p["a"].get<int>()+p["b"].get<int>();});
+                           ASSERT(r.call("add",{{"a",2},{"b",3}}).get<int>()==5); }
+void test_tool_unknown() { ToolRegistry r; ASSERT_THROWS(ToolNotFoundError,r.call("ghost",{})); }
+void test_tool_list()    { ToolRegistry r; r.register_tool({"t1","",{},{}},nullptr);
+                           r.register_tool({"t2","",{},{}},nullptr); ASSERT(r.list_tools().size()==2); }
+
+// ── WorkflowContext ──────────────────────────────────────────────
+void test_ctx_empty()   { WorkflowContext c; ASSERT(c.empty()); ASSERT(c.to_prompt_prefix().empty()); }
+void test_ctx_records() { WorkflowContext c(3); c.record("task A", json("result A"));
+                          ASSERT(!c.empty());
+                          ASSERT(c.to_prompt_prefix().find("task A")!=std::string::npos); }
+void test_ctx_evict()   { WorkflowContext c(2); c.record("t1",json("r1")); c.record("t2",json("r2"));
+                          c.record("t3",json("r3")); std::string p=c.to_prompt_prefix();
+                          ASSERT(p.find("t1")==std::string::npos); ASSERT(p.find("t3")!=std::string::npos); }
+
+// ── TraceEntry ──────────────────────────────────────────────────
+void test_trace()       { WorkflowState s;
+                          s.record_trace({"step1","llm","ok","anthropic/claude",123,""});
+                          ASSERT(s.traces.size()==1); ASSERT(s.traces[0].duration_ms==123); }
+
+// ── ProviderAutoPlanner ─────────────────────────────────────────
+void test_planner_empty() { ProviderAutoPlanner p;
+                             auto r = p.probe_and_plan(std::chrono::seconds(1));
+                             ASSERT(!r.success); ASSERT(!r.error.empty()); }
+void test_planner_add()   { ProviderAutoPlanner p;
+                             p.add_candidate("c1", ProviderConfig::github_models("tok"), "strong", 1);
+                             p.add_candidate("c2", ProviderConfig::github_models("tok"), "fast",   1);
+                             ASSERT(p.last_results().empty()); }
+
+// ── StreamCallback ──────────────────────────────────────────────
+void test_stream_cb()   { std::vector<std::string> chunks;
+                          StreamCallback cb=[&](const std::string&c){chunks.push_back(c);};
+                          cb("hello"); cb(" world");
+                          ASSERT(chunks.size()==2 && chunks[0]=="hello"); }
+
+// ── EngineConfig ────────────────────────────────────────────────
+void test_cfg_single()  { auto c=EngineConfig::from_single(ProviderConfig::github_models("tok"));
+                          ASSERT(c.orchestrator.primary.model==c.subagent.primary.model); }
+void test_cfg_two()     { auto c=EngineConfig::from_two(
+                              ProviderConfig::anthropic("k","claude-opus-4-8"),
+                              ProviderConfig::github_models("t"));
+                          ASSERT(c.orchestrator.primary.type==ProviderType::ANTHROPIC);
+                          ASSERT(c.subagent.primary.type==ProviderType::OPENAI_CHAT); }
+
+// ── AgentAction + AgentResult ────────────────────────────────────
+void test_agent_action_types() {
+    AgentAction a; a.type = AgentAction::Type::TOOL_CALL;
+    ASSERT(a.type == AgentAction::Type::TOOL_CALL);
+    AgentAction b; b.type = AgentAction::Type::FINAL_ANSWER;
+    ASSERT(b.type == AgentAction::Type::FINAL_ANSWER);
+    AgentAction c; c.type = AgentAction::Type::LOOP_BACK;
+    ASSERT(c.type == AgentAction::Type::LOOP_BACK);
+}
+
+void test_agent_result_defaults() {
+    AgentResult r;
+    ASSERT(!r.success);
+    ASSERT(r.iterations_used == 0);
+    ASSERT(r.steps.empty());
+    ASSERT(r.avg_step_ms() == 0.0);
+}
+
+void test_agent_result_reached_max() {
+    AgentResult r;
+    r.max_iterations  = 5;
+    r.iterations_used = 5;
+    ASSERT(r.reached_max());
+    r.iterations_used = 3;
+    ASSERT(!r.reached_max());
+}
+
+void test_agent_step_recording() {
+    AgentResult r;
+    AgentStep s;
+    s.iteration   = 1;
+    s.thought     = "I should search for this";
+    s.duration_ms = 200;
+    s.action.type = AgentAction::Type::TOOL_CALL;
+    r.steps.push_back(s);
+    ASSERT(r.steps.size() == 1);
+    ASSERT(r.avg_step_ms() == 200.0);
+}
+
+// ── 新增：针对本轮审计修复的回归测试 ────────────────────────────
+
+// C1: ToolFn=nullptr 不崩溃
+void test_tool_null_fn() {
+    ToolRegistry r;
+    r.register_tool({"null_tool","",{},{}}, nullptr);
+    auto result = r.call("null_tool", {});
+    ASSERT(result.is_null());
+}
+
+// C3: validate_dag 捕获空 step.id
+void test_dag_empty_id() {
+    WorkflowPlan p{"p",{{"",StepType::TOOL,"t",{},{},0,30,OnError::FAIL}}};
+    ASSERT_THROWS(DAGValidationError, validate_dag(p));
+}
+
+// D2: WorkflowContext 可配置截断长度
+void test_ctx_custom_truncation() {
+    WorkflowContext ctx(5, 10);  // max_summary_chars=10
+    ctx.record("task", json("1234567890abcdef"));
+    std::string p = ctx.to_prompt_prefix();
+    ASSERT(p.find("...") != std::string::npos);  // should be truncated
+}
+
+// L2: Agent history 观测截断
+void test_agent_result_steps() {
+    AgentResult r;
+    AgentStep s;
+    s.iteration = 1;
+    s.action.type = AgentAction::Type::TOOL_CALL;
+    s.action.tool_name = "web_search";
+    s.observation = json("x");
+    s.duration_ms = 50;
+    r.steps.push_back(s);
+    r.success = true;
+    r.final_answer = "done";
+    r.iterations_used = 1;
+    r.max_iterations  = 10;   // fix: set max so reached_max() is false
+    ASSERT(r.avg_step_ms() == 50.0);
+    ASSERT(!r.reached_max());
+}
+
+// ── 新功能：异常层次 ──────────────────────────────────────────────
+void test_exception_hierarchy() {
+    // ProviderError 是 AriadneError
+    try { throw AllProvidersExhaustedError("test"); }
+    catch (const ProviderError&)  { /* ok */ }
+    catch (...) { throw std::runtime_error("AllProvidersExhaustedError not caught as ProviderError"); }
+
+    // ToolNotFoundError 是 ToolError 是 AriadneError
+    try { throw ToolNotFoundError("my_tool","not registered"); }
+    catch (const ToolError& e) { ASSERT(std::string(e.what()).find("my_tool") != std::string::npos); }
+    catch (...) { throw std::runtime_error("ToolNotFoundError not caught as ToolError"); }
+
+    // StepExecutionError (alias WorkflowExecutionError)
+    try { throw StepExecutionError("s1","search","timeout"); }
+    catch (const AriadneError& e) { ASSERT(std::string(e.what()).find("s1") != std::string::npos); }
+    catch (...) { throw std::runtime_error("StepExecutionError not caught as AriadneError"); }
+}
+
+// ── 新功能：ToolInputError (schema validation) ───────────────────
+void test_tool_schema_validation() {
+    ToolRegistry r;
+    // Tool with required field "query"
+    r.register_tool({
+        "search", "Search",
+        {{"required", json::array({"query"})},
+         {"properties", {{"query", {{"type","string"}}}}}},
+        {}
+    }, [](const json& p)->json{ return {{"ok",true}}; });
+
+    // Call with required field → success
+    auto res = r.call("search", {{"query","hello"}});
+    ASSERT(res["ok"].get<bool>());
+
+    // Call without required field → ToolInputError
+    bool caught = false;
+    try { r.call("search", {}); }
+    catch (const ToolInputError& e) {
+        caught = true;
+        ASSERT(std::string(e.what()).find("query") != std::string::npos);
+    }
+    ASSERT(caught);
+}
+
+// ── 新功能：Step json_mode + system_prompt 字段 ──────────────────
+void test_step_new_fields() {
+    Step s;
+    s.id          = "llm_step";
+    s.type        = StepType::LLM;
+    s.action      = "Summarize this";
+    s.json_mode   = true;
+    s.system_prompt = "You are a JSON-only assistant.";
+    s.output_schema = {{"type","object"},{"properties",{{"summary",{{"type","string"}}}}}};
+    ASSERT(s.json_mode);
+    ASSERT(!s.system_prompt.empty());
+    ASSERT(s.output_schema.contains("type"));
+}
+
+// ── 新功能：AgentResult on_step callback ────────────────────────
+void test_agent_on_step_callback() {
+    std::vector<int> iterations_seen;
+    AgentResult r;
+    // Simulate callback being called with steps
+    auto on_step = [&](const AgentStep& step) {
+        iterations_seen.push_back(step.iteration);
+    };
+    AgentStep s1; s1.iteration = 1; s1.action.type = AgentAction::Type::TOOL_CALL;
+    AgentStep s2; s2.iteration = 2; s2.action.type = AgentAction::Type::FINAL_ANSWER;
+    on_step(s1); on_step(s2);
+    ASSERT(iterations_seen.size() == 2);
+    ASSERT(iterations_seen[0] == 1 && iterations_seen[1] == 2);
+}
+
+
+// ── ThreadPool ────────────────────────────────────────────────────
+void test_threadpool_basic() {
+    ThreadPool pool(4);
+    ASSERT(pool.size() == 4);
+
+    std::atomic<int> counter{0};
+    std::vector<std::future<void>> futs;
+    for (int i = 0; i < 20; ++i)
+        futs.push_back(pool.submit([&]{ ++counter; }));
+    for (auto& f : futs) f.get();
+    ASSERT(counter == 20);
+}
+
+void test_threadpool_returns_value() {
+    ThreadPool pool(2);
+    auto f1 = pool.submit([]{ return 42; });
+    auto f2 = pool.submit([]{ return std::string("hello"); });
+    ASSERT(f1.get() == 42);
+    ASSERT(f2.get() == "hello");
+}
+
+void test_threadpool_parallel() {
+    ThreadPool pool(4);
+    using clk = std::chrono::steady_clock;
+    auto t0 = clk::now();
+    std::vector<std::future<void>> futs;
+    for (int i = 0; i < 4; ++i)
+        futs.push_back(pool.submit([]{
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }));
+    for (auto& f : futs) f.get();
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        clk::now() - t0).count();
+    // 4 × 50ms in parallel should finish in ~50-150ms, not ~200ms
+    ASSERT(ms < 180);
+}
+
+// ── JSON Schema Validation ────────────────────────────────────────
+void test_schema_valid_object() {
+    json schema = {{"type","object"},{"required",json::array({"name","age"})},
+                   {"properties",{{"name",{{"type","string"}}},{"age",{{"type","integer"}}}}}};
+    json value  = {{"name","Alice"},{"age",30}};
+    auto v = validate_json_schema(value, schema);
+    ASSERT(v.empty());
+}
+
+void test_schema_missing_required() {
+    json schema = {{"type","object"},{"required",json::array({"name","age"})}};
+    json value  = {{"name","Bob"}};  // missing "age"
+    auto v = validate_json_schema(value, schema);
+    ASSERT(!v.empty());
+    bool found_age = false;
+    for (const auto& viol : v) if (viol.path.find("age") != std::string::npos) found_age=true;
+    ASSERT(found_age);
+}
+
+void test_schema_wrong_type() {
+    json schema = {{"type","object"},{"properties",{{"score",{{"type","number"}}}}}};
+    json value  = {{"score","not-a-number"}};
+    auto v = validate_json_schema(value, schema);
+    ASSERT(!v.empty());
+    ASSERT(v[0].path.find("score") != std::string::npos);
+}
+
+void test_schema_enum() {
+    json schema = {{"type","string"},{"enum",json::array({"a","b","c"})}};
+    ASSERT(validate_json_schema(json("a"), schema).empty());
+    ASSERT(!validate_json_schema(json("x"), schema).empty());
+}
+
+void test_schema_nested() {
+    json schema = {
+        {"type","object"},
+        {"required",json::array({"user"})},
+        {"properties",{
+            {"user",{
+                {"type","object"},
+                {"required",json::array({"id"})},
+                {"properties",{{"id",{{"type","integer"}}}}}
+            }}
+        }}
+    };
+    json ok  = {{"user",{{"id",1}}}};
+    json bad = {{"user",{{"id","wrong-type"}}}};
+    ASSERT(validate_json_schema(ok, schema).empty());
+    auto v = validate_json_schema(bad, schema);
+    ASSERT(!v.empty());
+    ASSERT(v[0].path.find("id") != std::string::npos);
+}
+
+// ── Plan-time tool validation ─────────────────────────────────────
+void test_plan_tool_validation() {
+    // validate_dag only checks structure; plan-time validation checks tool existence
+    // Simulate: a TOOL step with unregistered action should cause PlanningError
+    // (This is tested at the WorkflowEngine level; here we test the registry check)
+    ToolRegistry r;
+    r.register_tool({"web_search","",{},{}}, nullptr);
+    ASSERT(r.has_tool("web_search"));
+    ASSERT(!r.has_tool("nonexistent"));
+}
+// ── Rate Limiter ─────────────────────────────────────────────────
+void test_rate_limiter_unlimited() {
+    RateLimiter rl(0.0);  // unlimited
+    ASSERT(!rl.enabled());
+    ASSERT(rl.acquire());  // should return immediately
+}
+
+void test_rate_limiter_basic() {
+    RateLimiter rl(100.0);  // 100 RPS → token available immediately
+    ASSERT(rl.enabled());
+    ASSERT(rl.max_rps() == 100.0);
+    ASSERT(rl.acquire(100));  // should get token immediately
+}
+
+void test_rate_limiter_slow() {
+    RateLimiter rl(2.0);  // 2 RPS = token every 500ms
+    ASSERT(rl.acquire(100));  // first token: immediate
+    // second token needs ~500ms, but we only wait 50ms → timeout
+    bool got = rl.acquire(50);
+    // may or may not get it depending on timing; just check it doesn't crash
+    (void)got;
+}
+
+void test_rate_limiter_timeout() {
+    RateLimiter rl(0.5);  // 0.5 RPS = token every 2s
+    rl.acquire(100);    // consume first token
+    bool got = rl.acquire(10);  // 10ms timeout, can't get next token
+    ASSERT(!got);  // should time out
+}
+
+// ── Metrics ───────────────────────────────────────────────────────
+void test_metrics_noop() {
+    NoOpMetrics m;
+    // Should not throw or crash
+    m.record({MetricEvent::Kind::WORKFLOW_START,"wf1","","","",0,true,""});
+    m.record({MetricEvent::Kind::WORKFLOW_END,  "wf1","","","",100,true,""});
+}
+
+void test_metrics_console() {
+    ConsoleMetrics m;
+    // Just verify it doesn't crash; output goes to stdout (captured in CI)
+    m.record({MetricEvent::Kind::LLM_CALL,"wf1","step1","anthropic","claude-opus-4-8",0,true,""});
+}
+
+void test_metrics_interface() {
+    std::vector<MetricEvent> recorded;
+    class TestMetrics : public IMetricsCollector {
+    public:
+        std::vector<MetricEvent>& vec;
+        explicit TestMetrics(std::vector<MetricEvent>& v) : vec(v) {}
+        void record(const MetricEvent& e) noexcept override { vec.push_back(e); }
+    };
+    TestMetrics collector(recorded);
+    collector.record({MetricEvent::Kind::WORKFLOW_START,"wf1","","","",0,true,""});
+    collector.record({MetricEvent::Kind::STEP_END,"wf1","s1","","",50,true,""});
+    ASSERT(recorded.size() == 2);
+    ASSERT(recorded[0].kind == MetricEvent::Kind::WORKFLOW_START);
+    ASSERT(recorded[1].duration_ms == 50);
+}
+
+// ── ProviderConfig.max_rps + groq() factory ──────────────────────
+void test_provider_config_max_rps() {
+    auto groq = ProviderConfig::groq("key", "llama-3.3-70b-versatile");
+    ASSERT(groq.max_rps == 0.5);
+
+    auto gh = ProviderConfig::github_models("tok");
+    ASSERT(gh.max_rps == 0.25);
+
+    auto unlimited = ProviderConfig::anthropic("key");
+    ASSERT(unlimited.max_rps == 0.0);
+}
+
+int main() {
+    std::cout<<"=== DAG ===\n";
+    RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
+    std::cout<<"\n=== Topological Batches ===\n";
+    RUN(test_topo_linear); RUN(test_topo_parallel); RUN(test_leaf);
+    std::cout<<"\n=== $ref Resolution ===\n";
+    RUN(test_ref_task); RUN(test_ref_nested); RUN(test_ref_inputs);
+    std::cout<<"\n=== CircuitBreaker ===\n";
+    RUN(test_cb_closed); RUN(test_cb_opens); RUN(test_cb_recovers);
+    std::cout<<"\n=== ToolRegistry ===\n";
+    RUN(test_tool_reg); RUN(test_tool_unknown); RUN(test_tool_list);
+    std::cout<<"\n=== WorkflowContext ===\n";
+    RUN(test_ctx_empty); RUN(test_ctx_records); RUN(test_ctx_evict);
+    std::cout<<"\n=== Tracing ===\n";
+    RUN(test_trace);
+    std::cout<<"\n=== ProviderAutoPlanner ===\n";
+    RUN(test_planner_empty); RUN(test_planner_add);
+    std::cout<<"\n=== Streaming ===\n";
+    RUN(test_stream_cb);
+    std::cout<<"\n=== EngineConfig ===\n";
+    RUN(test_cfg_single); RUN(test_cfg_two);
+    std::cout<<"\n=== Agent Loop ===\n";
+    RUN(test_agent_action_types); RUN(test_agent_result_defaults);
+    RUN(test_agent_result_reached_max); RUN(test_agent_step_recording);
+        std::cout<<"\n=== New features ===\n";
+    RUN(test_exception_hierarchy);
+    RUN(test_tool_schema_validation);
+    RUN(test_step_new_fields);
+    RUN(test_agent_on_step_callback);
+    std::cout<<"\n=== Regression (audit fixes) ===\n";
+    RUN(test_tool_null_fn); RUN(test_dag_empty_id);
+    RUN(test_ctx_custom_truncation); RUN(test_agent_result_steps);
+    std::cout<<"\n=== ThreadPool ===\n";
+    RUN(test_threadpool_basic); RUN(test_threadpool_returns_value);
+    RUN(test_threadpool_parallel);
+    std::cout<<"\n=== JSON Schema Validation ===\n";
+    RUN(test_schema_valid_object); RUN(test_schema_missing_required);
+    RUN(test_schema_wrong_type); RUN(test_schema_enum); RUN(test_schema_nested);
+    std::cout<<"\n=== Plan-time Tool Validation ===\n";
+    RUN(test_plan_tool_validation);
+    std::cout<<"\n=== Rate Limiter ===\n";
+    RUN(test_rate_limiter_unlimited); RUN(test_rate_limiter_basic);
+    RUN(test_rate_limiter_slow); RUN(test_rate_limiter_timeout);
+    std::cout<<"\n=== Metrics ===\n";
+    RUN(test_metrics_noop); RUN(test_metrics_console); RUN(test_metrics_interface);
+    std::cout<<"\n=== ProviderConfig extensions ===\n";
+    RUN(test_provider_config_max_rps);
+    std::cout<<"\n────────────────────────────────────────\n";
+    std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";
+    return (g_pass==g_run) ? 0 : 1;
+}

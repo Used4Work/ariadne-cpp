@@ -1,0 +1,5 @@
+@PACKAGE_INIT@
+include("${CMAKE_CURRENT_LIST_DIR}/ariadneTargets.cmake")
+find_dependency(CURL REQUIRED)
+find_dependency(nlohmann_json REQUIRED)
+check_required_components(ariadne)
