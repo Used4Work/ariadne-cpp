@@ -442,7 +442,7 @@ void test_provider_config_max_rps() {
     ASSERT(groq.max_rps == 0.5);
 
     auto gh = ProviderConfig::github_models("tok");
-    ASSERT(gh.max_rps == 0.25);
+    ASSERT(gh.max_rps == 0.1);  // updated: 0.1 RPS = 6 RPM per tier (safe under GH Models)
 
     auto unlimited = ProviderConfig::anthropic("key");
     ASSERT(unlimited.max_rps == 0.0);
