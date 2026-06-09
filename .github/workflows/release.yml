@@ -80,31 +80,122 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel 4
 
+      - name: Get tag name
+        id: tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
       - name: Package (Linux / macOS)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
-          [ -z "$TAG" ] && TAG="${{ github.event.inputs.tag }}"
+          TAG="${{ steps.tag.outputs.tag }}"
           DIST="ariadne-${TAG}-${{ matrix.name }}"
           mkdir -p "${DIST}/include" "${DIST}/lib" "${DIST}/cmake"
-          cp ariadne.hpp "build/${{ matrix.lib }}" "${DIST}/include/" 2>/dev/null || true
-          cp "build/${{ matrix.lib }}" "${DIST}/lib/"
           cp ariadne.hpp "${DIST}/include/"
+          cp "build/${{ matrix.lib }}" "${DIST}/lib/"
           cp README.md LICENSE "${DIST}/"
-          printf 'if(NOT TARGET ariadne::ariadne)
+          cat > "${DIST}/cmake/ariadne-config.cmake" << 'CMAKEEOF'
+if(NOT TARGET ariadne::ariadne)
   add_library(ariadne::ariadne STATIC IMPORTED)
   get_filename_component(_d "${CMAKE_CURRENT_LIST_DIR}" PATH)
   set_target_properties(ariadne::ariadne PROPERTIES
     IMPORTED_LOCATION "${_d}/lib/libariadne.a"
     INTERFACE_INCLUDE_DIRECTORIES "${_d}/include")
 endif()
-' > "${DIST}/cmake/ariadne-config.cmake"
+CMAKEEOF
           tar -czf "ariadne-${TAG}-${{ matrix.name }}.tar.gz" "${DIST}"
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $tag = if ("${{ github.ref_name }}" -ne "") { "${{ github.ref_name }}" } else { "${{ github.event.inputs.tag }}" }
+          $tag = "${{ steps.tag.outputs.tag }}"
           $dist = "ariadne-$tag-windows-x64"
-          New-Item -ItemType Directory -Path "$dist\include","$dist\lib","$dist
+          New-Item -ItemType Directory -Path "$dist\include","$dist\lib","$dist\cmake" -Force
+          Copy-Item ariadne.hpp "$dist\include\"
+          Copy-Item "build\${{ matrix.lib }}" "$dist\lib\"
+          Copy-Item README.md,LICENSE "$dist\"
+          $cmake_cfg = @'
+if(NOT TARGET ariadne::ariadne)
+  add_library(ariadne::ariadne STATIC IMPORTED)
+  get_filename_component(_d "${CMAKE_CURRENT_LIST_DIR}" PATH)
+  set_target_properties(ariadne::ariadne PROPERTIES
+    IMPORTED_LOCATION "${_d}/lib/ariadne.lib"
+    INTERFACE_INCLUDE_DIRECTORIES "${_d}/include")
+endif()
+'@
+          Set-Content -Path "$dist\cmake\ariadne-config.cmake" -Value $cmake_cfg
+          Compress-Archive -Path "$dist\*" -DestinationPath "ariadne-$tag-windows-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ariadne-${{ matrix.name }}
+          path: "ariadne-*-${{ matrix.name }}.${{ matrix.ext }}"
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ariadne-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh ariadne-* 2>/dev/null || echo "No artifacts found"
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
+          name: "Ariadne ${{ github.ref_name || github.event.inputs.tag }}"
+          body: |
+            ## Pre-built Binaries
+
+            | Platform | File |
+            |---|---|
+            | Linux x64 | `ariadne-*-linux-x64.tar.gz` |
+            | Windows x64 (MSVC static) | `ariadne-*-windows-x64.zip` |
+            | macOS ARM64 | `ariadne-*-macos-arm64.tar.gz` |
+
+            ## Quick Start (CMake)
+
+            ```cmake
+            find_package(ariadne CONFIG REQUIRED
+              PATHS "path/to/ariadne-*/cmake" NO_DEFAULT_PATH)
+            target_link_libraries(myapp PRIVATE ariadne::ariadne)
+            ```
+
+            ## Build from Source
+
+            **Linux**
+            ```bash
+            sudo apt install libcurl4-openssl-dev nlohmann-json3-dev
+            cmake -B build && cmake --build build --parallel 4
+            ./build/unit_tests
+            ```
+
+            **Windows**
+            ```powershell
+            vcpkg install --triplet x64-windows-static
+            $root = $env:VCPKG_INSTALLATION_ROOT
+            cmake -B build "-DCMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows-static
+            cmake --build build --config Release
+            ```
+
+            **macOS**
+            ```bash
+            brew install curl nlohmann-json
+            cmake -B build && cmake --build build --parallel 4
+            ```
+          files: |
+            ariadne-*-linux-x64.tar.gz
+            ariadne-*-windows-x64.zip
+            ariadne-*-macos-arm64.tar.gz
+          generate_release_notes: true
+          fail_on_unmatched_files: false
