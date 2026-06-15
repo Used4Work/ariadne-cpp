@@ -93,6 +93,31 @@
           "id": "meta/llama-3.2-11b-vision-instruct",
           "role": "subagent",
           "note": "auto"
+        },
+        {
+          "id": "meta/llama-3.2-90b-vision-instruct",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "meta/llama-3.3-70b-instruct",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "meta/llama-4-maverick-17b-128e-instruct-fp8",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "meta/llama-4-scout-17b-16e-instruct",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "meta/meta-llama-3.1-405b-instruct",
+          "role": "subagent",
+          "note": "auto"
         }
       ]
     },
