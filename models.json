@@ -1,1 +1,151 @@
-{"_updated":"2026-06-08","providers":{"anthropic":{"api_endpoint":"https://api.anthropic.com/v1/messages","auth":"x-api-key","key_env":"ANTHROPIC_API_KEY","recommended_tier":"ORCHESTRATOR","models":[{"id":"claude-opus-4-8","role":"orchestrator","note":"Strongest"},{"id":"claude-sonnet-4-6","role":"subagent","note":"Balanced"},{"id":"claude-haiku-4-5-20251001","role":"subagent","note":"Fast"}]},"openai":{"api_endpoint":"https://api.openai.com/v1/chat/completions","auth":"Bearer","key_env":"OPENAI_API_KEY","recommended_tier":"ORCHESTRATOR","models":[{"id":"gpt-5.5-2026-04-23","role":"orchestrator","note":"Latest flagship"},{"id":"chat-latest","role":"orchestrator","note":"Always current"},{"id":"gpt-5.4-mini","role":"subagent","note":"Free-tier"}]},"github_models":{"api_endpoint":"https://models.github.ai/inference/chat/completions","auth":"Bearer GITHUB_TOKEN","key_env":"GITHUB_TOKEN","cost":"free","recommended_tier":"SUBAGENT","models":[{"id":"openai/gpt-4.1","role":"orchestrator","note":"Best on GH Models"},{"id":"openai/gpt-4o-mini","role":"subagent","note":"Fast free"},{"id":"meta/llama-4-maverick-instruct","role":"subagent","note":"OS flagship"}]},"groq":{"api_endpoint":"https://api.groq.com/openai/v1/chat/completions","auth":"Bearer","key_env":"GROQ_API_KEY","cost":"free_tier","recommended_tier":"SUBAGENT","models":[{"id":"llama-3.3-70b-versatile","role":"subagent","speed_tps":394,"note":"Best free"},{"id":"gpt-oss-120b","role":"subagent","speed_tps":500,"note":"OpenAI OS"},{"id":"llama-3.1-8b-instant","role":"subagent","speed_tps":840,"note":"Fastest"}]},"ollama":{"api_endpoint":"http://localhost:11434/v1/chat/completions","auth":"none","key_env":"none","cost":"free_local","recommended_tier":"SUBAGENT","models":[{"id":"llama3.2","role":"subagent","note":"Default"},{"id":"gpt-oss:20b","role":"subagent","note":"OpenAI OS local"},{"id":"qwen2.5-coder:32b","role":"subagent","note":"Best local coding"}]}}}
+{
+  "_updated": "2026-06-15",
+  "providers": {
+    "anthropic": {
+      "api_endpoint": "https://api.anthropic.com/v1/messages",
+      "auth": "x-api-key",
+      "key_env": "ANTHROPIC_API_KEY",
+      "recommended_tier": "ORCHESTRATOR",
+      "models": [
+        {
+          "id": "claude-opus-4-8",
+          "role": "orchestrator",
+          "note": "Strongest"
+        },
+        {
+          "id": "claude-sonnet-4-6",
+          "role": "subagent",
+          "note": "Balanced"
+        },
+        {
+          "id": "claude-haiku-4-5-20251001",
+          "role": "subagent",
+          "note": "Fast"
+        }
+      ]
+    },
+    "openai": {
+      "api_endpoint": "https://api.openai.com/v1/chat/completions",
+      "auth": "Bearer",
+      "key_env": "OPENAI_API_KEY",
+      "recommended_tier": "ORCHESTRATOR",
+      "models": [
+        {
+          "id": "gpt-5.5-2026-04-23",
+          "role": "orchestrator",
+          "note": "Latest flagship"
+        },
+        {
+          "id": "chat-latest",
+          "role": "orchestrator",
+          "note": "Always current"
+        },
+        {
+          "id": "gpt-5.4-mini",
+          "role": "subagent",
+          "note": "Free-tier"
+        }
+      ]
+    },
+    "github_models": {
+      "api_endpoint": "https://models.github.ai/inference/chat/completions",
+      "auth": "Bearer GITHUB_TOKEN",
+      "key_env": "GITHUB_TOKEN",
+      "cost": "free",
+      "recommended_tier": "SUBAGENT",
+      "models": [
+        {
+          "id": "openai/gpt-4.1",
+          "role": "orchestrator",
+          "note": "Best on GH Models"
+        },
+        {
+          "id": "openai/gpt-4o-mini",
+          "role": "subagent",
+          "note": "Fast free"
+        },
+        {
+          "id": "meta/llama-4-maverick-instruct",
+          "role": "subagent",
+          "note": "OS flagship"
+        },
+        {
+          "id": "cohere/cohere-command-a",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "deepseek/deepseek-r1",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "deepseek/deepseek-r1-0528",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "deepseek/deepseek-v3-0324",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "meta/llama-3.2-11b-vision-instruct",
+          "role": "subagent",
+          "note": "auto"
+        }
+      ]
+    },
+    "groq": {
+      "api_endpoint": "https://api.groq.com/openai/v1/chat/completions",
+      "auth": "Bearer",
+      "key_env": "GROQ_API_KEY",
+      "cost": "free_tier",
+      "recommended_tier": "SUBAGENT",
+      "models": [
+        {
+          "id": "llama-3.3-70b-versatile",
+          "role": "subagent",
+          "speed_tps": 394,
+          "note": "Best free"
+        },
+        {
+          "id": "gpt-oss-120b",
+          "role": "subagent",
+          "speed_tps": 500,
+          "note": "OpenAI OS"
+        },
+        {
+          "id": "llama-3.1-8b-instant",
+          "role": "subagent",
+          "speed_tps": 840,
+          "note": "Fastest"
+        }
+      ]
+    },
+    "ollama": {
+      "api_endpoint": "http://localhost:11434/v1/chat/completions",
+      "auth": "none",
+      "key_env": "none",
+      "cost": "free_local",
+      "recommended_tier": "SUBAGENT",
+      "models": [
+        {
+          "id": "llama3.2",
+          "role": "subagent",
+          "note": "Default"
+        },
+        {
+          "id": "gpt-oss:20b",
+          "role": "subagent",
+          "note": "OpenAI OS local"
+        },
+        {
+          "id": "qwen2.5-coder:32b",
+          "role": "subagent",
+          "note": "Best local coding"
+        }
+      ]
+    }
+  }
+}
