@@ -358,25 +358,42 @@ float InMemoryVectorStore::cosine_similarity(const std::vector<float>& a, const 
     return (denom > 1e-9f) ? (dot / denom) : 0.0f;
 }
 
+static std::vector<float> normalize_vec(const std::vector<float>& v) {
+    float norm = 0.0f;
+    for (float x : v) norm += x * x;
+    norm = std::sqrt(norm);
+    if (norm < 1e-9f) return v;
+    std::vector<float> out(v.size());
+    for (size_t i = 0; i < v.size(); ++i) out[i] = v[i] / norm;
+    return out;
+}
+
 void InMemoryVectorStore::add(const std::string& id, const std::vector<float>& embedding,
                                 const json& metadata) {
+    auto normed = normalize_vec(embedding);
     std::unique_lock<std::shared_mutex> lk(mu_);
     for (auto& e : entries_) {
-        if (e.id == id) { e.embedding = embedding; e.metadata = metadata; return; }
+        if (e.id == id) { e.embedding = normed; e.metadata = metadata; return; }
     }
-    entries_.push_back({id, embedding, metadata});
+    entries_.push_back({id, normed, metadata});
 }
 
 std::vector<VectorResult> InMemoryVectorStore::query(const std::vector<float>& embedding,
                                                        int top_k) const {
+    auto q = normalize_vec(embedding);
     std::shared_lock<std::shared_mutex> lk(mu_);
     std::vector<VectorResult> scored;
     scored.reserve(entries_.size());
-    for (const auto& e : entries_)
-        scored.push_back({e.id, cosine_similarity(embedding, e.embedding), e.metadata});
-    std::sort(scored.begin(), scored.end(),
-              [](const VectorResult& a, const VectorResult& b) { return a.score > b.score; });
-    if ((int)scored.size() > top_k) scored.resize(top_k);
+    for (const auto& e : entries_) {
+        float dot = 0.0f;
+        for (size_t i = 0; i < q.size() && i < e.embedding.size(); ++i)
+            dot += q[i] * e.embedding[i];
+        scored.push_back({e.id, dot, e.metadata});
+    }
+    size_t k = std::min((size_t)top_k, scored.size());
+    std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
+        [](const VectorResult& a, const VectorResult& b) { return a.score > b.score; });
+    scored.resize(k);
     return scored;
 }
 
