@@ -19,8 +19,13 @@ jobs:
         include:
           - os: ubuntu-latest
             name: Linux x64
+          - os: ubuntu-latest
+            name: Linux x64 (sanitizers)
+            sanitizers: true
           - os: windows-latest
             name: Windows x64
+          - os: macos-latest
+            name: macOS ARM64
 
     steps:
       - uses: actions/checkout@v4
@@ -43,9 +48,21 @@ jobs:
         shell: pwsh
         run: vcpkg install --triplet x64-windows-static
 
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install curl nlohmann-json
+
       - name: Configure (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.sanitizers
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DARIADNE_BUILD_TESTS=ON -DARIADNE_BUILD_EXAMPLES=OFF -DARIADNE_BUILD_STUDIO=ON
+
+      - name: Configure (Linux sanitizers)
+        if: matrix.sanitizers
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DARIADNE_BUILD_TESTS=ON -DARIADNE_BUILD_EXAMPLES=OFF -DARIADNE_BUILD_STUDIO=ON
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
@@ -58,6 +75,10 @@ jobs:
             -DARIADNE_BUILD_TESTS=ON `
             -DARIADNE_BUILD_EXAMPLES=OFF `
             -DARIADNE_BUILD_STUDIO=ON
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DARIADNE_BUILD_TESTS=ON -DARIADNE_BUILD_EXAMPLES=OFF -DARIADNE_BUILD_STUDIO=ON
 
       - name: Build
         run: cmake --build build --config Release --parallel 4

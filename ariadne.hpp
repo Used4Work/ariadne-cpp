@@ -22,6 +22,7 @@
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <shared_mutex>
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
@@ -643,8 +644,8 @@ private:
     mutable std::mutex usage_mu_;
     mutable TokenUsage cumulative_usage_;
     mutable std::unique_ptr<ResponseCache> response_cache_;
-    bool resp_cache_enabled_ = false;
-    long token_budget_ = 0;
+    std::atomic<bool> resp_cache_enabled_{false};
+    std::atomic<long> token_budget_{0};
 
     static std::vector<Slot> build_slots(const TierConfig& cfg);
     std::string try_slots(const std::vector<Slot>& slots,
@@ -795,6 +796,7 @@ public:
     bool                 has_tool     (const std::string& name)                     const;
     void                 add_guardrail(const std::string& tool_name, GuardrailFn fn);
 private:
+    mutable std::shared_mutex mu_;
     std::map<std::string, ToolDef> defs_;
     std::map<std::string, ToolFn>  fns_;
     std::map<std::string, std::vector<GuardrailFn>> guardrails_;
@@ -957,11 +959,11 @@ public:
     bool has(const std::string& key) const;
     std::string get(const std::string& key);
     void put(const std::string& key, const std::string& response);
-    size_t size() const { return cache_.size(); }
-    void clear() { cache_.clear(); order_.clear(); }
+    size_t size() const { std::lock_guard<std::mutex> lk(mu_); return cache_.size(); }
+    void clear() { std::lock_guard<std::mutex> lk(mu_); cache_.clear(); order_.clear(); }
 
     struct Stats { long hits = 0; long misses = 0; };
-    Stats stats() const { return stats_; }
+    Stats stats() const { std::lock_guard<std::mutex> lk(mu_); return stats_; }
 
 private:
     size_t max_size_;
@@ -1251,11 +1253,11 @@ public:
     bool has(const std::string& key) const;
     WorkflowPlan get(const std::string& key);
     void put(const std::string& key, const WorkflowPlan& plan);
-    size_t size() const { return cache_.size(); }
-    void clear() { cache_.clear(); order_.clear(); }
+    size_t size() const { std::lock_guard<std::mutex> lk(mu_); return cache_.size(); }
+    void clear() { std::lock_guard<std::mutex> lk(mu_); cache_.clear(); order_.clear(); }
 
     struct Stats { long hits = 0; long misses = 0; };
-    Stats stats() const { return stats_; }
+    Stats stats() const { std::lock_guard<std::mutex> lk(mu_); return stats_; }
 
 private:
     size_t max_size_;

@@ -59,8 +59,9 @@ HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA,     &resp.body);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT,       (long)cfg_.timeout_sec);
-    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);  // POSIX 多线程安全
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,        (long)cfg_.timeout_sec);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
     CURLcode rc = curl_easy_perform(c);
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
@@ -106,8 +107,10 @@ std::string AnthropicProvider::complete(const std::string& prompt,
          "x-api-key: " + cfg_.api_key,
          "anthropic-version: 2024-10-22"},
         body.dump());
-    if (resp.status_code == 429)
-        throw ProviderError("Anthropic: 429 Too Many Requests");
+    if (resp.status_code == 429 || resp.status_code == 503)
+        throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
+        throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " server error (retryable)");
     auto j = json::parse(resp.body);
     if (j.contains("error"))
         throw ProviderError("Anthropic: " + j["error"]["message"].get<std::string>());
@@ -144,9 +147,13 @@ std::string OpenAIChatProvider::complete(const std::string& prompt,
         {"Content-Type: application/json",
          "Authorization: Bearer " + cfg_.api_key},
         body.dump());
-    if (resp.status_code == 429)
-        throw ProviderError("OpenAI Chat: 429 Too Many Requests");
-    auto j = json::parse(resp.body);
+    if (resp.status_code == 429 || resp.status_code == 503)
+        throw ProviderError("OpenAI Chat: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
+        throw ProviderError("OpenAI Chat: " + std::to_string(resp.status_code) + " server error (retryable)");
+    json j;
+    try { j = json::parse(resp.body); }
+    catch (...) { throw ProviderError("OpenAI Chat: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
     if (j.contains("error"))
         throw ProviderError("OpenAI Chat: " + j["error"]["message"].get<std::string>());
     extract_token_usage(j);
@@ -169,8 +176,10 @@ std::string OpenAIResponsesProvider::complete(const std::string& prompt,
         {"Content-Type: application/json",
          "Authorization: Bearer " + cfg_.api_key},
         body.dump());
-    if (resp.status_code == 429)
-        throw ProviderError("OpenAI Responses: 429 Too Many Requests");
+    if (resp.status_code == 429 || resp.status_code == 503)
+        throw ProviderError("OpenAI Responses: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
+        throw ProviderError("OpenAI Responses: " + std::to_string(resp.status_code) + " server error (retryable)");
     auto j = json::parse(resp.body);
     if (j.contains("error"))
         throw ProviderError("OpenAI Responses: " + j["error"]["message"].get<std::string>());
@@ -512,16 +521,16 @@ long LLMClient::response_cache_hits() const {
 
 void LLMClient::print_status() const {
     auto print_tier = [](const char* name, const std::vector<ProviderStats>& sv) {
-        std::cout << "── " << name << " ──\n";
+        log_msg(LogLevel::LOG_INFO, "LLMClient", std::string("── ") + name + " ──");
         for (const auto& s : sv) {
-            const char* cs = s.circuit_state == CircuitBreaker::State::CLOSED ? "CLOSED   " :
-                             s.circuit_state == CircuitBreaker::State::OPEN   ? "OPEN     " : "HALF_OPEN";
-            std::cout << "  [" << cs << "] " << std::left << std::setw(20)
-                      << (s.provider_name + "/" + s.model_name)
-                      << " calls=" << s.total_calls << " ok=" << s.successes << " fail=" << s.failures;
+            const char* cs = s.circuit_state == CircuitBreaker::State::CLOSED ? "CLOSED" :
+                             s.circuit_state == CircuitBreaker::State::OPEN   ? "OPEN" : "HALF_OPEN";
+            std::string line = "[" + std::string(cs) + "] " + s.provider_name + "/" + s.model_name
+                + " calls=" + std::to_string(s.total_calls) + " ok=" + std::to_string(s.successes)
+                + " fail=" + std::to_string(s.failures);
             if (s.circuit_state == CircuitBreaker::State::OPEN)
-                std::cout << " (retry in " << (int)s.secs_to_retry << "s)";
-            std::cout << "\n";
+                line += " (retry in " + std::to_string((int)s.secs_to_retry) + "s)";
+            log_msg(LogLevel::LOG_INFO, "LLMClient", line);
         }
     };
     print_tier("ORCHESTRATOR", stats(ModelTier::ORCHESTRATOR));
@@ -604,13 +613,14 @@ std::vector<SchemaViolation> validate_json_schema(const json& value,
 }
 
 void ToolRegistry::register_tool(const ToolDef& def, ToolFn fn) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
     defs_[def.name] = def; fns_[def.name] = std::move(fn);
 }
 json ToolRegistry::call(const std::string& name, const json& params) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
     auto fit = fns_.find(name);
     if (fit == fns_.end()) throw ToolNotFoundError(name, "not registered");
 
-    // B3: Validate required inputs against schema
     auto dit = defs_.find(name);
     if (dit != defs_.end()) {
         const auto& schema = dit->second.input_schema;
@@ -623,7 +633,6 @@ json ToolRegistry::call(const std::string& name, const json& params) const {
         }
     }
 
-    // Tool guardrails
     auto git = guardrails_.find(name);
     if (git != guardrails_.end()) {
         for (const auto& guard : git->second) {
@@ -633,16 +642,23 @@ json ToolRegistry::call(const std::string& name, const json& params) const {
     }
 
     if (!fit->second) return nullptr;
-    return fit->second(params);
+    auto fn_copy = fit->second;
+    lk.unlock();
+    return fn_copy(params);
 }
 std::vector<ToolDef> ToolRegistry::list_tools() const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
     std::vector<ToolDef> out;
     for (const auto& [_, d] : defs_) out.push_back(d);
     return out;
 }
-bool ToolRegistry::has_tool(const std::string& n) const { return fns_.count(n) > 0; }
+bool ToolRegistry::has_tool(const std::string& n) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    return fns_.count(n) > 0;
+}
 
 void ToolRegistry::add_guardrail(const std::string& tool_name, GuardrailFn fn) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
     guardrails_[tool_name].push_back(std::move(fn));
 }
 
@@ -2173,12 +2189,13 @@ ProbeResult ProviderAutoPlanner::probe_one(const Candidate& c,
 ProviderAutoPlanner::PlanResult
 ProviderAutoPlanner::build_plan(const std::vector<ProbeResult>& results,
                                   const std::string& prefix) const {
-    std::cout << "[" << prefix << "] Probe results (" << results.size() << " candidates):\n";
+    log_msg(LogLevel::LOG_INFO, "AutoPlanner",
+        prefix + ": " + std::to_string(results.size()) + " candidates probed");
     for (const auto& r : results) {
-        std::cout << "  " << (r.alive ? "OK  " : "FAIL") << " [" << r.tier << "] "
-                  << std::left << std::setw(22) << r.name << " " << r.latency_ms << "ms";
-        if (!r.alive) std::cout << "  — " << r.error.substr(0,60);
-        std::cout << "\n";
+        std::string line = (r.alive ? "OK  " : "FAIL") + std::string(" [") + r.tier + "] "
+            + r.name + " " + std::to_string(r.latency_ms) + "ms";
+        if (!r.alive) line += " — " + r.error.substr(0, 60);
+        log_msg(r.alive ? LogLevel::LOG_INFO : LogLevel::LOG_WARN, "AutoPlanner", line);
     }
 
     using PC = std::pair<long, ProviderConfig>;
@@ -2215,8 +2232,8 @@ ProviderAutoPlanner::build_plan(const std::vector<ProbeResult>& results,
     plan.success = true;
     for (const auto& [_, c] : strong_v) plan.alive_strong.push_back(c.model);
     for (const auto& [_, c] : fast_v)   plan.alive_fast.push_back(c.model);
-    std::cout << "[" << prefix << "] → ORCHESTRATOR=" << plan.alive_strong[0]
-              << "  SUBAGENT=" << plan.alive_fast[0] << "\n";
+    log_msg(LogLevel::LOG_INFO, "AutoPlanner",
+        prefix + " → ORCHESTRATOR=" + plan.alive_strong[0] + "  SUBAGENT=" + plan.alive_fast[0]);
     return plan;
 }
 
@@ -2240,17 +2257,17 @@ ProviderAutoPlanner::probe_and_plan(std::chrono::seconds timeout) const {
 
 ProviderAutoPlanner::PlanResult
 ProviderAutoPlanner::repair(std::chrono::seconds timeout) const {
-    std::cout << "[REPAIR] Re-probing after provider failure...\n";
+    log_msg(LogLevel::LOG_WARN, "AutoPlanner", "Re-probing after provider failure...");
     return probe_and_plan(timeout);
 }
 
 void ProviderAutoPlanner::print_last_report() const {
-    if (last_results_.empty()) { std::cout << "(no probe run yet)\n"; return; }
+    if (last_results_.empty()) { log_msg(LogLevel::LOG_INFO, "AutoPlanner", "(no probe run yet)"); return; }
     for (const auto& r : last_results_) {
-        std::cout << "  " << (r.alive ? "✓" : "✗") << " [" << r.tier << "] "
-                  << r.name << "  " << r.latency_ms << "ms";
-        if (!r.alive) std::cout << " — " << r.error;
-        std::cout << "\n";
+        std::string line = (r.alive ? "OK" : "FAIL") + std::string(" [") + r.tier + "] "
+            + r.name + "  " + std::to_string(r.latency_ms) + "ms";
+        if (!r.alive) line += " — " + r.error;
+        log_msg(LogLevel::LOG_INFO, "AutoPlanner", line);
     }
 }
 
@@ -2287,7 +2304,8 @@ WorkflowResult WorkflowEngine::run_with_recovery(const std::string& task,
 
     for (int attempt = 0; attempt < max_repair_attempts
                         && is_provider_err(result.error_message); ++attempt) {
-        std::cout << "[RECOVERY] Attempt " << (attempt+1) << "/" << max_repair_attempts << "\n";
+        log_msg(LogLevel::LOG_WARN, "Recovery",
+            "Attempt " + std::to_string(attempt+1) + "/" + std::to_string(max_repair_attempts));
         auto plan = planner.repair();
         if (!plan.success) { result.error_message = "Recovery failed: " + plan.error; break; }
         config_.orchestrator = plan.config.orchestrator;
@@ -2297,7 +2315,7 @@ WorkflowResult WorkflowEngine::run_with_recovery(const std::string& task,
         executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, config_.max_concurrency, metrics_);
         result = run(task);
         if (result.success) {
-            std::cout << "[RECOVERY] Success on attempt " << (attempt+1) << "\n";
+            log_msg(LogLevel::LOG_INFO, "Recovery", "Success on attempt " + std::to_string(attempt+1));
             return result;
         }
     }
@@ -3186,8 +3204,8 @@ void WorkflowEngine::connect_mcp(const std::string& command,
     auto client = std::make_unique<McpClient>(std::move(transport));
     client->initialize("ariadne", "0.6.0");
     client->register_all_tools(*tools_);
-    std::cout << "[mcp] Connected to " << command << ", registered "
-              << client->list_tools().size() << " tools\n";
+    log_msg(LogLevel::LOG_INFO, "MCP",
+        "Connected to " + command + ", registered " + std::to_string(client->list_tools().size()) + " tools");
     mcp_clients_.push_back(std::move(client));
 }
 
