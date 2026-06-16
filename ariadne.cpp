@@ -433,6 +433,59 @@ bool LLMClient::supports_native_tools(ModelTier tier) const {
     return !slots.empty() && slots[0].provider->supports_native_tools();
 }
 
+// ── GeminiProvider ───────────────────────────────────────────────
+
+std::string GeminiProvider::complete(const std::string& prompt,
+                                      const std::string& sys,
+                                      double temp,
+                                      bool force_json,
+                                      const json& /*output_schema*/) const {
+    json contents = json::array();
+    if (!sys.empty()) {
+        contents.push_back({{"role","user"},{"parts",{{{"text", sys + "\n\n" + prompt}}}}});
+    } else {
+        contents.push_back({{"role","user"},{"parts",{{{"text", prompt}}}}});
+    }
+    json body = {{"contents", contents}};
+    json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
+    if (force_json) gen_config["responseMimeType"] = "application/json";
+    body["generationConfig"] = gen_config;
+
+    std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                    + cfg_.model + ":generateContent?key=" + cfg_.api_key;
+    auto resp = http_post(url, {"Content-Type: application/json"}, body.dump());
+    if (resp.status_code == 429 || resp.status_code == 503) {
+        std::string msg = "Gemini: " + std::to_string(resp.status_code) + " rate limited";
+        if (!resp.retry_after.empty()) msg += " retry_after=" + resp.retry_after;
+        throw ProviderError(msg);
+    }
+    if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
+        throw ProviderError("Gemini: " + std::to_string(resp.status_code) + " server error (retryable)");
+    json j;
+    try { j = json::parse(resp.body); }
+    catch (...) { throw ProviderError("Gemini: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
+    if (j.contains("error"))
+        throw ProviderError("Gemini: " + j["error"].value("message", "unknown error"));
+    // Parse Gemini token usage
+    if (j.contains("usageMetadata")) {
+        const auto& u = j["usageMetadata"];
+        g_last_token_usage.input_tokens  = u.value("promptTokenCount", 0L);
+        g_last_token_usage.output_tokens = u.value("candidatesTokenCount", 0L);
+        g_last_token_usage.total_tokens  = u.value("totalTokenCount", 0L);
+    }
+    return j["candidates"][0]["content"]["parts"][0]["text"].get<std::string>();
+}
+
+void GeminiProvider::complete_stream(const std::string& prompt,
+                                      const std::string& sys,
+                                      double temp,
+                                      StreamCallback on_chunk) const {
+    auto full = complete(prompt, sys, temp);
+    std::istringstream iss(full);
+    std::string word;
+    while (std::getline(iss, word, ' ')) on_chunk(word + " ");
+}
+
 // ── make_provider ────────────────────────────────────────────────
 
 std::unique_ptr<ILLMProvider> make_provider(const ProviderConfig& cfg) {
@@ -440,6 +493,7 @@ std::unique_ptr<ILLMProvider> make_provider(const ProviderConfig& cfg) {
     case ProviderType::ANTHROPIC:        return std::make_unique<AnthropicProvider>(cfg);
     case ProviderType::OPENAI_CHAT:      return std::make_unique<OpenAIChatProvider>(cfg);
     case ProviderType::OPENAI_RESPONSES: return std::make_unique<OpenAIResponsesProvider>(cfg);
+    case ProviderType::GEMINI:           return std::make_unique<GeminiProvider>(cfg);
     default: throw std::invalid_argument("Unknown ProviderType");
     }
 }

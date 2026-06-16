@@ -42,7 +42,12 @@ inline long estimate_tokens(const std::string& text) {
 }
 
 /** 库版本号 */
-constexpr const char* ARIADNE_VERSION = "1.2.0";
+#if __has_include("ariadne_version_gen.hpp")
+#include "ariadne_version_gen.hpp"
+constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
+#else
+constexpr const char* ARIADNE_VERSION = "1.4.0";
+#endif
 inline std::string version() { return ARIADNE_VERSION; }
 
 
@@ -238,7 +243,7 @@ private:
 // 2. Provider 层
 // ════════════════════════════════════════════════════════════════
 
-enum class ProviderType { ANTHROPIC, OPENAI_CHAT, OPENAI_RESPONSES };
+enum class ProviderType { ANTHROPIC, OPENAI_CHAT, OPENAI_RESPONSES, GEMINI };
 
 struct ProviderConfig {
     ProviderType type;
@@ -316,6 +321,18 @@ struct ProviderConfig {
     static ProviderConfig mistral(const std::string& key,
                                    const std::string& model = "mistral-small-latest") {
         return openai_compatible(key, "https://api.mistral.ai/v1", model, 1.0);
+    }
+    /** Google Gemini (free tier: 15 RPM for Flash models) */
+    static ProviderConfig gemini(const std::string& key,
+                                  const std::string& model = "gemini-2.0-flash") {
+        ProviderConfig c;
+        c.type     = ProviderType::GEMINI;
+        c.api_key  = key;
+        c.model    = model;
+        c.max_rps  = 0.25;
+        c.pricing  = (model.find("flash") != std::string::npos)
+                     ? ModelPricing{0.075, 0.30} : ModelPricing{1.25, 5.00};
+        return c;
     }
 };
 
@@ -451,6 +468,23 @@ public:
                           StreamCallback on_chunk) const override;
     std::string provider_name() const override { return "openai_responses"; }
     std::string model_name()    const override { return cfg_.model;          }
+};
+
+/** POST /v1beta/models/{model}:generateContent → candidates[0].content.parts[0].text */
+class GeminiProvider : public HttpProvider {
+public:
+    explicit GeminiProvider(const ProviderConfig& cfg) : HttpProvider(cfg) {}
+    std::string complete(const std::string& prompt,
+                          const std::string& system,
+                          double temperature,
+                          bool force_json = false,
+                          const json& output_schema = json()) const override;
+    void complete_stream(const std::string& prompt,
+                          const std::string& system,
+                          double temperature,
+                          StreamCallback on_chunk) const override;
+    std::string provider_name() const override { return "gemini"; }
+    std::string model_name()    const override { return cfg_.model; }
 };
 
 std::unique_ptr<ILLMProvider> make_provider(const ProviderConfig& cfg);

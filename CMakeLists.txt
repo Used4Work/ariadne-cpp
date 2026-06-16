@@ -1,7 +1,12 @@
 cmake_minimum_required(VERSION 3.17)
-project(ariadne VERSION 1.2.0 LANGUAGES CXX)
+project(ariadne VERSION 1.4.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Generate version header from CMake (single source of truth)
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.hpp.in
+    ${CMAKE_CURRENT_BINARY_DIR}/ariadne_version_gen.hpp @ONLY)
 
 find_package(CURL REQUIRED)
 find_package(nlohmann_json 3.9 REQUIRED)
@@ -27,6 +32,7 @@ add_library(ariadne STATIC ariadne.cpp)
 add_library(ariadne::ariadne ALIAS ariadne)
 target_include_directories(ariadne PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(ariadne PUBLIC CURL::libcurl nlohmann_json::nlohmann_json)
 

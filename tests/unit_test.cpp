@@ -1262,6 +1262,33 @@ void test_mock_supports_native() {
     ASSERT(!client.supports_native_tools(ModelTier::ORCHESTRATOR));
 }
 
+// ── Gemini Provider ─────────────────────────────────────
+void test_gemini_config() {
+    auto c = ProviderConfig::gemini("test-key");
+    ASSERT(c.type == ProviderType::GEMINI);
+    ASSERT(c.model == "gemini-2.0-flash");
+    ASSERT(c.max_rps == 0.25);
+    ASSERT(c.pricing.input_per_1m == 0.075);
+}
+
+void test_gemini_pro_pricing() {
+    auto c = ProviderConfig::gemini("key", "gemini-2.0-pro");
+    ASSERT(c.pricing.input_per_1m == 1.25);
+}
+
+void test_gemini_make_provider() {
+    auto p = make_provider(ProviderConfig::gemini("key"));
+    ASSERT(p->provider_name() == "gemini");
+    ASSERT(p->model_name() == "gemini-2.0-flash");
+}
+
+// ── Version from CMake ──────────────────────────────────
+void test_version_sync() {
+    auto v = ariadne::version();
+    ASSERT(!v.empty());
+    ASSERT(v == std::string(ARIADNE_VERSION));
+}
+
 // ── Parallel Tool Calls ─────────────────────────────────
 void test_parallel_tool_calls_response() {
     LLMResponse r;
@@ -1464,6 +1491,12 @@ int main() {
     std::cout<<"\n=== Native Tool Calling ===\n";
     RUN(test_chat_message_struct); RUN(test_llm_tool_call_struct);
     RUN(test_llm_response_with_tools); RUN(test_mock_supports_native);
+
+    std::cout<<"\n=== Gemini Provider ===\n";
+    RUN(test_gemini_config); RUN(test_gemini_pro_pricing); RUN(test_gemini_make_provider);
+
+    std::cout<<"\n=== Version Sync ===\n";
+    RUN(test_version_sync);
 
     std::cout<<"\n=== Parallel Tool Calls ===\n";
     RUN(test_parallel_tool_calls_response);
