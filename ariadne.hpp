@@ -197,6 +197,10 @@ struct ProviderConfig {
                                 const std::string& model = "llama-3.3-70b-versatile") {
         return openai_compatible(key, "https://api.groq.com/openai", model, 0.5);
     }
+    /** LLM7.io free tier: 30 RPM, no signup needed (key="unused") */
+    static ProviderConfig llm7(const std::string& model = "deepseek-v3-0324") {
+        return openai_compatible("unused", "https://api.llm7.io", model, 0.5);
+    }
 };
 
 /** 所有 Provider 的公共接口 */

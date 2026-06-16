@@ -54,11 +54,16 @@ int main(){
     std::string model=menv?menv:"openai/gpt-4o-mini";
     double threshold=0.50;
 
-    std::cout<<"Eval Harness — GitHub Models (free)\n"
-             <<"Model: "<<model<<"\n\n";
+    // Use LLM7.io as fallback if GitHub Models is rate-limited
+    auto primary = ProviderConfig::github_models(tok, model);
+    auto fallback = ProviderConfig::llm7("deepseek-v3-0324");
+    TierConfig tier{primary, {fallback}, 3, 60.0};
+    auto config = EngineConfig::with_fallbacks(tier, tier);
 
-    WorkflowEngine engine(EngineConfig::from_single(
-        ProviderConfig::github_models(tok,model)));
+    std::cout<<"Eval Harness — GitHub Models + LLM7.io fallback\n"
+             <<"Model: "<<model<<" (fallback: deepseek-v3-0324)\n\n";
+
+    WorkflowEngine engine(config);
     mock_tools(engine);
 
     int passed=0; double total=0;

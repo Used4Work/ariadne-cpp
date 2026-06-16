@@ -19,8 +19,10 @@ int main(int argc,char* argv[]) {
     const char* key=std::getenv("GITHUB_TOKEN");
     if(!key){std::cerr<<"Set GITHUB_TOKEN\n";return 1;}
     std::string mode=(argc>1)?argv[1]:"dag";
-    WorkflowEngine engine(EngineConfig::from_single(
-        ProviderConfig::github_models(key,"openai/gpt-4o-mini")));
+    auto primary = ProviderConfig::github_models(key,"openai/gpt-4o-mini");
+    auto fallback = ProviderConfig::llm7("deepseek-v3-0324");
+    TierConfig tier{primary, {fallback}, 3, 60.0};
+    WorkflowEngine engine(EngineConfig::with_fallbacks(tier, tier));
     add_tools(engine);
 
     if(mode=="dag"){
