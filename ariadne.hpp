@@ -338,6 +338,56 @@ struct ProviderConfig {
 
 struct ToolDef;  // forward declaration
 
+// ════════════════════════════════════════════════════════════════
+// Vector Memory Store — 轻量级语义检索（无外部依赖）
+//
+// 用法：
+//   InMemoryVectorStore store;
+//   store.add("id1", {0.1, 0.2, 0.3}, {{"text","hello"}});
+//   auto results = store.query({0.1, 0.2, 0.3}, 5);
+//   // results[0].id, results[0].score, results[0].metadata
+// ════════════════════════════════════════════════════════════════
+
+struct VectorEntry {
+    std::string          id;
+    std::vector<float>   embedding;
+    json                 metadata;
+};
+
+struct VectorResult {
+    std::string id;
+    float       score = 0.0f;
+    json        metadata;
+};
+
+class IMemoryStore {
+public:
+    virtual ~IMemoryStore() = default;
+    virtual void add(const std::string& id, const std::vector<float>& embedding,
+                      const json& metadata = {}) = 0;
+    virtual std::vector<VectorResult> query(const std::vector<float>& embedding,
+                                             int top_k = 5) const = 0;
+    virtual void remove(const std::string& id) = 0;
+    virtual size_t size() const = 0;
+    virtual void clear() = 0;
+};
+
+class InMemoryVectorStore : public IMemoryStore {
+public:
+    void add(const std::string& id, const std::vector<float>& embedding,
+              const json& metadata = {}) override;
+    std::vector<VectorResult> query(const std::vector<float>& embedding,
+                                     int top_k = 5) const override;
+    void remove(const std::string& id) override;
+    size_t size() const override;
+    void clear() override;
+private:
+    mutable std::shared_mutex mu_;
+    std::vector<VectorEntry> entries_;
+
+    static float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b);
+};
+
 // ── Native Tool Calling 数据类型 ─────────────────────────
 
 struct ChatMessage {
@@ -1357,6 +1407,20 @@ public:
     virtual void close() = 0;
 };
 
+/** HTTP 传输：通过 HTTP POST 与 MCP 服务器通信 (Streamable HTTP) */
+class HttpTransport : public IMcpTransport {
+public:
+    HttpTransport(const std::string& url, const std::string& api_key = "");
+    void send(const json& message) override;
+    json receive() override;
+    void close() override;
+private:
+    std::string url_;
+    std::string api_key_;
+    json pending_response_;
+    bool has_pending_ = false;
+};
+
 /** Stdio 传输：通过子进程 stdin/stdout 通信 */
 class StdioTransport : public IMcpTransport {
 public:
@@ -1534,8 +1598,15 @@ public:
     /** MCP 工具注册（通过子进程连接 MCP 服务器，自动发现并注册工具） */
     void connect_mcp(const std::string& command, const std::vector<std::string>& args = {});
 
-    /** Checkpointing — 设置存储后端，每步自动保存 */
+    /** MCP over HTTP（Streamable HTTP transport） */
+    void connect_mcp_http(const std::string& url, const std::string& api_key = "");
+
+    /** Checkpointing — 设置存储后端 */
     void set_checkpoint_store(std::shared_ptr<ICheckpointStore> store) { checkpoint_store_ = std::move(store); }
+
+    /** Memory store — 语义检索（用于 RAG / 长期记忆） */
+    void set_memory_store(std::shared_ptr<IMemoryStore> store) { memory_store_ = std::move(store); }
+    std::shared_ptr<IMemoryStore> memory_store() const { return memory_store_; }
 
     /** Human-in-the-loop 中断回调 — 在每个步骤执行前调用
      *  返回 nullopt=继续, string=暂停原因 (抛出 InterruptError) */
@@ -1562,6 +1633,7 @@ private:
     std::vector<GuardrailFn>          output_guardrails_;
     std::map<std::string, std::vector<GuardrailFn>> tool_guardrails_;
     std::shared_ptr<ICheckpointStore> checkpoint_store_;
+    std::shared_ptr<IMemoryStore> memory_store_;
     InterruptFn interrupt_hook_;
 
     WorkflowResult run_internal(const std::string& task, WorkflowContext* ctx);

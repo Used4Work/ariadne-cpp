@@ -342,6 +342,60 @@ std::string OpenAIResponsesProvider::complete(const std::string& prompt,
     return out.value("text", "");
 }
 
+// ════════════════════════════════════════════════════════════════
+// InMemoryVectorStore — cosine similarity search
+// ════════════════════════════════════════════════════════════════
+
+float InMemoryVectorStore::cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) return 0.0f;
+    float dot = 0.0f, na = 0.0f, nb = 0.0f;
+    for (size_t i = 0; i < a.size(); ++i) {
+        dot += a[i] * b[i];
+        na  += a[i] * a[i];
+        nb  += b[i] * b[i];
+    }
+    float denom = std::sqrt(na) * std::sqrt(nb);
+    return (denom > 1e-9f) ? (dot / denom) : 0.0f;
+}
+
+void InMemoryVectorStore::add(const std::string& id, const std::vector<float>& embedding,
+                                const json& metadata) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    for (auto& e : entries_) {
+        if (e.id == id) { e.embedding = embedding; e.metadata = metadata; return; }
+    }
+    entries_.push_back({id, embedding, metadata});
+}
+
+std::vector<VectorResult> InMemoryVectorStore::query(const std::vector<float>& embedding,
+                                                       int top_k) const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    std::vector<VectorResult> scored;
+    scored.reserve(entries_.size());
+    for (const auto& e : entries_)
+        scored.push_back({e.id, cosine_similarity(embedding, e.embedding), e.metadata});
+    std::sort(scored.begin(), scored.end(),
+              [](const VectorResult& a, const VectorResult& b) { return a.score > b.score; });
+    if ((int)scored.size() > top_k) scored.resize(top_k);
+    return scored;
+}
+
+void InMemoryVectorStore::remove(const std::string& id) {
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+        [&](const VectorEntry& e) { return e.id == id; }), entries_.end());
+}
+
+size_t InMemoryVectorStore::size() const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    return entries_.size();
+}
+
+void InMemoryVectorStore::clear() {
+    std::unique_lock<std::shared_mutex> lk(mu_);
+    entries_.clear();
+}
+
 // ── ILLMProvider::complete_chat default ──────────────────────────
 
 LLMResponse ILLMProvider::complete_chat(const std::vector<ChatMessage>& messages,
@@ -3366,6 +3420,55 @@ AgentResult WorkflowEngine::run_multi_agent(const std::string& task,
 }
 
 // ════════════════════════════════════════════════════════════════
+// MCP HttpTransport — Streamable HTTP (POST JSON-RPC to server)
+// ════════════════════════════════════════════════════════════════
+
+HttpTransport::HttpTransport(const std::string& url, const std::string& api_key)
+    : url_(url), api_key_(api_key) {}
+
+void HttpTransport::send(const json& message) {
+    CurlHandle curl;
+    CURL* c = curl.get();
+    std::string body = message.dump();
+    std::string resp_body;
+    struct curl_slist* h = nullptr;
+    h = curl_slist_append(h, "Content-Type: application/json");
+    h = curl_slist_append(h, "Accept: application/json");
+    if (!api_key_.empty())
+        h = curl_slist_append(h, ("Authorization: Bearer " + api_key_).c_str());
+    auto write_cb = [](char* p, size_t s, size_t n, void* u) -> size_t {
+        static_cast<std::string*>(u)->append(p, s * n); return s * n;
+    };
+    curl_easy_setopt(c, CURLOPT_URL,            url_.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER,     h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS,     body.c_str());
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,  (long)body.size());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,  +write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,      &resp_body);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,        30L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
+    CURLcode rc = curl_easy_perform(c);
+    curl_slist_free_all(h);
+    if (rc != CURLE_OK)
+        throw std::runtime_error(std::string("MCP HTTP: ") + curl_easy_strerror(rc));
+    try {
+        pending_response_ = json::parse(resp_body);
+        has_pending_ = true;
+    } catch (...) {
+        throw std::runtime_error("MCP HTTP: invalid JSON response");
+    }
+}
+
+json HttpTransport::receive() {
+    if (!has_pending_) throw std::runtime_error("MCP HTTP: no pending response");
+    has_pending_ = false;
+    return pending_response_;
+}
+
+void HttpTransport::close() {}
+
+// ════════════════════════════════════════════════════════════════
 // MCP Client — stdio transport + JSON-RPC 2.0
 // ════════════════════════════════════════════════════════════════
 
@@ -3582,6 +3685,16 @@ void WorkflowEngine::connect_mcp(const std::string& command,
     client->register_all_tools(*tools_);
     log_msg(LogLevel::LOG_INFO, "MCP",
         "Connected to " + command + ", registered " + std::to_string(client->list_tools().size()) + " tools");
+    mcp_clients_.push_back(std::move(client));
+}
+
+void WorkflowEngine::connect_mcp_http(const std::string& url, const std::string& api_key) {
+    auto transport = std::make_unique<HttpTransport>(url, api_key);
+    auto client = std::make_unique<McpClient>(std::move(transport));
+    client->initialize("ariadne", ARIADNE_VERSION);
+    client->register_all_tools(*tools_);
+    log_msg(LogLevel::LOG_INFO, "MCP",
+        "Connected via HTTP to " + url + ", registered " + std::to_string(client->list_tools().size()) + " tools");
     mcp_clients_.push_back(std::move(client));
 }
 

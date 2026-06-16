@@ -1375,6 +1375,56 @@ void test_orchestrator_result_struct() {
     ASSERT(result.log.size() == 2);
 }
 
+// ── Vector Memory Store ─────────────────────────────────
+void test_vector_store_add_query() {
+    InMemoryVectorStore store;
+    store.add("a", {1.0f, 0.0f, 0.0f}, {{"text","hello"}});
+    store.add("b", {0.0f, 1.0f, 0.0f}, {{"text","world"}});
+    store.add("c", {0.9f, 0.1f, 0.0f}, {{"text","similar"}});
+    ASSERT(store.size() == 3);
+    auto results = store.query({1.0f, 0.0f, 0.0f}, 2);
+    ASSERT(results.size() == 2);
+    ASSERT(results[0].id == "a");
+    ASSERT(results[0].score > 0.99f);
+    ASSERT(results[1].id == "c");
+}
+
+void test_vector_store_remove() {
+    InMemoryVectorStore store;
+    store.add("x", {1.0f, 0.0f}, {});
+    store.add("y", {0.0f, 1.0f}, {});
+    ASSERT(store.size() == 2);
+    store.remove("x");
+    ASSERT(store.size() == 1);
+    auto r = store.query({1.0f, 0.0f}, 5);
+    ASSERT(r.size() == 1 && r[0].id == "y");
+}
+
+void test_vector_store_update() {
+    InMemoryVectorStore store;
+    store.add("z", {1.0f, 0.0f}, {{"v",1}});
+    store.add("z", {0.0f, 1.0f}, {{"v",2}});
+    ASSERT(store.size() == 1);
+    auto r = store.query({0.0f, 1.0f}, 1);
+    ASSERT(r[0].id == "z" && r[0].metadata["v"] == 2);
+}
+
+void test_vector_cosine_orthogonal() {
+    InMemoryVectorStore store;
+    store.add("x", {1.0f, 0.0f}, {});
+    store.add("y", {0.0f, 1.0f}, {});
+    auto r = store.query({1.0f, 0.0f}, 2);
+    ASSERT(r[0].score > 0.99f);
+    ASSERT(r[1].score < 0.01f);
+}
+
+// ── MCP HTTP Transport ──────────────────────────────────
+void test_mcp_http_transport_type() {
+    HttpTransport t("http://localhost:9999");
+    // Can't test actual HTTP without a server, but verify it compiles and constructs
+    t.close();
+}
+
 // ── Response Safety Guards ───────────────────────────────
 void test_empty_response_guard() {
     // Verify that accessing [0] on empty arrays throws ProviderError, not crashes
@@ -1614,6 +1664,13 @@ int main() {
     std::cout<<"\n=== Adaptive Orchestrator ===\n";
     RUN(test_orchestrator_strategy_enum); RUN(test_orchestrator_plan_struct);
     RUN(test_orchestrator_result_struct);
+
+    std::cout<<"\n=== Vector Memory Store ===\n";
+    RUN(test_vector_store_add_query); RUN(test_vector_store_remove);
+    RUN(test_vector_store_update); RUN(test_vector_cosine_orthogonal);
+
+    std::cout<<"\n=== MCP HTTP Transport ===\n";
+    RUN(test_mcp_http_transport_type);
 
     std::cout<<"\n=== Response Safety ===\n";
     RUN(test_empty_response_guard);
