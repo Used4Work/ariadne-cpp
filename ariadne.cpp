@@ -178,6 +178,129 @@ std::string OpenAIResponsesProvider::complete(const std::string& prompt,
     return j["output"][0]["content"][0]["text"].get<std::string>();
 }
 
+// ── ILLMProvider::complete_chat default ──────────────────────────
+
+LLMResponse ILLMProvider::complete_chat(const std::vector<ChatMessage>& messages,
+                                          const std::vector<ToolDef>& /*tools*/,
+                                          double temperature) const {
+    // Default: concatenate messages into a single prompt, call complete()
+    std::string system, prompt;
+    for (const auto& m : messages) {
+        if (m.role == "system") system = m.content;
+        else if (m.role == "user") prompt += m.content + "\n";
+        else if (m.role == "assistant") prompt += "[Assistant]: " + m.content + "\n";
+        else if (m.role == "tool") prompt += "[Tool result]: " + m.content + "\n";
+    }
+    LLMResponse resp;
+    resp.content = complete(prompt, system, temperature);
+    return resp;
+}
+
+// ── OpenAIChatProvider::complete_chat (native tools) ────────────
+
+LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& messages,
+                                                const std::vector<ToolDef>& tools,
+                                                double temperature) const {
+    // Build messages array
+    json msgs = json::array();
+    for (const auto& m : messages) {
+        json msg = {{"role", m.role}};
+        if (!m.content.empty()) msg["content"] = m.content;
+        else msg["content"] = nullptr;
+        if (m.role == "assistant" && !m.tool_calls.is_null() && !m.tool_calls.empty())
+            msg["tool_calls"] = m.tool_calls;
+        if (m.role == "tool") {
+            msg["tool_call_id"] = m.tool_call_id;
+            if (!m.name.empty()) msg["name"] = m.name;
+        }
+        msgs.push_back(msg);
+    }
+
+    json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
+                  {"temperature", temperature}, {"messages", msgs}};
+
+    // Add tools if provided
+    if (!tools.empty()) {
+        json tools_array = json::array();
+        for (const auto& t : tools) {
+            tools_array.push_back({
+                {"type", "function"},
+                {"function", {
+                    {"name", t.name},
+                    {"description", t.description},
+                    {"parameters", t.input_schema.empty() ? json({{"type","object"}}) : t.input_schema}
+                }}
+            });
+        }
+        body["tools"] = tools_array;
+        body["tool_choice"] = "auto";
+    }
+
+    std::string base = cfg_.base_url.empty() ? "https://api.openai.com" : rtrim_slash(cfg_.base_url);
+    std::string path = cfg_.completions_path.empty() ? "/v1/chat/completions" : cfg_.completions_path;
+    auto resp = http_post(base + path,
+        {"Content-Type: application/json",
+         "Authorization: Bearer " + cfg_.api_key},
+        body.dump());
+    if (resp.status_code == 429)
+        throw ProviderError("OpenAI Chat: 429 Too Many Requests");
+    auto j = json::parse(resp.body);
+    if (j.contains("error"))
+        throw ProviderError("OpenAI Chat: " + j["error"]["message"].get<std::string>());
+    extract_token_usage(j);
+
+    LLMResponse result;
+    const auto& choice = j["choices"][0]["message"];
+    result.content = choice.value("content", "");
+
+    // Parse native tool calls
+    if (choice.contains("tool_calls") && !choice["tool_calls"].is_null()) {
+        for (const auto& tc : choice["tool_calls"]) {
+            LLMToolCall call;
+            call.id   = tc.value("id", "");
+            call.name = tc["function"].value("name", "");
+            std::string args_str = tc["function"].value("arguments", "{}");
+            try { call.arguments = json::parse(args_str); }
+            catch (...) { call.arguments = json::object(); }
+            result.tool_calls.push_back(std::move(call));
+        }
+    }
+    return result;
+}
+
+// ── LLMClient::complete_chat ────────────────────────────────────
+
+LLMResponse LLMClient::complete_chat(ModelTier tier,
+                                       const std::vector<ChatMessage>& messages,
+                                       const std::vector<ToolDef>& tools,
+                                       double temperature) const {
+    const auto& slots = (tier == ModelTier::ORCHESTRATOR) ? orchestrators_ : subagents_;
+    std::string last_error;
+    for (const auto& slot : slots) {
+        if (!slot.breaker.try_allow()) continue;
+        { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.calls; }
+        if (slot.rate_limiter.enabled())
+            if (!slot.rate_limiter.acquire(10000)) continue;
+        try {
+            auto resp = slot.provider->complete_chat(messages, tools, temperature);
+            slot.breaker.on_success();
+            { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
+            { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
+            return resp;
+        } catch (const std::exception& e) {
+            slot.breaker.on_failure();
+            { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+            last_error = e.what();
+        }
+    }
+    throw AllProvidersExhaustedError("Chat providers exhausted. Last: " + last_error);
+}
+
+bool LLMClient::supports_native_tools(ModelTier tier) const {
+    const auto& slots = (tier == ModelTier::ORCHESTRATOR) ? orchestrators_ : subagents_;
+    return !slots.empty() && slots[0].provider->supports_native_tools();
+}
+
 // ── make_provider ────────────────────────────────────────────────
 
 std::unique_ptr<ILLMProvider> make_provider(const ProviderConfig& cfg) {
@@ -2433,6 +2556,123 @@ static std::string build_agent_prompt(const std::string& task,
         prompt += "\nWork done so far:\n" + history;
     prompt += "\nRespond with your next action as a JSON object.";
     return prompt;
+}
+
+// ════════════════════════════════════════════════════════════════
+// Native Tool Calling Agent Loop
+// ════════════════════════════════════════════════════════════════
+
+AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_iterations,
+                                               std::function<void(const AgentStep&)> on_step) {
+    // Auto-fallback if provider doesn't support native tools
+    if (!llm_->supports_native_tools(ModelTier::ORCHESTRATOR)) {
+        log_msg(LogLevel::LOG_INFO, "Agent", "Provider lacks native tools, falling back to prompt-based");
+        return run_agent(task, max_iterations, on_step);
+    }
+
+    llm_->reset_usage();
+    reset_cancel();
+    AgentResult result;
+    result.max_iterations = max_iterations;
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Input guardrails
+    json task_json = {{"task", task}};
+    for (const auto& guard : input_guardrails_) {
+        auto err = guard(task_json);
+        if (err) { result.error = "Input guardrail: " + *err; return result; }
+    }
+
+    auto tools = tools_->list_tools();
+
+    // Build conversation messages
+    std::vector<ChatMessage> messages;
+    messages.push_back({"system",
+        "You are a helpful AI agent. Use the provided tools to gather information. "
+        "When you have enough data, respond with a text message containing your final answer.",
+        {}, "", ""});
+    messages.push_back({"user", task, {}, "", ""});
+
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        if (cancel_->load()) { result.error = "Agent cancelled"; break; }
+        if (has_deadline_ && std::chrono::steady_clock::now() >= deadline_) {
+            result.error = "Agent deadline exceeded"; break;
+        }
+        auto step_t0 = std::chrono::steady_clock::now();
+        AgentStep step;
+        step.iteration = iter + 1;
+
+        LLMResponse resp;
+        try {
+            resp = llm_->complete_chat(ModelTier::ORCHESTRATOR, messages, tools, 0.0);
+        } catch (const std::exception& e) {
+            result.error = std::string("LLM error: ") + e.what();
+            break;
+        }
+
+        if (resp.has_tool_calls()) {
+            // Native tool call — structured, no JSON parsing needed
+            const auto& tc = resp.tool_calls[0];
+            step.thought = resp.content.empty() ? "Using " + tc.name : resp.content;
+            step.action.type = AgentAction::Type::TOOL_CALL;
+            step.action.tool_name = tc.name;
+            step.action.tool_args = tc.arguments;
+            step.action.thought = step.thought;
+
+            json obs;
+            try { obs = tools_->call(tc.name, tc.arguments); }
+            catch (const std::exception& e) {
+                obs = {{"error", std::string("tool failed: ") + e.what()}};
+            }
+            step.observation = obs;
+
+            // Build assistant message with tool_calls for conversation history
+            json tc_json = json::array();
+            for (const auto& c : resp.tool_calls) {
+                tc_json.push_back({
+                    {"id", c.id}, {"type", "function"},
+                    {"function", {{"name", c.name}, {"arguments", c.arguments.dump()}}}
+                });
+            }
+            messages.push_back({"assistant", resp.content, tc_json, "", ""});
+            // Tool result message
+            messages.push_back({"tool", obs.dump(), {}, tc.id, tc.name});
+
+        } else {
+            // Text response — final answer
+            step.thought = "Providing final answer";
+            step.action.type = AgentAction::Type::FINAL_ANSWER;
+            step.action.response = resp.content;
+            step.action.thought = step.thought;
+            step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - step_t0).count();
+            result.steps.push_back(step);
+            result.success = true;
+            result.final_answer = resp.content;
+            result.iterations_used = iter + 1;
+            if (on_step) on_step(step);
+            break;
+        }
+
+        step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - step_t0).count();
+        result.steps.push_back(step);
+        result.traces.push_back({
+            "native_iter_" + std::to_string(iter+1), "tool", "ok", "",
+            step.duration_ms, "",
+            g_last_token_usage.input_tokens, g_last_token_usage.output_tokens
+        });
+        if (on_step) on_step(step);
+    }
+
+    if (!result.success && result.error.empty()) {
+        result.error = "Max iterations reached without final answer";
+        result.iterations_used = max_iterations;
+    }
+    result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    result.token_usage = llm_->total_usage();
+    return result;
 }
 
 AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iterations,

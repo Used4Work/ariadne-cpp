@@ -1194,6 +1194,45 @@ void test_token_usage_cost() {
     ASSERT(a.cost_usd > 0.0029 && a.cost_usd < 0.0031);
 }
 
+// ── Native Tool Calling Types ────────────────────────────
+void test_chat_message_struct() {
+    ChatMessage m;
+    m.role = "user";
+    m.content = "hello";
+    ASSERT(m.role == "user");
+    ASSERT(m.content == "hello");
+    ASSERT(m.tool_calls.is_null());
+}
+
+void test_llm_tool_call_struct() {
+    LLMToolCall tc;
+    tc.id = "call_123";
+    tc.name = "web_search";
+    tc.arguments = {{"query", "tesla"}};
+    ASSERT(tc.name == "web_search");
+    ASSERT(tc.arguments["query"] == "tesla");
+}
+
+void test_llm_response_with_tools() {
+    LLMResponse r;
+    r.content = "";
+    r.tool_calls.push_back({"call_1", "search", {{"q","test"}}});
+    ASSERT(r.has_tool_calls());
+    ASSERT(r.tool_calls[0].name == "search");
+    LLMResponse r2;
+    r2.content = "The answer is 42";
+    ASSERT(!r2.has_tool_calls());
+}
+
+void test_mock_supports_native() {
+    MockProvider mp("test");
+    ASSERT(!mp.supports_native_tools());  // mock doesn't support native
+    auto orc = std::make_unique<MockProvider>("ok");
+    auto sub = std::make_unique<MockProvider>("ok");
+    LLMClient client(std::move(orc), std::move(sub));
+    ASSERT(!client.supports_native_tools(ModelTier::ORCHESTRATOR));
+}
+
 // ── Provider Auto-Pricing ────────────────────────────────
 void test_provider_auto_pricing() {
     auto a = ProviderConfig::anthropic("key", "claude-opus-4-8");
@@ -1371,6 +1410,10 @@ int main() {
 
     std::cout<<"\n=== Cost Tracking ===\n";
     RUN(test_model_pricing); RUN(test_token_usage_cost);
+
+    std::cout<<"\n=== Native Tool Calling ===\n";
+    RUN(test_chat_message_struct); RUN(test_llm_tool_call_struct);
+    RUN(test_llm_response_with_tools); RUN(test_mock_supports_native);
 
     std::cout<<"\n=== Provider Auto-Pricing ===\n";
     RUN(test_provider_auto_pricing);
