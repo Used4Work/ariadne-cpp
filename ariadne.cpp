@@ -11,6 +11,9 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -255,6 +258,12 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
             if (!cached.empty()) return cached;
         }
     }
+    // Token budget check before making LLM call
+    if (token_budget_ > 0 && cumulative_usage_.total_tokens >= token_budget_)
+        throw TokenBudgetError("Token budget exceeded: " +
+            std::to_string(cumulative_usage_.total_tokens) + "/" +
+            std::to_string(token_budget_));
+
     std::string last_error;
     for (const auto& slot : slots) {
         if (!slot.breaker.try_allow()) {
@@ -263,43 +272,54 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
             continue;
         }
         { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.calls; }
-        // Rate limiting: block until token available (or timeout)
         if (slot.rate_limiter.enabled())
             if (!slot.rate_limiter.acquire(10000)) {
                 last_error = slot.provider->provider_name() + "/" +
                              slot.provider->model_name() + " [RATE_LIMIT_TIMEOUT]";
                 continue;
             }
-        try {
-            auto res = slot.provider->complete(prompt, system, temperature, force_json, output_schema);
-            slot.breaker.on_success();
-            { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
-            { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
-            if (resp_cache_enabled_ && response_cache_ && !cache_key.empty())
-                response_cache_->put(cache_key, res);
-            return res;
-        } catch (const std::exception& e) {
-            std::string emsg = e.what();
-            bool is_rate_limit = emsg.find("429") != std::string::npos
-                              || emsg.find("503") != std::string::npos;
-            bool is_fatal = emsg.find("401") != std::string::npos
-                         || emsg.find("403") != std::string::npos
-                         || emsg.find("invalid_api_key") != std::string::npos;
+        // 429/503: retry same slot with exponential backoff (up to 3 times)
+        constexpr int MAX_RATE_RETRIES = 3;
+        for (int rate_retry = 0; rate_retry <= MAX_RATE_RETRIES; ++rate_retry) {
+            try {
+                auto res = slot.provider->complete(prompt, system, temperature, force_json, output_schema);
+                slot.breaker.on_success();
+                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
+                { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
+                if (resp_cache_enabled_ && response_cache_ && !cache_key.empty())
+                    response_cache_->put(cache_key, res);
+                return res;
+            } catch (const std::exception& e) {
+                std::string emsg = e.what();
+                bool is_rate_limit = emsg.find("429") != std::string::npos
+                                  || emsg.find("503") != std::string::npos;
+                bool is_fatal = emsg.find("401") != std::string::npos
+                             || emsg.find("403") != std::string::npos
+                             || emsg.find("invalid_api_key") != std::string::npos;
 
-            if (is_fatal) {
-                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
-                throw AllProvidersExhaustedError(
-                    slot.provider->provider_name() + ": fatal error — " + emsg);
-            } else if (is_rate_limit) {
-                std::cerr << "[RATE_LIMIT] sleeping 6s\n";
-                std::this_thread::sleep_for(std::chrono::seconds(6));
-                last_error = slot.provider->provider_name() + "/" +
-                             slot.provider->model_name() + " [RATE_LIMITED, retrying]";
-            } else {
-                slot.breaker.on_failure();
-                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
-                last_error = slot.provider->provider_name() + "/" + slot.provider->model_name()
-                           + ": " + emsg;
+                if (is_fatal) {
+                    { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                    throw AllProvidersExhaustedError(
+                        slot.provider->provider_name() + ": fatal error — " + emsg);
+                } else if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
+                    int backoff_sec = 3 * (1 << rate_retry);  // 3s, 6s, 12s
+                    std::cerr << "[RATE_LIMIT] " << slot.provider->provider_name()
+                              << " retry " << (rate_retry+1) << "/" << MAX_RATE_RETRIES
+                              << ", backoff " << backoff_sec << "s\n";
+                    std::this_thread::sleep_for(std::chrono::seconds(backoff_sec));
+                    continue;
+                } else {
+                    if (is_rate_limit) {
+                        last_error = slot.provider->provider_name() + "/" +
+                                     slot.provider->model_name() + " [RATE_LIMITED, exhausted retries]";
+                    } else {
+                        slot.breaker.on_failure();
+                        last_error = slot.provider->provider_name() + "/" + slot.provider->model_name()
+                                   + ": " + emsg;
+                    }
+                    { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                    break;
+                }
             }
         }
     }
@@ -513,6 +533,41 @@ std::vector<Step> WorkflowPlan::leaf_steps() const {
     std::vector<Step> out;
     for (const auto& s : steps) if (!ref.count(s.id)) out.push_back(s);
     return out;
+}
+
+json WorkflowPlan::to_json() const {
+    json j;
+    j["id"] = id;
+    j["metadata"] = metadata;
+    j["steps"] = json::array();
+    for (const auto& s : steps) {
+        json sj;
+        sj["id"] = s.id;
+        sj["type"] = (s.type == StepType::TOOL) ? "tool" :
+                     (s.type == StepType::LLM) ? "llm" :
+                     (s.type == StepType::TRANSFORM) ? "transform" : "condition";
+        sj["action"] = s.action;
+        sj["inputs"] = s.inputs;
+        sj["depends_on"] = s.depends_on;
+        sj["retry"] = s.retry;
+        sj["timeout_sec"] = s.timeout_sec;
+        sj["on_error"] = (s.on_error == OnError::SKIP) ? "skip" :
+                         (s.on_error == OnError::FALLBACK) ? "fallback" : "fail";
+        sj["description"] = s.description;
+        sj["model_tier"] = (s.model_tier == ModelTier::ORCHESTRATOR) ? "orchestrator" : "subagent";
+        if (!s.system_prompt.empty()) sj["system_prompt"] = s.system_prompt;
+        if (s.json_mode) sj["json_mode"] = true;
+        if (!s.output_schema.is_null() && !s.output_schema.empty()) sj["output_schema"] = s.output_schema;
+        if (s.temperature >= 0.0) sj["temperature"] = s.temperature;
+        if (!s.fallback.is_null()) sj["fallback_value"] = s.fallback;
+        if (!s.fallback_model.empty()) sj["fallback_model"] = s.fallback_model;
+        j["steps"].push_back(sj);
+    }
+    return j;
+}
+
+WorkflowPlan WorkflowPlan::from_json(const json& j) {
+    return WorkflowPlanner::parse_plan(j, j.value("metadata", json::object()).value("task", ""));
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -981,6 +1036,87 @@ void validate_dag(const WorkflowPlan& plan) {
 }
 
 // ════════════════════════════════════════════════════════════════
+// WorkflowState serialization
+// ════════════════════════════════════════════════════════════════
+
+json WorkflowState::to_json() const {
+    json j;
+    j["task_input"] = task_input;
+    j["step_outputs"] = json::object();
+    for (const auto& [k, v] : step_outputs) j["step_outputs"][k] = v;
+    j["errors"] = json::object();
+    for (const auto& [k, v] : errors) j["errors"][k] = v;
+    j["traces"] = json::array();
+    for (const auto& t : traces) {
+        j["traces"].push_back({
+            {"step_id", t.step_id}, {"step_type", t.step_type},
+            {"status", t.status}, {"provider", t.provider},
+            {"duration_ms", t.duration_ms}, {"error", t.error},
+            {"input_tokens", t.input_tokens}, {"output_tokens", t.output_tokens}
+        });
+    }
+    return j;
+}
+
+WorkflowState WorkflowState::from_json(const json& j) {
+    WorkflowState s;
+    s.task_input = j.value("task_input", json::object());
+    if (j.contains("step_outputs") && j["step_outputs"].is_object())
+        for (const auto& [k, v] : j["step_outputs"].items())
+            s.step_outputs[k] = v;
+    if (j.contains("errors") && j["errors"].is_object())
+        for (const auto& [k, v] : j["errors"].items())
+            s.errors[k] = v.get<std::string>();
+    if (j.contains("traces") && j["traces"].is_array())
+        for (const auto& t : j["traces"])
+            s.traces.push_back({
+                t.value("step_id",""), t.value("step_type",""),
+                t.value("status",""), t.value("provider",""),
+                t.value("duration_ms",0L), t.value("error",""),
+                t.value("input_tokens",0L), t.value("output_tokens",0L)
+            });
+    return s;
+}
+
+// ════════════════════════════════════════════════════════════════
+// FileCheckpointStore
+// ════════════════════════════════════════════════════════════════
+
+FileCheckpointStore::FileCheckpointStore(const std::string& directory) : dir_(directory) {
+    std::filesystem::create_directories(dir_);
+}
+
+void FileCheckpointStore::save(const std::string& workflow_id, const json& state) {
+    std::ofstream f(dir_ + "/" + workflow_id + ".checkpoint.json");
+    if (f) f << state.dump(2);
+}
+
+json FileCheckpointStore::load(const std::string& workflow_id) {
+    std::ifstream f(dir_ + "/" + workflow_id + ".checkpoint.json");
+    if (!f) throw std::runtime_error("Checkpoint not found: " + workflow_id);
+    return json::parse(f);
+}
+
+bool FileCheckpointStore::exists(const std::string& workflow_id) {
+    return std::filesystem::exists(dir_ + "/" + workflow_id + ".checkpoint.json");
+}
+
+void FileCheckpointStore::remove(const std::string& workflow_id) {
+    std::filesystem::remove(dir_ + "/" + workflow_id + ".checkpoint.json");
+}
+
+std::vector<std::string> FileCheckpointStore::list() {
+    std::vector<std::string> ids;
+    if (!std::filesystem::exists(dir_)) return ids;
+    for (const auto& entry : std::filesystem::directory_iterator(dir_)) {
+        auto name = entry.path().stem().string();
+        if (name.size() > 11 && name.substr(name.size()-11) == ".checkpoint")
+            ids.push_back(name.substr(0, name.size()-11));
+    }
+    return ids;
+}
+
+// ════════════════════════════════════════════════════════════════
 // WorkflowResult
 // ════════════════════════════════════════════════════════════════
 
@@ -1045,7 +1181,8 @@ void ResponseCache::put(const std::string& key, const std::string& response) {
 // ════════════════════════════════════════════════════════════════
 
 std::string PlanCache::normalize_key(const std::string& task,
-                                      const std::vector<ToolDef>& tools) {
+                                      const std::vector<ToolDef>& tools,
+                                      const std::string& context) {
     std::string key;
     // 工具签名（排序后拼接）
     std::vector<std::string> tnames;
@@ -1064,6 +1201,9 @@ std::string PlanCache::normalize_key(const std::string& task,
     }
     while (!norm.empty() && norm.back() == ' ') norm.pop_back();
     key += norm;
+    if (!context.empty()) {
+        key += "|ctx:" + std::to_string(simple_hash(context));
+    }
     return key;
 }
 
@@ -1150,7 +1290,7 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
         std::string cache_key;
         WorkflowPlan plan;
         if (cache_enabled_) {
-            cache_key = PlanCache::normalize_key(task, tools);
+            cache_key = PlanCache::normalize_key(task, tools, use_ctx.to_prompt_prefix());
             if (plan_cache_.has(cache_key)) {
                 plan = plan_cache_.get(cache_key);
             } else {
@@ -1804,6 +1944,21 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
     AgentResult result;
     result.max_iterations = max_iterations;
     auto t0 = std::chrono::steady_clock::now();
+    auto wf_id = "agent_" + std::to_string(
+        std::chrono::system_clock::now().time_since_epoch().count() % 1000000);
+    metrics_->record({MetricEvent::Kind::WORKFLOW_START, wf_id, "", "", "", 0, true, task});
+
+    // Input guardrails
+    json task_json = {{"task", task}};
+    for (const auto& guard : input_guardrails_) {
+        auto err = guard(task_json);
+        if (err) {
+            result.error = "Input guardrail: " + *err;
+            result.duration_ms = 0;
+            metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "", 0, false, result.error});
+            return result;
+        }
+    }
 
     auto tools = tools_->list_tools();
     std::string history;
@@ -1905,6 +2060,16 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
     result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     result.token_usage = llm_->total_usage();
+
+    // Output guardrails (on success)
+    if (result.success) {
+        for (const auto& guard : output_guardrails_) {
+            auto err = guard(json(result.final_answer));
+            if (err) { result.success = false; result.error = "Output guardrail: " + *err; }
+        }
+    }
+    metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "",
+                      result.duration_ms, result.success, result.error});
     return result;
 }
 
@@ -2284,6 +2449,10 @@ std::string WorkflowEngine::llm_complete(const std::string& prompt,
                                           const std::string& system,
                                           ModelTier tier, double temperature) {
     return llm_->complete_as(tier, prompt, system, temperature);
+}
+
+json WorkflowEngine::call_tool(const std::string& name, const json& params) {
+    return tools_->call(name, params);
 }
 
 void WorkflowEngine::add_input_guardrail(GuardrailFn fn) { input_guardrails_.push_back(std::move(fn)); }

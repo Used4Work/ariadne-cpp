@@ -273,9 +273,8 @@ int main(int argc, char* argv[]) {
     svr.Get("/api/tools", [&](const httplib::Request&, httplib::Response& res) {
         json tools = json::array();
         if (engine) {
-            // Access tools via plan_only hack (empty task won't work, so just list names)
-            tools.push_back({{"name","web_search"},{"description","Search the web"}});
-            tools.push_back({{"name","calculator"},{"description","Evaluate math"}});
+            for (const auto& t : engine->list_tools())
+                tools.push_back({{"name", t.name}, {"description", t.description}});
         }
         res.set_content(tools.dump(), "application/json");
     });
@@ -380,7 +379,16 @@ int main(int argc, char* argv[]) {
                                 auto inputs = state.resolve_inputs(step.inputs);
 
                                 if (step.type == StepType::TOOL) {
-                                    result = json("(tool: " + step.action + ")");
+                                    json tool_input = inputs;
+                                    if (inputs.contains("tool_input_key") && inputs.contains("tool_input_value")) {
+                                        tool_input = {{inputs["tool_input_key"].get<std::string>(),
+                                                       inputs["tool_input_value"]}};
+                                    }
+                                    if (engine->has_tool(step.action)) {
+                                        result = engine->call_tool(step.action, tool_input);
+                                    } else {
+                                        result = json({{"error", "Unknown tool: " + step.action}});
+                                    }
                                 } else if (step.type == StepType::LLM) {
                                     std::string prompt = step.action;
                                     if (!inputs.empty()) prompt += "\n\nContext:\n" + inputs.dump(2);

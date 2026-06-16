@@ -91,6 +91,11 @@ class GuardrailError : public AriadneError {
     using AriadneError::AriadneError;
 };
 
+/** Token 预算超出 */
+class TokenBudgetError : public AriadneError {
+    using AriadneError::AriadneError;
+};
+
 /** Guardrail 验证函数：返回 nullopt=通过，或 string=错误原因 */
 using GuardrailFn = std::function<std::optional<std::string>(const json&)>;
 
@@ -200,6 +205,21 @@ struct ProviderConfig {
     /** LLM7.io free tier: 30 RPM, no signup needed (key="unused") */
     static ProviderConfig llm7(const std::string& model = "deepseek-v3-0324") {
         return openai_compatible("unused", "https://api.llm7.io", model, 0.5);
+    }
+    /** Cerebras free tier: 1M tokens/day, 30 RPM */
+    static ProviderConfig cerebras(const std::string& key,
+                                    const std::string& model = "llama-3.3-70b") {
+        return openai_compatible(key, "https://api.cerebras.ai/v1", model, 0.5);
+    }
+    /** SambaNova free tier: forever-free + $5 credit */
+    static ProviderConfig sambanova(const std::string& key,
+                                     const std::string& model = "Meta-Llama-3.3-70B-Instruct") {
+        return openai_compatible(key, "https://api.sambanova.ai/v1", model, 0.5);
+    }
+    /** Mistral free tier: ~1B tokens/month */
+    static ProviderConfig mistral(const std::string& key,
+                                   const std::string& model = "mistral-small-latest") {
+        return openai_compatible(key, "https://api.mistral.ai/v1", model, 1.0);
     }
 };
 
@@ -476,6 +496,8 @@ public:
     void reset_usage();
     void enable_response_cache(bool on = true);
     long response_cache_hits() const;
+    void set_token_budget(long max_tokens) { token_budget_ = max_tokens; }
+    void clear_token_budget() { token_budget_ = 0; }
 
 private:
     struct Slot {
@@ -490,6 +512,7 @@ private:
     mutable TokenUsage cumulative_usage_;
     mutable std::unique_ptr<ResponseCache> response_cache_;
     bool resp_cache_enabled_ = false;
+    long token_budget_ = 0;
 
     static std::vector<Slot> build_slots(const TierConfig& cfg);
     std::string try_slots(const std::vector<Slot>& slots,
@@ -535,6 +558,11 @@ struct WorkflowPlan {
 
     std::vector<std::vector<Step>> topological_batches() const;
     std::vector<Step>              leaf_steps()          const;
+
+    /** 序列化为 JSON（可持久化/导出） */
+    json to_json() const;
+    /** 从 JSON 反序列化 */
+    static WorkflowPlan from_json(const json& j);
 };
 
 /** 结构化的单步追踪记录 (R3) */
@@ -559,6 +587,11 @@ struct WorkflowState {
     json resolve_inputs(const json& inputs)      const;
     void record_trace  (TraceEntry entry) noexcept;
 
+    /** 序列化为 JSON（用于 checkpointing） */
+    json to_json() const;
+    /** 从 JSON 恢复 */
+    static WorkflowState from_json(const json& j);
+
 private:
     json resolve_value(const json& v) const;
 };
@@ -582,6 +615,34 @@ struct SchemaViolation {
 std::vector<SchemaViolation> validate_json_schema(const json& value,
                                                     const json& schema,
                                                     const std::string& path = "");
+
+// ════════════════════════════════════════════════════════════════
+// Checkpointing — WorkflowState 持久化 + 断点恢复
+// ════════════════════════════════════════════════════════════════
+
+/** Checkpoint 存储接口 */
+class ICheckpointStore {
+public:
+    virtual ~ICheckpointStore() = default;
+    virtual void save(const std::string& workflow_id, const json& state) = 0;
+    virtual json load(const std::string& workflow_id) = 0;
+    virtual bool exists(const std::string& workflow_id) = 0;
+    virtual void remove(const std::string& workflow_id) = 0;
+    virtual std::vector<std::string> list() = 0;
+};
+
+/** 文件系统 Checkpoint 存储 */
+class FileCheckpointStore : public ICheckpointStore {
+public:
+    explicit FileCheckpointStore(const std::string& directory);
+    void save(const std::string& workflow_id, const json& state) override;
+    json load(const std::string& workflow_id) override;
+    bool exists(const std::string& workflow_id) override;
+    void remove(const std::string& workflow_id) override;
+    std::vector<std::string> list() override;
+private:
+    std::string dir_;
+};
 
 // ════════════════════════════════════════════════════════════════
 // 8. ToolRegistry
@@ -1049,7 +1110,8 @@ public:
     explicit PlanCache(size_t max_size = 50) : max_size_(max_size) {}
 
     static std::string normalize_key(const std::string& task,
-                                      const std::vector<ToolDef>& tools);
+                                      const std::vector<ToolDef>& tools,
+                                      const std::string& context = "");
     bool has(const std::string& key) const;
     WorkflowPlan get(const std::string& key);
     void put(const std::string& key, const WorkflowPlan& plan);
@@ -1212,6 +1274,25 @@ public:
                               ModelTier tier = ModelTier::SUBAGENT,
                               double temperature = 0.0);
 
+    /** 直接调用已注册的工具 */
+    json call_tool(const std::string& name, const json& params);
+    bool has_tool(const std::string& name) const { return tools_->has_tool(name); }
+    std::vector<ToolDef> list_tools() const { return tools_->list_tools(); }
+
+    /** Token budget enforcement — 设置最大 token 预算，超出时抛出 TokenBudgetError */
+    void set_token_budget(long max_tokens) {
+        token_budget_ = max_tokens;
+        llm_->set_token_budget(max_tokens);
+    }
+    void clear_token_budget() {
+        token_budget_ = 0;
+        llm_->clear_token_budget();
+    }
+    long token_budget() const { return token_budget_; }
+    bool budget_exceeded() const {
+        return token_budget_ > 0 && llm_->total_usage().total_tokens >= token_budget_;
+    }
+
     /** 计划缓存控制 */
     void enable_plan_cache(bool on = true) { cache_enabled_ = on; }
     PlanCache::Stats plan_cache_stats() const { return plan_cache_.stats(); }
@@ -1223,6 +1304,9 @@ public:
 
     /** MCP 工具注册（通过子进程连接 MCP 服务器，自动发现并注册工具） */
     void connect_mcp(const std::string& command, const std::vector<std::string>& args = {});
+
+    /** Checkpointing — 设置存储后端，每步自动保存 */
+    void set_checkpoint_store(std::shared_ptr<ICheckpointStore> store) { checkpoint_store_ = std::move(store); }
 
 private:
     EngineConfig                      config_;
@@ -1238,10 +1322,12 @@ private:
     bool                              has_deadline_ = false;
     PlanCache                         plan_cache_;
     bool                              cache_enabled_ = true;
+    long                              token_budget_ = 0;
     std::vector<std::unique_ptr<McpClient>> mcp_clients_;
     std::vector<GuardrailFn>          input_guardrails_;
     std::vector<GuardrailFn>          output_guardrails_;
     std::map<std::string, std::vector<GuardrailFn>> tool_guardrails_;
+    std::shared_ptr<ICheckpointStore> checkpoint_store_;
 
     WorkflowResult run_internal(const std::string& task, WorkflowContext* ctx);
 };

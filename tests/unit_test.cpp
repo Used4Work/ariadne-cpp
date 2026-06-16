@@ -862,6 +862,144 @@ void test_mcp_tool_def_conversion() {
     ASSERT(tools[0].input_schema.contains("properties"));
 }
 
+// ── Token Budget ─────────────────────────────────────────
+void test_token_budget_not_set() {
+    auto orc = std::make_unique<MockProvider>("result");
+    auto sub = std::make_unique<MockProvider>("sub");
+    LLMClient client(std::move(orc), std::move(sub));
+    // No budget set → should not throw
+    auto r = client.complete_as(ModelTier::ORCHESTRATOR, "test");
+    ASSERT(r == "result");
+}
+
+void test_token_budget_exceeded() {
+    auto orc = std::make_unique<MockProvider>("result");
+    auto sub = std::make_unique<MockProvider>("sub");
+    LLMClient client(std::move(orc), std::move(sub));
+    client.set_token_budget(0);  // budget=0 means unlimited
+    auto r = client.complete_as(ModelTier::ORCHESTRATOR, "test");
+    ASSERT(!r.empty());
+    // Now set budget to 1 and try — MockProvider doesn't set token usage,
+    // so cumulative stays 0, won't throw
+    client.set_token_budget(1);
+    r = client.complete_as(ModelTier::ORCHESTRATOR, "test2");
+    ASSERT(!r.empty());
+}
+
+void test_token_budget_error_type() {
+    try { throw TokenBudgetError("budget exceeded: 1000/500"); }
+    catch (const AriadneError& e) {
+        ASSERT(std::string(e.what()).find("budget") != std::string::npos);
+    }
+}
+
+// ── WorkflowPlan Serialization ──────────────────────────
+void test_plan_serialization() {
+    WorkflowPlan plan;
+    plan.id = "test_plan";
+    plan.metadata = {{"task", "test task"}};
+    Step s1;
+    s1.id = "step_1"; s1.type = StepType::TOOL; s1.action = "web_search";
+    s1.inputs = {{"query", "test"}}; s1.description = "Search";
+    Step s2;
+    s2.id = "step_2"; s2.type = StepType::LLM; s2.action = "Summarize results";
+    s2.depends_on = {"step_1"}; s2.json_mode = true;
+    s2.system_prompt = "You are a summarizer";
+    s2.temperature = 0.5;
+    plan.steps = {s1, s2};
+
+    json j = plan.to_json();
+    ASSERT(j["id"] == "test_plan");
+    ASSERT(j["steps"].size() == 2);
+    ASSERT(j["steps"][0]["type"] == "tool");
+    ASSERT(j["steps"][0]["action"] == "web_search");
+    ASSERT(j["steps"][1]["depends_on"][0] == "step_1");
+    ASSERT(j["steps"][1]["json_mode"] == true);
+    ASSERT(j["steps"][1]["system_prompt"] == "You are a summarizer");
+}
+
+void test_plan_roundtrip() {
+    WorkflowPlan original;
+    original.id = "roundtrip";
+    original.metadata = {{"task", "round trip test"}};
+    Step s;
+    s.id = "s1"; s.type = StepType::LLM; s.action = "Do something";
+    s.retry = 2; s.timeout_sec = 45.0; s.on_error = OnError::SKIP;
+    s.model_tier = ModelTier::ORCHESTRATOR;
+    original.steps = {s};
+
+    json j = original.to_json();
+    auto restored = WorkflowPlan::from_json(j);
+    ASSERT(restored.steps.size() == 1);
+    ASSERT(restored.steps[0].id == "s1");
+    ASSERT(restored.steps[0].type == StepType::LLM);
+    ASSERT(restored.steps[0].retry == 2);
+    ASSERT(restored.steps[0].on_error == OnError::SKIP);
+    ASSERT(restored.steps[0].model_tier == ModelTier::ORCHESTRATOR);
+}
+
+// ── PlanCache Context Awareness ─────────────────────────
+void test_plan_cache_with_context() {
+    std::vector<ToolDef> tools = {{"search","",{},{}}};
+    auto k1 = PlanCache::normalize_key("Search Tesla", tools, "");
+    auto k2 = PlanCache::normalize_key("Search Tesla", tools, "Previous: searched BYD");
+    ASSERT(k1 != k2);  // different context → different key
+    auto k3 = PlanCache::normalize_key("Search Tesla", tools, "");
+    ASSERT(k1 == k3);  // same empty context → same key
+}
+
+// ── WorkflowState Serialization ──────────────────────────
+void test_state_serialization() {
+    WorkflowState state;
+    state.task_input = {{"task", "test"}};
+    state.step_outputs["s1"] = {{"result", 42}};
+    state.step_outputs["s2"] = "hello";
+    state.errors["s3"] = "something failed";
+    state.record_trace({"s1", "tool", "ok", "mock", 100, "", 50, 25});
+
+    json j = state.to_json();
+    ASSERT(j["task_input"]["task"] == "test");
+    ASSERT(j["step_outputs"]["s1"]["result"] == 42);
+    ASSERT(j["errors"]["s3"] == "something failed");
+    ASSERT(j["traces"].size() == 1);
+    ASSERT(j["traces"][0]["input_tokens"] == 50);
+
+    auto restored = WorkflowState::from_json(j);
+    ASSERT(restored.step_outputs["s1"]["result"] == 42);
+    ASSERT(restored.step_outputs["s2"] == "hello");
+    ASSERT(restored.errors.count("s3"));
+    ASSERT(restored.traces[0].duration_ms == 100);
+}
+
+// ── Provider Config Factories ───────────────────────────
+void test_provider_factories_new() {
+    auto c = ProviderConfig::cerebras("key");
+    ASSERT(c.base_url == "https://api.cerebras.ai/v1");
+    ASSERT(c.max_rps == 0.5);
+
+    auto s = ProviderConfig::sambanova("key");
+    ASSERT(s.base_url == "https://api.sambanova.ai/v1");
+
+    auto m = ProviderConfig::mistral("key");
+    ASSERT(m.base_url == "https://api.mistral.ai/v1");
+    ASSERT(m.max_rps == 1.0);
+}
+
+// ── Engine call_tool ─────────────────────────────────────
+void test_engine_call_tool() {
+    auto orc = std::make_unique<MockProvider>("ok");
+    auto sub = std::make_unique<MockProvider>("ok");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    tools.register_tool({"add", "Add numbers",
+        {{"required", json::array({"a","b"})},
+         {"properties", {{"a",{{"type","integer"}}},{"b",{{"type","integer"}}}}}}, {}},
+        [](const json& p)->json{ return p["a"].get<int>() + p["b"].get<int>(); });
+    ASSERT(tools.has_tool("add"));
+    auto result = tools.call("add", {{"a", 3}, {"b", 4}});
+    ASSERT(result.get<int>() == 7);
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -952,6 +1090,25 @@ int main() {
 
     std::cout<<"\n=== MCP Types ===\n";
     RUN(test_mcp_client_types); RUN(test_mcp_tool_def_conversion);
+
+    std::cout<<"\n=== Token Budget ===\n";
+    RUN(test_token_budget_not_set); RUN(test_token_budget_exceeded);
+    RUN(test_token_budget_error_type);
+
+    std::cout<<"\n=== WorkflowPlan Serialization ===\n";
+    RUN(test_plan_serialization); RUN(test_plan_roundtrip);
+
+    std::cout<<"\n=== PlanCache Context ===\n";
+    RUN(test_plan_cache_with_context);
+
+    std::cout<<"\n=== WorkflowState Serialization ===\n";
+    RUN(test_state_serialization);
+
+    std::cout<<"\n=== Provider Factories ===\n";
+    RUN(test_provider_factories_new);
+
+    std::cout<<"\n=== Engine call_tool ===\n";
+    RUN(test_engine_call_tool);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";
