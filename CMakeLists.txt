@@ -43,6 +43,21 @@ endif()
 # ── Ariadne Studio (visual workflow editor) ──────────────────────
 option(ARIADNE_BUILD_STUDIO "Build Ariadne Studio" ON)
 if(ARIADNE_BUILD_STUDIO)
+    # Auto-download cpp-httplib if not present
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/httplib.h")
+        message(STATUS "Downloading cpp-httplib...")
+        file(DOWNLOAD
+            "https://raw.githubusercontent.com/yhirose/cpp-httplib/v0.20.0/httplib.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/deps/httplib.h"
+            STATUS dl_status)
+        list(GET dl_status 0 dl_code)
+        if(NOT dl_code EQUAL 0)
+            message(WARNING "Failed to download httplib.h — Studio will not build")
+            set(ARIADNE_BUILD_STUDIO OFF)
+        endif()
+    endif()
+endif()
+if(ARIADNE_BUILD_STUDIO)
     # Embed index.html into a C++ header at build time
     add_custom_command(
         OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/studio_embedded.h
@@ -66,6 +81,8 @@ if(ARIADNE_BUILD_STUDIO)
     target_link_libraries(ariadne-studio PRIVATE ariadne)
     if(WIN32)
         target_link_libraries(ariadne-studio PRIVATE ws2_32)
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "9.0")
+        target_link_libraries(ariadne-studio PRIVATE stdc++fs)
     endif()
 endif()
 

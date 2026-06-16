@@ -6,6 +6,16 @@
 #  define _CRT_SECURE_NO_WARNINGS
 #endif
 
+// Disable optional dependencies for standalone build
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+#undef CPPHTTPLIB_OPENSSL_SUPPORT
+#endif
+#ifdef CPPHTTPLIB_BROTLI_SUPPORT
+#undef CPPHTTPLIB_BROTLI_SUPPORT
+#endif
+#ifdef CPPHTTPLIB_ZLIB_SUPPORT
+#undef CPPHTTPLIB_ZLIB_SUPPORT
+#endif
 #include "../ariadne.hpp"
 #include "studio_ui.hpp"
 #include <httplib.h>
