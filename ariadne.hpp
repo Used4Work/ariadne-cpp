@@ -1355,6 +1355,107 @@ private:
 };
 
 // ════════════════════════════════════════════════════════════════
+// Dynamic Workflow — Ultracode 级别的动态任务编排
+//
+// 对标 Claude Code Ultracode 的核心原语：
+//   parallel()     → 并行扇出，等待所有结果 (barrier)
+//   pipeline()     → 无 barrier 流水线，item 独立流过各阶段
+//   map()          → 并行 map，对集合中每个元素应用函数
+//   loop_until()   → 动态循环直到条件满足 (loop-until-dry)
+//   fan_out_agents → 并行启动多个 ReACT agent
+//
+// 用法：
+//   DynamicWorkflow dw(engine);
+//   dw.on_progress([](auto& p, auto& m){ std::cout << "[" << p << "] " << m << "\n"; });
+//
+//   // 并行扇出 3 个 agent
+//   auto results = dw.fan_out_agents({"搜索Tesla","搜索BYD","搜索NIO"}, 8);
+//
+//   // 流水线：搜索 → 分析 → 验证
+//   auto verified = dw.pipeline(items,
+//       {[&](auto& x){ return engine.llm_complete("分析: " + x.dump()); },
+//        [&](auto& x){ return engine.llm_complete("验证: " + x.dump()); }});
+//
+//   // 循环直到找到 10 个结果
+//   auto all = dw.loop_until(
+//       [](int r, auto& acc){ return acc.size() >= 10; },
+//       [&](int r){ return engine.run_agent("找更多 bug, round " + std::to_string(r), 5).final_answer; });
+// ════════════════════════════════════════════════════════════════
+
+using DynTask  = std::function<json()>;
+using StageFn  = std::function<json(const json& input)>;
+using StopFn   = std::function<bool(int round, const std::vector<json>& accumulated)>;
+using RoundFn  = std::function<std::vector<json>(int round)>;
+using ProgressFn = std::function<void(const std::string& phase, const std::string& message)>;
+
+/** 动态编排结果 */
+struct DynamicResult {
+    bool                success = true;
+    std::vector<json>   outputs;
+    int                 rounds_used = 0;
+    long                duration_ms = 0;
+    TokenUsage          token_usage;
+    std::string         error;
+    std::vector<std::string> log;
+};
+
+class DynamicWorkflow {
+public:
+    explicit DynamicWorkflow(WorkflowEngine& engine, size_t max_concurrency = 0);
+    ~DynamicWorkflow();
+
+    // ── 核心原语 ────────────────────────────────────────
+
+    /** parallel — 并行执行 N 个任务，等待所有完成 (barrier)
+     *  失败的任务返回 null，不中断其他任务 */
+    std::vector<json> parallel(const std::vector<DynTask>& tasks);
+
+    /** map — 对集合中每个元素并行应用 fn */
+    std::vector<json> map(const std::vector<json>& items, StageFn fn);
+
+    /** pipeline — 无 barrier 流水线
+     *  每个 item 独立流过所有 stage，item A 可以在 stage 3 而 item B 还在 stage 1
+     *  某个 item 在某个 stage 失败则该 item 后续 stage 跳过，结果为 null */
+    std::vector<json> pipeline(const std::vector<json>& items,
+                                const std::vector<StageFn>& stages);
+
+    /** loop_until — 动态循环直到 stop 返回 true
+     *  每轮调用 work(round)，结果追加到累积集合
+     *  支持 budget-aware：token 预算耗尽自动停止 */
+    DynamicResult loop_until(StopFn stop, RoundFn work, int max_rounds = 50);
+
+    // ── 便利方法 ────────────────────────────────────────
+
+    /** 并行启动多个 ReACT agent，返回各自的 final_answer */
+    std::vector<json> fan_out_agents(const std::vector<std::string>& tasks,
+                                      int max_iterations = 10);
+
+    /** 对抗验证：对一个 claim 启动 N 个独立验证 agent
+     *  每个返回 {verified: bool, reason: string}
+     *  多数票决定最终结果 */
+    json adversarial_verify(const std::string& claim, int num_voters = 3);
+
+    // ── 进度 & 控制 ────────────────────────────────────
+
+    void phase(const std::string& name);
+    void log(const std::string& message);
+    void on_progress(ProgressFn fn) { progress_fn_ = std::move(fn); }
+
+    /** 当前阶段名 */
+    std::string current_phase() const { return current_phase_; }
+
+private:
+    WorkflowEngine& engine_;
+    ThreadPool pool_;
+    ProgressFn progress_fn_;
+    std::string current_phase_ = "init";
+    std::vector<std::string> log_;
+    std::mutex log_mu_;
+
+    void emit(const std::string& msg);
+};
+
+// ════════════════════════════════════════════════════════════════
 // 13. DAG 校验
 // ════════════════════════════════════════════════════════════════
 

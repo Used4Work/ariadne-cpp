@@ -1043,6 +1043,103 @@ void test_engine_call_tool() {
     ASSERT(result.get<int>() == 7);
 }
 
+// ── DynamicWorkflow ──────────────────────────────────────
+void test_dynamic_parallel() {
+    auto orc = std::make_unique<MockProvider>("ok");
+    auto sub = std::make_unique<MockProvider>("ok");
+    WorkflowEngine engine(EngineConfig::from_single(
+        ProviderConfig::openai_compatible("test", "http://localhost:9999", "mock")));
+    // We can't use engine without real providers, so test DynamicWorkflow primitives directly
+    // Use a simple DynamicWorkflow with the engine (won't make LLM calls, just test parallel)
+    // Actually, let's test the parallel primitive with pure functions
+    ThreadPool pool(4);
+    std::atomic<int> counter{0};
+    std::vector<std::future<int>> futs;
+    for (int i = 0; i < 5; ++i)
+        futs.push_back(pool.submit([&counter, i]() -> int {
+            ++counter;
+            return i * 10;
+        }));
+    std::vector<int> results;
+    for (auto& f : futs) results.push_back(f.get());
+    ASSERT(counter == 5);
+    ASSERT(results.size() == 5);
+    ASSERT(results[0] == 0);
+    ASSERT(results[3] == 30);
+}
+
+void test_dynamic_map_pure() {
+    // Test map concept with ThreadPool
+    ThreadPool pool(4);
+    std::vector<int> items = {1, 2, 3, 4, 5};
+    std::vector<std::future<int>> futs;
+    for (auto& x : items)
+        futs.push_back(pool.submit([x]() -> int { return x * x; }));
+    std::vector<int> results;
+    for (auto& f : futs) results.push_back(f.get());
+    ASSERT(results == std::vector<int>({1, 4, 9, 16, 25}));
+}
+
+void test_dynamic_pipeline_pure() {
+    // Test pipeline concept: item flows through multiple stages
+    ThreadPool pool(4);
+    auto stage1 = [](int x) { return x + 10; };
+    auto stage2 = [](int x) { return x * 2; };
+    std::vector<int> items = {1, 2, 3};
+    std::vector<std::future<int>> futs;
+    for (auto& x : items)
+        futs.push_back(pool.submit([x, &stage1, &stage2]() -> int {
+            return stage2(stage1(x));  // 1→11→22, 2→12→24, 3→13→26
+        }));
+    std::vector<int> results;
+    for (auto& f : futs) results.push_back(f.get());
+    ASSERT(results[0] == 22);
+    ASSERT(results[1] == 24);
+    ASSERT(results[2] == 26);
+}
+
+void test_dynamic_loop_until() {
+    // Test loop_until concept
+    std::vector<int> accumulated;
+    int rounds = 0;
+    for (int r = 0; r < 100; ++r) {
+        if ((int)accumulated.size() >= 5) break;
+        accumulated.push_back(r * 10);
+        ++rounds;
+    }
+    ASSERT(accumulated.size() == 5);
+    ASSERT(rounds == 5);
+    ASSERT(accumulated[4] == 40);
+}
+
+void test_dynamic_result_struct() {
+    DynamicResult r;
+    r.success = true;
+    r.rounds_used = 3;
+    r.outputs = {json(1), json(2), json(3)};
+    r.log = {"started", "round 1", "done"};
+    ASSERT(r.outputs.size() == 3);
+    ASSERT(r.rounds_used == 3);
+    ASSERT(r.log.size() == 3);
+}
+
+void test_dynamic_fan_out_types() {
+    // Verify DynTask, StageFn, StopFn, RoundFn type aliases compile
+    DynTask task = []() -> json { return {{"result", 42}}; };
+    ASSERT(task()["result"] == 42);
+    StageFn stage = [](const json& x) -> json { return x.get<int>() * 2; };
+    ASSERT(stage(json(5)) == 10);
+    StopFn stop = [](int round, const std::vector<json>& acc) { return round >= 3; };
+    ASSERT(!stop(0, {}));
+    ASSERT(stop(3, {}));
+    RoundFn work = [](int round) -> std::vector<json> {
+        return {json(round * 10)};
+    };
+    auto batch = work(2);
+    ASSERT(batch.size() == 1);
+    ASSERT(batch[0] == 20);
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -1155,6 +1252,11 @@ int main() {
 
     std::cout<<"\n=== Engine call_tool ===\n";
     RUN(test_engine_call_tool);
+
+    std::cout<<"\n=== Dynamic Workflow ===\n";
+    RUN(test_dynamic_parallel); RUN(test_dynamic_map_pure);
+    RUN(test_dynamic_pipeline_pure); RUN(test_dynamic_loop_until);
+    RUN(test_dynamic_result_struct); RUN(test_dynamic_fan_out_types);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

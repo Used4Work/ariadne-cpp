@@ -1012,6 +1012,217 @@ json WorkflowExecutor::exec_transform(const Step& s, const json& in) const {
 }
 
 // ════════════════════════════════════════════════════════════════
+// DynamicWorkflow — Ultracode 级别的动态任务编排
+// ════════════════════════════════════════════════════════════════
+
+DynamicWorkflow::DynamicWorkflow(WorkflowEngine& engine, size_t max_concurrency)
+    : engine_(engine)
+    , pool_(max_concurrency == 0 ? std::min(16u, std::thread::hardware_concurrency()) : max_concurrency)
+{}
+
+DynamicWorkflow::~DynamicWorkflow() = default;
+
+void DynamicWorkflow::emit(const std::string& msg) {
+    {
+        std::lock_guard<std::mutex> lk(log_mu_);
+        log_.push_back(msg);
+    }
+    if (progress_fn_) progress_fn_(current_phase_, msg);
+}
+
+void DynamicWorkflow::phase(const std::string& name) {
+    current_phase_ = name;
+    emit("── Phase: " + name + " ──");
+}
+
+void DynamicWorkflow::log(const std::string& message) {
+    emit(message);
+}
+
+std::vector<json> DynamicWorkflow::parallel(const std::vector<DynTask>& tasks) {
+    emit("parallel: " + std::to_string(tasks.size()) + " tasks");
+    std::vector<std::future<json>> futs;
+    futs.reserve(tasks.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        futs.push_back(pool_.submit([&tasks, i, this]() -> json {
+            try {
+                auto result = tasks[i]();
+                emit("  [" + std::to_string(i) + "] done");
+                return result;
+            } catch (const std::exception& e) {
+                emit("  [" + std::to_string(i) + "] failed: " + e.what());
+                return nullptr;
+            }
+        }));
+    }
+    std::vector<json> results;
+    results.reserve(futs.size());
+    for (auto& f : futs) results.push_back(f.get());
+    return results;
+}
+
+std::vector<json> DynamicWorkflow::map(const std::vector<json>& items, StageFn fn) {
+    emit("map: " + std::to_string(items.size()) + " items");
+    std::vector<std::future<json>> futs;
+    futs.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        futs.push_back(pool_.submit([&fn, &items, i, this]() -> json {
+            try {
+                return fn(items[i]);
+            } catch (const std::exception& e) {
+                emit("  map[" + std::to_string(i) + "] failed: " + e.what());
+                return nullptr;
+            }
+        }));
+    }
+    std::vector<json> results;
+    results.reserve(futs.size());
+    for (auto& f : futs) results.push_back(f.get());
+    return results;
+}
+
+std::vector<json> DynamicWorkflow::pipeline(const std::vector<json>& items,
+                                              const std::vector<StageFn>& stages) {
+    emit("pipeline: " + std::to_string(items.size()) + " items × "
+         + std::to_string(stages.size()) + " stages");
+    // Each item flows through all stages independently — no barrier between stages
+    // Pipeline via pool: each item gets a single task that chains all stages
+    std::vector<std::future<json>> futs;
+    futs.reserve(items.size());
+    for (size_t i = 0; i < items.size(); ++i) {
+        futs.push_back(pool_.submit([&stages, &items, i, this]() -> json {
+            json current = items[i];
+            for (size_t s = 0; s < stages.size(); ++s) {
+                if (current.is_null()) return nullptr;  // previous stage failed
+                try {
+                    current = stages[s](current);
+                } catch (const std::exception& e) {
+                    emit("  pipe[" + std::to_string(i) + "] failed at stage "
+                         + std::to_string(s) + ": " + e.what());
+                    return nullptr;
+                }
+            }
+            emit("  pipe[" + std::to_string(i) + "] complete");
+            return current;
+        }));
+    }
+    std::vector<json> results;
+    results.reserve(futs.size());
+    for (auto& f : futs) results.push_back(f.get());
+    return results;
+}
+
+DynamicResult DynamicWorkflow::loop_until(StopFn stop, RoundFn work, int max_rounds) {
+    DynamicResult result;
+    auto t0 = std::chrono::steady_clock::now();
+    emit("loop_until: max " + std::to_string(max_rounds) + " rounds");
+
+    std::vector<json> accumulated;
+    for (int round = 0; round < max_rounds; ++round) {
+        // Budget check
+        if (engine_.budget_exceeded()) {
+            emit("loop_until: budget exceeded at round " + std::to_string(round));
+            break;
+        }
+        // Stop condition
+        if (stop(round, accumulated)) {
+            emit("loop_until: stop condition met at round " + std::to_string(round));
+            break;
+        }
+        emit("loop_until: round " + std::to_string(round + 1));
+        try {
+            auto batch = work(round);
+            for (auto& item : batch) accumulated.push_back(std::move(item));
+            emit("  round " + std::to_string(round + 1) + ": +"
+                 + std::to_string(batch.size()) + " items, total "
+                 + std::to_string(accumulated.size()));
+        } catch (const std::exception& e) {
+            emit("  round " + std::to_string(round + 1) + " failed: " + e.what());
+            result.error = e.what();
+            result.success = false;
+            break;
+        }
+        result.rounds_used = round + 1;
+    }
+    result.outputs = std::move(accumulated);
+    result.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    {
+        std::lock_guard<std::mutex> lk(log_mu_);
+        result.log = log_;
+    }
+    return result;
+}
+
+std::vector<json> DynamicWorkflow::fan_out_agents(const std::vector<std::string>& tasks,
+                                                    int max_iterations) {
+    phase("fan_out_agents");
+    emit("Spawning " + std::to_string(tasks.size()) + " parallel agents");
+    std::vector<DynTask> agent_tasks;
+    agent_tasks.reserve(tasks.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        agent_tasks.push_back([this, &tasks, i, max_iterations]() -> json {
+            auto result = engine_.run_agent(tasks[i], max_iterations);
+            return {{"task", tasks[i]},
+                    {"success", result.success},
+                    {"answer", result.final_answer},
+                    {"iterations", result.iterations_used},
+                    {"duration_ms", result.duration_ms},
+                    {"tokens", result.token_usage.total_tokens}};
+        });
+    }
+    return parallel(agent_tasks);
+}
+
+json DynamicWorkflow::adversarial_verify(const std::string& claim, int num_voters) {
+    phase("adversarial_verify");
+    emit("Verifying claim with " + std::to_string(num_voters) + " independent voters");
+
+    std::string verify_prompt =
+        "You are a skeptical fact-checker. Analyze this claim and try to REFUTE it.\n"
+        "If you cannot refute it, it is likely true.\n\n"
+        "Claim: " + claim + "\n\n"
+        "Respond with ONLY a JSON object:\n"
+        "{\"verified\": true/false, \"confidence\": 0.0-1.0, \"reason\": \"your reasoning\"}";
+
+    std::vector<DynTask> voter_tasks;
+    for (int i = 0; i < num_voters; ++i) {
+        voter_tasks.push_back([this, &verify_prompt, i]() -> json {
+            try {
+                auto raw = engine_.llm_complete(verify_prompt, "", ModelTier::SUBAGENT, 0.3);
+                return WorkflowPlanner::extract_json(raw);
+            } catch (...) {
+                return {{"verified", false}, {"confidence", 0.0}, {"reason", "voter failed"}};
+            }
+        });
+    }
+
+    auto votes = parallel(voter_tasks);
+
+    // Majority vote
+    int yes = 0, no = 0;
+    double total_confidence = 0.0;
+    json all_reasons = json::array();
+    for (const auto& v : votes) {
+        if (v.is_null()) { ++no; continue; }
+        bool verified = v.value("verified", false);
+        if (verified) ++yes; else ++no;
+        total_confidence += v.value("confidence", 0.0);
+        all_reasons.push_back(v.value("reason", ""));
+    }
+
+    bool final_verdict = yes > no;
+    emit("Verdict: " + std::string(final_verdict ? "VERIFIED" : "REFUTED")
+         + " (" + std::to_string(yes) + "/" + std::to_string(num_voters) + " votes)");
+
+    return {{"claim", claim},
+            {"verified", final_verdict},
+            {"votes_yes", yes}, {"votes_no", no},
+            {"avg_confidence", votes.empty() ? 0.0 : total_confidence / votes.size()},
+            {"reasons", all_reasons}};
+}
+
+// ════════════════════════════════════════════════════════════════
 // validate_dag
 // ════════════════════════════════════════════════════════════════
 
