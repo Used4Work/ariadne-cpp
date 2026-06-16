@@ -20,7 +20,7 @@ int main(int argc,char* argv[]) {
     if(!key){std::cerr<<"Set GITHUB_TOKEN\n";return 1;}
     std::string mode=(argc>1)?argv[1]:"dag";
     WorkflowEngine engine(EngineConfig::from_single(
-        ProviderConfig::github_models(key,"openai/gpt-4.1")));
+        ProviderConfig::github_models(key,"openai/gpt-4o-mini")));
     add_tools(engine);
 
     if(mode=="dag"){
@@ -56,7 +56,7 @@ int main(int argc,char* argv[]) {
         else          std::cerr<<"Failed: "<<r.error<<"\n";
     } else if(mode=="probe"){
         ProviderAutoPlanner p;
-        p.add_candidate("gpt-4.1",ProviderConfig::github_models(key,"openai/gpt-4.1"),"strong",1);
+        p.add_candidate("gpt-4.1",ProviderConfig::github_models(key,"openai/gpt-4o-mini"),"strong",1);
         p.add_candidate("gpt-4o-mini",ProviderConfig::github_models(key,"openai/gpt-4o-mini"),"fast",1);
         auto r=p.probe_and_plan(std::chrono::seconds(10));
         if(r.success) std::cout<<"ORCHESTRATOR: "<<r.alive_strong[0]<<"\nSUBAGENT: "<<r.alive_fast[0]<<"\n";

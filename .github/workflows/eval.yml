@@ -9,7 +9,7 @@ on:
       model:
         description: "Model ID"
         required: false
-        default: "openai/gpt-4.1"
+        default: "openai/gpt-4o-mini"
 permissions:
   contents: read
   models: read
@@ -28,7 +28,7 @@ jobs:
       - name: Run Eval Harness
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          EVAL_MODEL: ${{ github.event.inputs.model || 'openai/gpt-4.1' }}
+          EVAL_MODEL: ${{ github.event.inputs.model || 'openai/gpt-4o-mini' }}
         run: cd build && ./eval_runner
       - name: Upload eval report
         if: always()
