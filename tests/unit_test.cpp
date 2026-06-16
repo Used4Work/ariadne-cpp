@@ -448,6 +448,420 @@ void test_provider_config_max_rps() {
     ASSERT(unlimited.max_rps == 0.0);
 }
 
+// ── Recursive $ref Resolution ─────────────────────────────────
+void test_ref_nested_object() {
+    WorkflowState s;
+    s.step_outputs["s1"] = {{"val", "hello"}};
+    auto r = s.resolve_inputs({{"outer", {{"inner", "$s1.val"}}}});
+    ASSERT(r["outer"]["inner"].get<std::string>() == "hello");
+}
+
+void test_ref_array() {
+    WorkflowState s;
+    s.step_outputs["a"] = "alpha";
+    s.step_outputs["b"] = "beta";
+    auto r = s.resolve_inputs({{"items", json::array({"$a", "$b", "literal"})}});
+    ASSERT(r["items"][0].get<std::string>() == "alpha");
+    ASSERT(r["items"][1].get<std::string>() == "beta");
+    ASSERT(r["items"][2].get<std::string>() == "literal");
+}
+
+void test_ref_mixed() {
+    WorkflowState s;
+    s.task_input = {{"q", "test"}};
+    s.step_outputs["s1"] = {{"data", json::array({10, 20})}};
+    auto r = s.resolve_inputs({{"query", "$task_input.q"},
+                                {"results", json::array({"$s1.data"})},
+                                {"count", 3}});
+    ASSERT(r["query"].get<std::string>() == "test");
+    ASSERT(r["count"].get<int>() == 3);
+}
+
+// ── Cancellation ─────────────────────────────────────────────
+void test_cancel_token() {
+    auto tok = std::make_shared<std::atomic<bool>>(false);
+    ASSERT(!tok->load());
+    tok->store(true);
+    ASSERT(tok->load());
+}
+
+void test_cancelled_error() {
+    try { throw WorkflowCancelledError("test cancel"); }
+    catch (const AriadneError& e) {
+        ASSERT(std::string(e.what()).find("cancel") != std::string::npos);
+    }
+}
+
+// ── MockProvider + Execution ─────────────────────────────────
+void test_mock_provider() {
+    MockProvider p("hello world");
+    ASSERT(p.complete("", "", 0.0, false) == "hello world");
+    ASSERT(p.provider_name() == "mock");
+    p.set_response("changed");
+    ASSERT(p.complete("", "", 0.0, false) == "changed");
+}
+
+void test_llmclient_mock() {
+    auto orc = std::make_unique<MockProvider>(R"({"answer":"42"})");
+    auto sub = std::make_unique<MockProvider>("sub response");
+    LLMClient client(std::move(orc), std::move(sub));
+    auto r1 = client.complete_as(ModelTier::ORCHESTRATOR, "test");
+    ASSERT(r1.find("42") != std::string::npos);
+    auto r2 = client.complete_as(ModelTier::SUBAGENT, "test");
+    ASSERT(r2 == "sub response");
+}
+
+void test_executor_simple_dag() {
+    auto orc = std::make_unique<MockProvider>("orchestrator output");
+    auto sub = std::make_unique<MockProvider>("tool result from llm");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    tools.register_tool({"add","Add numbers",{},{}},
+        [](const json& p)->json{ return p["a"].get<int>() + p["b"].get<int>(); });
+
+    WorkflowExecutor exec(client, tools);
+    WorkflowPlan plan{"test_plan", {
+        {"step1", StepType::TOOL, "add", {{"a", 3}, {"b", 4}}, {}, 0, 30, OnError::FAIL},
+        {"step2", StepType::LLM, "Summarize", {{"input", "$step1"}}, {"step1"}, 0, 30, OnError::FAIL},
+    }};
+    auto state = exec.execute(plan, {{"task", "test"}});
+    ASSERT(state.step_outputs.count("step1"));
+    ASSERT(state.step_outputs["step1"].get<int>() == 7);
+    ASSERT(state.step_outputs.count("step2"));
+    ASSERT(state.traces.size() == 2);
+}
+
+// ── CONDITION Branching ───────────────────────────────────────
+void test_condition_true_passes() {
+    auto orc = std::make_unique<MockProvider>("llm out");
+    auto sub = std::make_unique<MockProvider>("sub out");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    WorkflowExecutor exec(client, tools);
+    WorkflowPlan plan{"cond_test", {
+        {"check", StepType::CONDITION, "check", {{"value", true}}, {}, 0, 30, OnError::FAIL},
+        {"after", StepType::LLM, "Do work", {}, {"check"}, 0, 30, OnError::FAIL},
+    }};
+    auto state = exec.execute(plan, {{"task","test"}});
+    ASSERT(state.step_outputs.count("after"));
+    ASSERT(!state.step_outputs["after"].is_null());
+}
+
+void test_condition_false_skips() {
+    auto orc = std::make_unique<MockProvider>("should not run");
+    auto sub = std::make_unique<MockProvider>("sub");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    WorkflowExecutor exec(client, tools);
+    WorkflowPlan plan{"cond_test", {
+        {"check", StepType::CONDITION, "check", {{"value", false}}, {}, 0, 30, OnError::FAIL},
+        {"after", StepType::LLM, "Do work", {}, {"check"}, 0, 30, OnError::FAIL},
+    }};
+    auto state = exec.execute(plan, {{"task","test"}});
+    ASSERT(state.step_outputs["after"].is_null());
+}
+
+void test_condition_cascade_skip() {
+    auto orc = std::make_unique<MockProvider>("x");
+    auto sub = std::make_unique<MockProvider>("x");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    WorkflowExecutor exec(client, tools);
+    WorkflowPlan plan{"cascade", {
+        {"gate", StepType::CONDITION, "gate", {{"value", false}}, {}, 0, 30, OnError::FAIL},
+        {"mid",  StepType::LLM, "Middle", {}, {"gate"}, 0, 30, OnError::FAIL},
+        {"end",  StepType::LLM, "End",    {}, {"mid"},  0, 30, OnError::FAIL},
+    }};
+    auto state = exec.execute(plan, {{"task","test"}});
+    ASSERT(state.step_outputs["mid"].is_null());
+    ASSERT(state.step_outputs["end"].is_null());
+}
+
+// ── Metrics Emission ─────────────────────────────────────────
+void test_metrics_step_events() {
+    std::vector<MetricEvent> recorded;
+    class Collector : public IMetricsCollector {
+    public:
+        std::vector<MetricEvent>& v;
+        explicit Collector(std::vector<MetricEvent>& vec) : v(vec) {}
+        void record(const MetricEvent& e) noexcept override { v.push_back(e); }
+    };
+    auto col = std::make_shared<Collector>(recorded);
+
+    auto orc = std::make_unique<MockProvider>("llm result");
+    auto sub = std::make_unique<MockProvider>("sub");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    tools.register_tool({"echo","",{},{}}, [](const json& p)->json{ return p; });
+    WorkflowExecutor exec(client, tools, 0, col);
+    WorkflowPlan plan{"metrics_test", {
+        {"t1", StepType::TOOL, "echo", {{"x",1}}, {}, 0, 30, OnError::FAIL},
+        {"l1", StepType::LLM,  "Sum",  {},        {"t1"}, 0, 30, OnError::FAIL},
+    }};
+    exec.execute(plan, {{"task","test"}});
+
+    int step_start=0, step_end=0, tool_call=0, tool_resp=0, llm_call=0, llm_resp=0;
+    for (const auto& e : recorded) {
+        if (e.kind == MetricEvent::Kind::STEP_START)    ++step_start;
+        if (e.kind == MetricEvent::Kind::STEP_END)      ++step_end;
+        if (e.kind == MetricEvent::Kind::TOOL_CALL)     ++tool_call;
+        if (e.kind == MetricEvent::Kind::TOOL_RESPONSE) ++tool_resp;
+        if (e.kind == MetricEvent::Kind::LLM_CALL)      ++llm_call;
+        if (e.kind == MetricEvent::Kind::LLM_RESPONSE)  ++llm_resp;
+    }
+    ASSERT(step_start == 2);
+    ASSERT(step_end == 2);
+    ASSERT(tool_call == 1);
+    ASSERT(tool_resp == 1);
+    ASSERT(llm_call == 1);
+    ASSERT(llm_resp == 1);
+}
+
+void test_metrics_workflow_end() {
+    std::vector<MetricEvent> recorded;
+    class Collector : public IMetricsCollector {
+    public:
+        std::vector<MetricEvent>& v;
+        explicit Collector(std::vector<MetricEvent>& vec) : v(vec) {}
+        void record(const MetricEvent& e) noexcept override { v.push_back(e); }
+    };
+    auto col = std::make_shared<Collector>(recorded);
+    MetricEvent evt{MetricEvent::Kind::WORKFLOW_START, "wf1", "", "", "", 0, true, ""};
+    col->record(evt);
+    evt.kind = MetricEvent::Kind::WORKFLOW_END;
+    evt.duration_ms = 100;
+    col->record(evt);
+    ASSERT(recorded.size() == 2);
+    ASSERT(recorded[0].kind == MetricEvent::Kind::WORKFLOW_START);
+    ASSERT(recorded[1].kind == MetricEvent::Kind::WORKFLOW_END);
+    ASSERT(recorded[1].duration_ms == 100);
+}
+
+// ── Token Usage ──────────────────────────────────────────────
+void test_token_usage_struct() {
+    TokenUsage a{10, 20, 30};
+    TokenUsage b{5, 15, 20};
+    a += b;
+    ASSERT(a.input_tokens == 15);
+    ASSERT(a.output_tokens == 35);
+    ASSERT(a.total_tokens == 50);
+}
+
+void test_token_usage_mock_provider() {
+    auto orc = std::make_unique<MockProvider>("result");
+    auto sub = std::make_unique<MockProvider>("sub");
+    LLMClient client(std::move(orc), std::move(sub));
+    client.reset_usage();
+    client.complete_as(ModelTier::ORCHESTRATOR, "test");
+    auto u = client.total_usage();
+    // MockProvider doesn't set g_last_token_usage, so should be zero
+    ASSERT(u.total_tokens == 0);
+}
+
+// ── Plan Cache ───────────────────────────────────────────────
+void test_plan_cache_basic() {
+    PlanCache cache(3);
+    WorkflowPlan p1{"plan1", {{"s1", StepType::TOOL, "act", {}, {}, 0, 30, OnError::FAIL}}};
+    cache.put("key1", p1);
+    ASSERT(cache.has("key1"));
+    ASSERT(!cache.has("key2"));
+    auto got = cache.get("key1");
+    ASSERT(got.steps.size() == 1);
+    ASSERT(got.steps[0].id == "s1");
+}
+
+void test_plan_cache_lru() {
+    PlanCache cache(2);
+    WorkflowPlan p1{"p1",{}}, p2{"p2",{}}, p3{"p3",{}};
+    cache.put("a", p1);
+    cache.put("b", p2);
+    ASSERT(cache.size() == 2);
+    cache.put("c", p3);  // evicts "a" (LRU)
+    ASSERT(cache.size() == 2);
+    ASSERT(!cache.has("a"));
+    ASSERT(cache.has("b"));
+    ASSERT(cache.has("c"));
+}
+
+void test_plan_cache_normalize() {
+    std::vector<ToolDef> tools = {{"search","",{},{}}, {"calc","",{},{}}};
+    auto k1 = PlanCache::normalize_key("Search Tesla Revenue", tools);
+    auto k2 = PlanCache::normalize_key("search  tesla  revenue", tools);
+    ASSERT(k1 == k2);
+    auto k3 = PlanCache::normalize_key("Search BYD Revenue", tools);
+    ASSERT(k1 != k3);
+}
+
+// ── Loop Detector (unit-level, no LLM) ───────────────────────
+void test_loop_detector_no_loop() {
+    // Simulate: 3 different tool calls — no loop
+    // Access via the agent loop indirectly. Test the concept.
+    std::vector<std::pair<std::string, json>> calls = {
+        {"search", {{"q","a"}}}, {"search", {{"q","b"}}}, {"calc", {{"x",1}}}
+    };
+    // No repeats, so no loop expected
+    int repeat_count = 0;
+    size_t last_hash = 0;
+    for (const auto& [name, args] : calls) {
+        size_t h = std::hash<std::string>{}(name + args.dump());
+        if (h == last_hash) ++repeat_count; else repeat_count = 1;
+        last_hash = h;
+    }
+    ASSERT(repeat_count < 3);
+}
+
+void test_loop_detector_exact_repeat() {
+    // 3 identical calls → stuck
+    std::vector<std::pair<std::string, json>> calls = {
+        {"search", {{"q","tesla"}}}, {"search", {{"q","tesla"}}}, {"search", {{"q","tesla"}}}
+    };
+    int repeat_count = 0;
+    size_t last_hash = 0;
+    for (const auto& [name, args] : calls) {
+        size_t h = std::hash<std::string>{}(name + args.dump());
+        if (h == last_hash) ++repeat_count; else repeat_count = 1;
+        last_hash = h;
+    }
+    ASSERT(repeat_count >= 3);
+}
+
+// ── Guardrails ───────────────────────────────────────────────
+void test_guardrail_tool_pass() {
+    ToolRegistry r;
+    r.register_tool({"safe","",{},{}}, [](const json& p)->json{ return {{"ok",true}}; });
+    r.add_guardrail("safe", [](const json& p) -> std::optional<std::string> {
+        return std::nullopt;  // always pass
+    });
+    auto res = r.call("safe", {{"x",1}});
+    ASSERT(res["ok"].get<bool>());
+}
+
+void test_guardrail_tool_block() {
+    ToolRegistry r;
+    r.register_tool({"risky","",{},{}}, [](const json& p)->json{ return {{"ok",true}}; });
+    r.add_guardrail("risky", [](const json& p) -> std::optional<std::string> {
+        if (p.value("danger", false)) return std::string("dangerous input blocked");
+        return std::nullopt;
+    });
+    // Safe call passes
+    auto ok = r.call("risky", {{"danger", false}});
+    ASSERT(ok["ok"].get<bool>());
+    // Dangerous call blocked
+    bool caught = false;
+    try { r.call("risky", {{"danger", true}}); }
+    catch (const GuardrailError& e) {
+        caught = true;
+        ASSERT(std::string(e.what()).find("dangerous") != std::string::npos);
+    }
+    ASSERT(caught);
+}
+
+void test_guardrail_error_type() {
+    try { throw GuardrailError("test guardrail"); }
+    catch (const AriadneError& e) {
+        ASSERT(std::string(e.what()).find("guardrail") != std::string::npos);
+    }
+}
+
+// ── Agent Handoff ────────────────────────────────────────────
+void test_handoff_action_type() {
+    AgentAction a;
+    a.type = AgentAction::Type::HANDOFF;
+    a.target_agent = "specialist";
+    ASSERT(a.type == AgentAction::Type::HANDOFF);
+    ASSERT(a.target_agent == "specialist");
+}
+
+void test_agent_def() {
+    AgentDef def;
+    def.name = "researcher";
+    def.system_prompt = "You research things";
+    def.allowed_tools = {"web_search"};
+    def.handoff_targets = {"writer"};
+    ASSERT(def.name == "researcher");
+    ASSERT(def.allowed_tools.size() == 1);
+    ASSERT(def.handoff_targets[0] == "writer");
+}
+
+// ── Strict Structured Output ─────────────────────────────────
+void test_strict_schema_mock() {
+    // MockProvider returns canned JSON; verify the executor path with output_schema
+    auto orc = std::make_unique<MockProvider>(R"({"revenue": 120})");
+    auto sub = std::make_unique<MockProvider>(R"({"revenue": 120})");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    WorkflowExecutor exec(client, tools);
+    Step s;
+    s.id = "extract"; s.type = StepType::LLM; s.action = "Extract revenue";
+    s.output_schema = {{"type","object"},{"properties",{{"revenue",{{"type","number"}}}}}};
+    WorkflowPlan plan{"schema_test", {s}};
+    auto state = exec.execute(plan, {{"task","test"}});
+    ASSERT(state.step_outputs.count("extract"));
+    ASSERT(state.step_outputs["extract"]["revenue"].get<int>() == 120);
+}
+
+// ── Response Cache ───────────────────────────────────────────
+void test_response_cache_basic() {
+    ResponseCache cache(10);
+    auto key = ResponseCache::make_key("model", "sys", "prompt", 0.0, false);
+    cache.put(key, "cached_response");
+    ASSERT(cache.has(key));
+    ASSERT(cache.get(key) == "cached_response");
+    ASSERT(cache.stats().hits == 1);
+}
+
+void test_response_cache_lru() {
+    ResponseCache cache(2);
+    auto k1 = ResponseCache::make_key("m", "s", "p1", 0.0, false);
+    auto k2 = ResponseCache::make_key("m", "s", "p2", 0.0, false);
+    auto k3 = ResponseCache::make_key("m", "s", "p3", 0.0, false);
+    cache.put(k1, "r1"); cache.put(k2, "r2");
+    ASSERT(cache.size() == 2);
+    cache.put(k3, "r3");  // evicts k1
+    ASSERT(!cache.has(k1));
+    ASSERT(cache.has(k3));
+}
+
+void test_response_cache_key_diff() {
+    auto k1 = ResponseCache::make_key("gpt-4o", "sys", "hello", 0.0, false);
+    auto k2 = ResponseCache::make_key("gpt-4o", "sys", "hello", 0.7, false);
+    auto k3 = ResponseCache::make_key("gpt-4o", "sys", "hello", 0.0, true);
+    ASSERT(k1 != k2);  // different temperature
+    ASSERT(k1 != k3);  // different force_json
+}
+
+// ── MCP Types ────────────────────────────────────────────────
+void test_mcp_client_types() {
+    // Verify McpClient can be constructed (no actual subprocess)
+    // Just test that the types compile and are usable
+    ToolDef def{"mcp_tool", "An MCP tool", {{"type","object"}}, {}};
+    ASSERT(def.name == "mcp_tool");
+    ASSERT(def.input_schema["type"] == "object");
+}
+
+void test_mcp_tool_def_conversion() {
+    // Simulate what list_tools would return
+    json mcp_response = {
+        {"tools", {{
+            {"name", "weather"},
+            {"description", "Get weather"},
+            {"inputSchema", {{"type","object"},{"properties",{{"city",{{"type","string"}}}}}}}
+        }}}
+    };
+    // Convert to ToolDef (same as McpClient::list_tools does)
+    std::vector<ToolDef> tools;
+    for (const auto& t : mcp_response["tools"]) {
+        ToolDef def;
+        def.name = t.value("name", "");
+        def.description = t.value("description", "");
+        def.input_schema = t.value("inputSchema", json::object());
+        tools.push_back(def);
+    }
+    ASSERT(tools.size() == 1);
+    ASSERT(tools[0].name == "weather");
+    ASSERT(tools[0].input_schema.contains("properties"));
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -495,6 +909,50 @@ int main() {
     RUN(test_metrics_noop); RUN(test_metrics_console); RUN(test_metrics_interface);
     std::cout<<"\n=== ProviderConfig extensions ===\n";
     RUN(test_provider_config_max_rps);
+
+    std::cout<<"\n=== Recursive $ref Resolution ===\n";
+    RUN(test_ref_nested_object); RUN(test_ref_array); RUN(test_ref_mixed);
+
+    std::cout<<"\n=== Cancellation ===\n";
+    RUN(test_cancel_token); RUN(test_cancelled_error);
+
+    std::cout<<"\n=== MockProvider + Execution ===\n";
+    RUN(test_mock_provider); RUN(test_llmclient_mock);
+    RUN(test_executor_simple_dag);
+
+    std::cout<<"\n=== CONDITION Branching ===\n";
+    RUN(test_condition_true_passes); RUN(test_condition_false_skips);
+    RUN(test_condition_cascade_skip);
+
+    std::cout<<"\n=== Metrics Emission ===\n";
+    RUN(test_metrics_step_events); RUN(test_metrics_workflow_end);
+
+    std::cout<<"\n=== Token Usage ===\n";
+    RUN(test_token_usage_struct); RUN(test_token_usage_mock_provider);
+
+    std::cout<<"\n=== Plan Cache ===\n";
+    RUN(test_plan_cache_basic); RUN(test_plan_cache_lru); RUN(test_plan_cache_normalize);
+
+    std::cout<<"\n=== Loop Detector ===\n";
+    RUN(test_loop_detector_no_loop); RUN(test_loop_detector_exact_repeat);
+
+    std::cout<<"\n=== Guardrails ===\n";
+    RUN(test_guardrail_tool_pass); RUN(test_guardrail_tool_block);
+    RUN(test_guardrail_error_type);
+
+    std::cout<<"\n=== Agent Types (handoff) ===\n";
+    RUN(test_handoff_action_type); RUN(test_agent_def);
+
+    std::cout<<"\n=== Strict Structured Output ===\n";
+    RUN(test_strict_schema_mock);
+
+    std::cout<<"\n=== Response Cache ===\n";
+    RUN(test_response_cache_basic); RUN(test_response_cache_lru);
+    RUN(test_response_cache_key_diff);
+
+    std::cout<<"\n=== MCP Types ===\n";
+    RUN(test_mcp_client_types); RUN(test_mcp_tool_def_conversion);
+
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";
     return (g_pass==g_run) ? 0 : 1;

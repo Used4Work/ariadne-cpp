@@ -23,11 +23,12 @@ size_t HttpProvider::write_cb(char* p, size_t s, size_t n, void* u) {
     return s * n;
 }
 
-std::string HttpProvider::http_post(const std::string& url,
-                                     const std::vector<std::string>& hdrs,
-                                     const std::string& body) const {
-    CURL* c = curl_.get();
-    std::string resp;
+HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
+                                                    const std::vector<std::string>& hdrs,
+                                                    const std::string& body) const {
+    CurlHandle curl;  // 每次请求独立 handle，线程安全
+    CURL* c = curl.get();
+    HttpResponse resp;
     struct curl_slist* h = nullptr;
     for (const auto& s : hdrs) h = curl_slist_append(h, s.c_str());
     curl_easy_setopt(c, CURLOPT_URL,           url.c_str());
@@ -35,13 +36,33 @@ std::string HttpProvider::http_post(const std::string& url,
     curl_easy_setopt(c, CURLOPT_POSTFIELDS,    body.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &resp);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &resp.body);
     curl_easy_setopt(c, CURLOPT_TIMEOUT,       (long)cfg_.timeout_sec);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);  // POSIX 多线程安全
     CURLcode rc = curl_easy_perform(c);
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
         throw std::runtime_error(std::string("curl: ") + curl_easy_strerror(rc));
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp.status_code);
     return resp;
+}
+
+static void extract_token_usage(const json& j) {
+    g_last_token_usage = {};
+    if (!j.contains("usage")) return;
+    const auto& u = j["usage"];
+    // OpenAI format
+    if (u.contains("prompt_tokens")) {
+        g_last_token_usage.input_tokens  = u.value("prompt_tokens", 0L);
+        g_last_token_usage.output_tokens = u.value("completion_tokens", 0L);
+        g_last_token_usage.total_tokens  = u.value("total_tokens", 0L);
+    }
+    // Anthropic format
+    else if (u.contains("input_tokens")) {
+        g_last_token_usage.input_tokens  = u.value("input_tokens", 0L);
+        g_last_token_usage.output_tokens = u.value("output_tokens", 0L);
+        g_last_token_usage.total_tokens  = g_last_token_usage.input_tokens + g_last_token_usage.output_tokens;
+    }
 }
 
 // ── AnthropicProvider ────────────────────────────────────────────
@@ -49,20 +70,24 @@ std::string HttpProvider::http_post(const std::string& url,
 std::string AnthropicProvider::complete(const std::string& prompt,
                                           const std::string& sys,
                                           double temp,
-                                          bool /*force_json*/) const {
+                                          bool /*force_json*/,
+                                          const json& /*output_schema*/) const {
     json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
                   {"temperature", temp},
                   {"messages", {{{"role","user"}, {"content", prompt}}}}};
     if (!sys.empty()) body["system"] = sys;
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
-    auto raw = http_post(base + "/v1/messages",
+    auto resp = http_post(base + "/v1/messages",
         {"Content-Type: application/json",
          "x-api-key: " + cfg_.api_key,
          "anthropic-version: 2023-06-01"},
         body.dump());
-    auto j = json::parse(raw);
+    if (resp.status_code == 429)
+        throw ProviderError("Anthropic: 429 Too Many Requests");
+    auto j = json::parse(resp.body);
     if (j.contains("error"))
-        throw std::runtime_error("Anthropic: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("Anthropic: " + j["error"]["message"].get<std::string>());
+    extract_token_usage(j);
     return j["content"][0]["text"].get<std::string>();
 }
 
@@ -76,22 +101,31 @@ static std::string rtrim_slash(const std::string& s) {
 std::string OpenAIChatProvider::complete(const std::string& prompt,
                                            const std::string& sys,
                                            double temp,
-                                           bool force_json) const {
+                                           bool force_json,
+                                           const json& output_schema) const {
     json msgs = json::array();
     if (!sys.empty()) msgs.push_back({{"role","system"}, {"content", sys}});
     msgs.push_back({{"role","user"}, {"content", prompt}});
     json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
                   {"temperature", temp}, {"messages", msgs}};
-    if (force_json) body["response_format"] = {{"type","json_object"}};
+    if (!output_schema.empty()) {
+        body["response_format"] = {{"type","json_schema"},
+            {"json_schema", {{"name","response"},{"strict",true},{"schema",output_schema}}}};
+    } else if (force_json) {
+        body["response_format"] = {{"type","json_object"}};
+    }
     std::string base = cfg_.base_url.empty() ? "https://api.openai.com" : rtrim_slash(cfg_.base_url);
     std::string path = cfg_.completions_path.empty() ? "/v1/chat/completions" : cfg_.completions_path;
-    auto raw = http_post(base + path,
+    auto resp = http_post(base + path,
         {"Content-Type: application/json",
          "Authorization: Bearer " + cfg_.api_key},
         body.dump());
-    auto j = json::parse(raw);
+    if (resp.status_code == 429)
+        throw ProviderError("OpenAI Chat: 429 Too Many Requests");
+    auto j = json::parse(resp.body);
     if (j.contains("error"))
-        throw std::runtime_error("OpenAI Chat: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("OpenAI Chat: " + j["error"]["message"].get<std::string>());
+    extract_token_usage(j);
     return j["choices"][0]["message"]["content"].get<std::string>();
 }
 
@@ -100,19 +134,23 @@ std::string OpenAIChatProvider::complete(const std::string& prompt,
 std::string OpenAIResponsesProvider::complete(const std::string& prompt,
                                                 const std::string& sys,
                                                 double temp,
-                                                bool /*force_json*/) const {
+                                                bool /*force_json*/,
+                                                const json& /*output_schema*/) const {
     json body = {{"model", cfg_.model}, {"max_output_tokens", cfg_.max_tokens},
                   {"temperature", temp},
                   {"input", {{{"role","user"}, {"content", prompt}}}}};
     if (!sys.empty()) body["instructions"] = sys;
     std::string base = cfg_.base_url.empty() ? "https://api.openai.com" : cfg_.base_url;
-    auto raw = http_post(base + "/v1/responses",
+    auto resp = http_post(base + "/v1/responses",
         {"Content-Type: application/json",
          "Authorization: Bearer " + cfg_.api_key},
         body.dump());
-    auto j = json::parse(raw);
+    if (resp.status_code == 429)
+        throw ProviderError("OpenAI Responses: 429 Too Many Requests");
+    auto j = json::parse(resp.body);
     if (j.contains("error"))
-        throw std::runtime_error("OpenAI Responses: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("OpenAI Responses: " + j["error"]["message"].get<std::string>());
+    extract_token_usage(j);
     return j["output"][0]["content"][0]["text"].get<std::string>();
 }
 
@@ -186,12 +224,31 @@ std::vector<LLMClient::Slot> LLMClient::build_slots(const TierConfig& cfg) {
 LLMClient::LLMClient(TierConfig orc, TierConfig sub)
     : orchestrators_(build_slots(orc)), subagents_(build_slots(sub)) {}
 
+LLMClient::LLMClient(std::unique_ptr<ILLMProvider> orc_prov,
+                       std::unique_ptr<ILLMProvider> sub_prov) {
+    Slot os; os.provider = std::move(orc_prov);
+    orchestrators_.push_back(std::move(os));
+    Slot ss; ss.provider = std::move(sub_prov);
+    subagents_.push_back(std::move(ss));
+}
+
 std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                                    const std::string& prompt,
                                    const std::string& system,
                                    double temperature,
                                    ModelTier tier,
-                                   bool force_json) const {
+                                   bool force_json,
+                                   const json& output_schema) const {
+    // 响应缓存查找 (temperature=0 时最有效)
+    std::string cache_key;
+    if (resp_cache_enabled_ && response_cache_ && !slots.empty()) {
+        cache_key = ResponseCache::make_key(
+            slots[0].provider->model_name(), system, prompt, temperature, force_json);
+        if (response_cache_->has(cache_key)) {
+            auto cached = response_cache_->get(cache_key);
+            if (!cached.empty()) return cached;
+        }
+    }
     std::string last_error;
     for (const auto& slot : slots) {
         if (!slot.breaker.try_allow()) {
@@ -208,27 +265,22 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                 continue;
             }
         try {
-            auto res = slot.provider->complete(prompt, system, temperature, force_json);
+            auto res = slot.provider->complete(prompt, system, temperature, force_json, output_schema);
             slot.breaker.on_success();
             { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
+            { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
+            if (resp_cache_enabled_ && response_cache_ && !cache_key.empty())
+                response_cache_->put(cache_key, res);
             return res;
         } catch (const std::exception& e) {
             std::string emsg = e.what();
-            // R2: detect HTTP 429 rate-limit signal (GitHub Models returns plain text)
-            // "Too Many Requests" → json::parse throws: "parse error...last read: 'T'"
-            bool is_rate_limit =
-                (emsg.find("parse error") != std::string::npos &&
-                 emsg.find("last read: \'T\'") != std::string::npos) ||
-                 emsg.find("429") != std::string::npos ||
-                 emsg.find("Too Many") != std::string::npos;
+            bool is_rate_limit = emsg.find("429") != std::string::npos;
 
             if (is_rate_limit) {
-                // Rate limiting: do NOT open circuit breaker — sleep and let caller retry
                 std::cerr << "[RATE_LIMIT] sleeping 6s\n";
                 std::this_thread::sleep_for(std::chrono::seconds(6));
                 last_error = slot.provider->provider_name() + "/" +
                              slot.provider->model_name() + " [RATE_LIMITED, retrying]";
-                // No record_failure → breaker stays closed
             } else {
                 slot.breaker.on_failure();
                 { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
@@ -244,9 +296,9 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
 
 std::string LLMClient::complete_as(ModelTier tier, const std::string& prompt,
                                      const std::string& system, double temperature,
-                                     bool force_json) const {
+                                     bool force_json, const json& output_schema) const {
     const auto& slots = (tier == ModelTier::ORCHESTRATOR) ? orchestrators_ : subagents_;
-    return try_slots(slots, prompt, system, temperature, tier, force_json);
+    return try_slots(slots, prompt, system, temperature, tier, force_json, output_schema);
 }
 
 std::vector<ProviderStats> LLMClient::stats(ModelTier tier) const {
@@ -263,6 +315,23 @@ std::vector<ProviderStats> LLMClient::stats(ModelTier tier) const {
         out.push_back(ps);
     }
     return out;
+}
+
+TokenUsage LLMClient::total_usage() const {
+    std::lock_guard<std::mutex> lk(usage_mu_);
+    return cumulative_usage_;
+}
+void LLMClient::reset_usage() {
+    std::lock_guard<std::mutex> lk(usage_mu_);
+    cumulative_usage_ = {};
+}
+
+void LLMClient::enable_response_cache(bool on) {
+    resp_cache_enabled_ = on;
+    if (on && !response_cache_) response_cache_ = std::make_unique<ResponseCache>();
+}
+long LLMClient::response_cache_hits() const {
+    return response_cache_ ? response_cache_->stats().hits : 0;
 }
 
 void LLMClient::print_status() const {
@@ -378,6 +447,15 @@ json ToolRegistry::call(const std::string& name, const json& params) const {
         }
     }
 
+    // Tool guardrails
+    auto git = guardrails_.find(name);
+    if (git != guardrails_.end()) {
+        for (const auto& guard : git->second) {
+            auto err = guard(params);
+            if (err) throw GuardrailError("Tool '" + name + "' guardrail: " + *err);
+        }
+    }
+
     if (!fit->second) return nullptr;
     return fit->second(params);
 }
@@ -387,6 +465,10 @@ std::vector<ToolDef> ToolRegistry::list_tools() const {
     return out;
 }
 bool ToolRegistry::has_tool(const std::string& n) const { return fns_.count(n) > 0; }
+
+void ToolRegistry::add_guardrail(const std::string& tool_name, GuardrailFn fn) {
+    guardrails_[tool_name].push_back(std::move(fn));
+}
 
 // ════════════════════════════════════════════════════════════════
 // WorkflowPlan
@@ -439,16 +521,25 @@ json WorkflowState::resolve_ref(const std::string& ref) const {
     }
     return obj;
 }
-json WorkflowState::resolve_inputs(const json& inputs) const {
-    if (!inputs.is_object()) return inputs;
-    json r = json::object();
-    for (auto& [k, v] : inputs.items()) {
-        if (v.is_string()) {
-            const auto& sv = v.get<std::string>();
-            r[k] = (!sv.empty() && sv[0] == '$') ? resolve_ref(sv) : v;
-        } else r[k] = v;
+json WorkflowState::resolve_value(const json& v) const {
+    if (v.is_string()) {
+        const auto& sv = v.get<std::string>();
+        return (!sv.empty() && sv[0] == '$') ? resolve_ref(sv) : v;
     }
-    return r;
+    if (v.is_object()) {
+        json r = json::object();
+        for (auto& [k, val] : v.items()) r[k] = resolve_value(val);
+        return r;
+    }
+    if (v.is_array()) {
+        json r = json::array();
+        for (const auto& el : v) r.push_back(resolve_value(el));
+        return r;
+    }
+    return v;
+}
+json WorkflowState::resolve_inputs(const json& inputs) const {
+    return resolve_value(inputs);
 }
 void WorkflowState::record_trace(TraceEntry entry) noexcept {
     traces.push_back(std::move(entry));
@@ -477,22 +568,18 @@ std::string WorkflowContext::to_prompt_prefix() const {
 // WorkflowPlanner
 // ════════════════════════════════════════════════════════════════
 
-static const char* PLANNER_SYS = R"(
-You are a workflow planning engine. Return ONLY {"steps":[...]} JSON, no markdown.
-STEP SCHEMA:
-{"id":"snake_case","type":"tool|llm|transform","action":"tool_name or instruction",
- "description":"one line","inputs":{"key":"value or $step_id.field"},
- "depends_on":["ids"],"retry":0,"timeout_sec":30.0,"on_error":"fail|skip|fallback",
- "model_tier":"subagent|orchestrator"}
-Rules: steps without shared deps run in parallel; no explanation outside the JSON object.
-)";
-
 json WorkflowPlanner::extract_json(const std::string& text) {
-    try { return json::parse(text); } catch (...) {}
+    try { return json::parse(text); } catch (const std::exception& e) {
+        std::cerr << "[extract_json] direct parse failed: " << e.what() << "\n";
+    }
     std::regex fence(R"(```(?:json)?\s*([\s\S]+?)\s*```)"); std::smatch m;
-    if (std::regex_search(text, m, fence)) try { return json::parse(m[1].str()); } catch (...) {}
+    if (std::regex_search(text, m, fence)) try { return json::parse(m[1].str()); } catch (const std::exception& e) {
+        std::cerr << "[extract_json] fence parse failed: " << e.what() << "\n";
+    }
     std::regex obj(R"(\{[\s\S]+\})");
-    if (std::regex_search(text, m, obj)) try { return json::parse(m[0].str()); } catch (...) {}
+    if (std::regex_search(text, m, obj)) try { return json::parse(m[0].str()); } catch (const std::exception& e) {
+        std::cerr << "[extract_json] regex parse failed: " << e.what() << "\n";
+    }
     throw PlanningError("Cannot extract JSON from LLM response: " + text.substr(0, 300));
 }
 
@@ -522,6 +609,10 @@ WorkflowPlan WorkflowPlanner::parse_plan(const json& raw, const std::string& tas
                         (oe == "fallback") ? OnError::FALLBACK : OnError::FAIL;
         step.model_tier = (s.value("model_tier", "subagent") == "orchestrator")
                           ? ModelTier::ORCHESTRATOR : ModelTier::SUBAGENT;
+        step.system_prompt = s.value("system_prompt", "");
+        step.json_mode     = s.value("json_mode", false);
+        step.output_schema = s.value("output_schema", json(nullptr));
+        step.temperature   = s.value("temperature", -1.0);
         plan.steps.push_back(std::move(step));
     }
     return plan;
@@ -569,8 +660,9 @@ WorkflowPlan WorkflowPlanner::plan(const std::string& task,
         if (!errors.empty())
             p += "\n\nPrevious validation errors (fix them):\n" + errors + "\nReturn ONLY JSON.";
         try {
+            const char* sys = custom_sys_.empty() ? PLANNER_SYS_V2 : custom_sys_.c_str();
             auto raw  = extract_json(llm_.complete_as(
-                ModelTier::ORCHESTRATOR, p, PLANNER_SYS_V2,
+                ModelTier::ORCHESTRATOR, p, sys,
                 temps[std::min(i, (int)temps.size()-1)], /*force_json=*/true));
             auto plan = parse_plan(raw, task);
             validate_dag(plan);
@@ -583,87 +675,56 @@ WorkflowPlan WorkflowPlanner::plan(const std::string& task,
                         + " attempts:\n" + errors);
 }
 
-WorkflowPlanner::WorkflowPlanner(LLMClient& llm) : llm_(llm) {}
-
-json WorkflowPlanner::analyze_task(const std::string& task,
-                                    const std::vector<ToolDef>& tools,
-                                    const WorkflowContext& ctx) const {
-    json ta = json::array();
-    for (const auto& t : tools) ta.push_back({{"name", t.name}, {"description", t.description}});
-    std::string prefix = ctx.to_prompt_prefix();
-    std::string p = prefix +
-        "Analyze the task. Return ONLY JSON:\n"
-        "{\"intent\":\"...\",\"required_tools\":[...],\"subtasks\":[{\"order\":1,\"description\":\"...\",\"tool\":\"name or null\"}],"
-        "\"complexity\":\"simple|moderate|complex\"}\n"
-        "Available tools: " + ta.dump() + "\nTask: " + task;
-    return extract_json(llm_.complete_as(ModelTier::ORCHESTRATOR, p));
-}
-
-WorkflowPlan WorkflowPlanner::plan_static(const std::string& task, const json& analysis,
-                                           const std::vector<ToolDef>& tools,
-                                           int max_attempts) const {
-    json tj = json::array();
-    for (const auto& t : tools)
-        tj.push_back({{"name", t.name}, {"description", t.description}, {"inputs", t.input_schema}});
-    std::string base = "Tools:\n" + tj.dump(2)
-                     + "\n\nTask: " + task
-                     + "\n\nAnalysis:\n" + analysis.dump(2)
-                     + "\n\nGenerate the workflow DAG:";
-    std::string errors;
-    std::vector<double> temps = {0.0, 0.2, 0.4};
-    for (int i = 0; i < max_attempts; ++i) {
-        std::string p = base;
-        if (!errors.empty())
-            p += "\n\nPrevious validation errors (fix them):\n" + errors + "\nReturn ONLY JSON.";
-        try {
-            auto raw  = extract_json(llm_.complete_as(ModelTier::ORCHESTRATOR, p, PLANNER_SYS,
-                                     temps[std::min(i, (int)temps.size()-1)]));
-            auto plan = parse_plan(raw, task);
-            validate_dag(plan);
-            return plan;
-        } catch (const std::exception& e) {
-            errors += "[Attempt " + std::to_string(i+1) + "] " + e.what() + "\n";
-        }
-    }
-    throw PlanningError("plan_static failed after " + std::to_string(max_attempts) + " attempts:\n" + errors);
-}
-
-WorkflowPlan WorkflowPlanner::replan(const std::string& task, const WorkflowPlan& cur,
-                                      const std::vector<json>& failures) const {
-    std::string fb;
-    for (size_t i = 0; i < failures.size(); ++i) {
-        const auto& f = failures[i];
-        fb += "Case " + std::to_string(i+1) + ": input=" +
-              f.value("input", json{}).dump().substr(0, 200) +
-              " reason=" + f.value("reason", std::string{}).substr(0, 300) + "\n";
-    }
-    json dag = json::array();
-    for (const auto& s : cur.steps) dag.push_back({{"id", s.id}, {"description", s.description}});
-    std::string p = "Task: " + task + "\nCurrent DAG:\n" + dag.dump(2)
-                  + "\nFailures:\n" + fb + "\nImprove the plan. Return ONLY JSON: {\"steps\":[...]}";
-    auto raw  = extract_json(llm_.complete_as(ModelTier::ORCHESTRATOR, p, PLANNER_SYS, 0.3));
-    auto plan = parse_plan(raw, task);
-    validate_dag(plan);
-    return plan;
-}
+WorkflowPlanner::WorkflowPlanner(LLMClient& llm, const std::string& custom_sys)
+    : llm_(llm), custom_sys_(custom_sys) {}
 
 // ════════════════════════════════════════════════════════════════
 // WorkflowExecutor
 // ════════════════════════════════════════════════════════════════
 
-WorkflowExecutor::WorkflowExecutor(LLMClient& llm, ToolRegistry& tools, size_t max_threads)
-    : llm_(llm), tools_(tools), pool_(max_threads) {}
+WorkflowExecutor::WorkflowExecutor(LLMClient& llm, ToolRegistry& tools, size_t max_threads,
+                                     std::shared_ptr<IMetricsCollector> metrics)
+    : llm_(llm), tools_(tools), pool_(max_threads),
+      metrics_(metrics ? metrics : std::make_shared<NoOpMetrics>()) {}
 
 WorkflowState WorkflowExecutor::execute(const WorkflowPlan& plan,
-                                         const json& task_input) const {
+                                         const json& task_input,
+                                         CancelToken cancel) const {
     WorkflowState state;
     state.task_input = task_input;
 
+    // 构建 step 类型索引，用于 CONDITION 分支控制
+    std::map<std::string, StepType> step_types;
+    for (const auto& s : plan.steps) step_types[s.id] = s.type;
+
+    // 被 CONDITION=false 阻断的步骤集合
+    std::set<std::string> skipped_by_condition;
+
     for (const auto& batch : plan.topological_batches()) {
+        if (cancel && cancel->load()) throw WorkflowCancelledError("Workflow cancelled");
         using FutResult = std::tuple<bool, json, std::vector<TraceEntry>>;
         std::vector<std::pair<Step, std::future<FutResult>>> futs;
 
         for (const auto& step : batch) {
+            // CONDITION 分支控制：如果任意依赖的 CONDITION 步骤返回 false，跳过此步骤
+            bool blocked = false;
+            for (const auto& dep : step.depends_on) {
+                if (skipped_by_condition.count(dep)) { blocked = true; break; }
+                if (step_types.count(dep) && step_types[dep] == StepType::CONDITION) {
+                    auto it = state.step_outputs.find(dep);
+                    if (it != state.step_outputs.end()) {
+                        const auto& v = it->second;
+                        if (v.is_null() || v == false || v == 0) { blocked = true; break; }
+                    }
+                }
+            }
+            if (blocked) {
+                skipped_by_condition.insert(step.id);
+                state.step_outputs[step.id] = nullptr;
+                state.record_trace({step.id, "condition", "skipped", "", 0, "blocked by false condition"});
+                continue;
+            }
+
             futs.emplace_back(step,
                 pool_.submit([&, step]() -> FutResult {
                     std::vector<TraceEntry> local_traces;
@@ -719,9 +780,9 @@ json WorkflowExecutor::run_step(const Step& step, const WorkflowState& state,
                            (step.type == StepType::LLM)  ? "llm"  :
                            (step.type == StepType::TRANSFORM) ? "transform" : "condition";
 
+    metrics_->record({MetricEvent::Kind::STEP_START, "", step.id, "", "", 0, true, ""});
+
     std::exception_ptr last;
-    // B4: 移除内层 std::async，curl 的 CURLOPT_TIMEOUT 已处理超时
-    // R4: 带 jitter 的退避
     static thread_local std::mt19937 rng(std::random_device{}());
     for (int i = 0; i <= step.retry; ++i) {
         try {
@@ -729,9 +790,16 @@ json WorkflowExecutor::run_step(const Step& step, const WorkflowState& state,
             long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             traces.push_back({step.id, type_str, "ok", "", ms, ""});
+            metrics_->record({MetricEvent::Kind::STEP_END, "", step.id, "", "", ms, true, ""});
             return result;
         } catch (...) {
             last = std::current_exception();
+            double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (elapsed >= step.timeout_sec)
+                throw std::runtime_error("Step '" + step.id + "' timed out after "
+                    + std::to_string((int)elapsed) + "s (limit: "
+                    + std::to_string((int)step.timeout_sec) + "s)");
             if (i < step.retry) {
                 std::uniform_int_distribution<int> jitter(0, 200);
                 int delay_ms = 500 * (1 << i) + jitter(rng);
@@ -743,6 +811,7 @@ json WorkflowExecutor::run_step(const Step& step, const WorkflowState& state,
         std::chrono::steady_clock::now() - t0).count();
     try { std::rethrow_exception(last); } catch (const std::exception& e) {
         traces.push_back({step.id, type_str, "failed", "", ms, e.what()});
+        metrics_->record({MetricEvent::Kind::STEP_END, "", step.id, "", "", ms, false, e.what()});
         throw;
     }
 }
@@ -761,14 +830,23 @@ json WorkflowExecutor::dispatch(const Step& step, const json& inputs) const {
 }
 
 json WorkflowExecutor::exec_tool(const Step& s, const json& in) const {
-    return tools_.call(s.action, in);
+    metrics_->record({MetricEvent::Kind::TOOL_CALL, "", s.id, "", "", 0, true, "", {{"tool", s.action}}});
+    auto t0 = std::chrono::steady_clock::now();
+    auto result = tools_.call(s.action, in);
+    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    metrics_->record({MetricEvent::Kind::TOOL_RESPONSE, "", s.id, "", "", (long)ms, true, ""});
+    return result;
 }
 
-// R2: 保留 JSON 层级结构而不是拍平成字符串
 json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
     std::string prompt = s.action;
     if (!in.empty())
         prompt += "\n\nContext:\n" + in.dump(2);
+
+    std::string tier_str = (s.model_tier == ModelTier::ORCHESTRATOR) ? "orchestrator" : "subagent";
+    metrics_->record({MetricEvent::Kind::LLM_CALL, "", s.id, tier_str, "", 0, true, ""});
+    auto llm_t0 = std::chrono::steady_clock::now();
 
     // B1: Structured output / JSON mode
     if (s.json_mode || !s.output_schema.empty()) {
@@ -779,7 +857,8 @@ json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
         else
             prompt += "\n\nReturn ONLY valid JSON. No markdown, no explanation.";
 
-        auto raw = llm_.complete_as(s.model_tier, prompt, s.system_prompt, 0.0);
+        double temp = (s.temperature >= 0.0) ? s.temperature : 0.0;
+        auto raw = llm_.complete_as(s.model_tier, prompt, s.system_prompt, temp, true, s.output_schema);
         try {
             auto result = WorkflowPlanner::extract_json(raw);
             // 实际 schema 验证（不只是 prompt injection）
@@ -792,13 +871,25 @@ json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
                         std::cerr << "  " << v.path << ": " << v.message << "\n";
                 }
             }
+            auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - llm_t0).count();
+            metrics_->record({MetricEvent::Kind::LLM_RESPONSE, "", s.id, "", "", (long)llm_ms, true, ""});
             return result;
         }
-        catch (...) { return raw; }
+        catch (...) {
+            auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - llm_t0).count();
+            metrics_->record({MetricEvent::Kind::LLM_RESPONSE, "", s.id, "", "", (long)llm_ms, true, ""});
+            return raw;
+        }
     }
 
-    // B2: Per-step system prompt
-    return llm_.complete_as(s.model_tier, prompt, s.system_prompt);
+    double temp = (s.temperature >= 0.0) ? s.temperature : 0.0;
+    auto result = llm_.complete_as(s.model_tier, prompt, s.system_prompt, temp);
+    auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - llm_t0).count();
+    metrics_->record({MetricEvent::Kind::LLM_RESPONSE, "", s.id, "", "", (long)llm_ms, true, ""});
+    return result;
 }
 
 // B3: parse_json 加保护
@@ -883,6 +974,109 @@ std::string WorkflowResult::summary() const {
 }
 
 // ════════════════════════════════════════════════════════════════
+// ResponseCache — LLM 响应缓存
+// ════════════════════════════════════════════════════════════════
+
+static size_t simple_hash(const std::string& s) {
+    // FNV-1a hash — 快速、低碰撞
+    size_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+}
+
+std::string ResponseCache::make_key(const std::string& model, const std::string& system,
+                                      const std::string& prompt, double temperature,
+                                      bool force_json) {
+    std::string canonical = model + "\x00" + system + "\x00" + prompt + "\x00"
+                          + std::to_string(temperature) + "\x00"
+                          + (force_json ? "1" : "0");
+    return std::to_string(simple_hash(canonical));
+}
+
+bool ResponseCache::has(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return cache_.count(key) > 0;
+}
+
+std::string ResponseCache::get(const std::string& key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = cache_.find(key);
+    if (it == cache_.end()) { ++stats_.misses; return ""; }
+    ++stats_.hits;
+    order_.remove(key);
+    order_.push_front(key);
+    return it->second;
+}
+
+void ResponseCache::put(const std::string& key, const std::string& response) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cache_.count(key)) {
+        order_.remove(key);
+    } else if (cache_.size() >= max_size_) {
+        auto lru = order_.back();
+        order_.pop_back();
+        cache_.erase(lru);
+    }
+    cache_[key] = response;
+    order_.push_front(key);
+}
+
+// ════════════════════════════════════════════════════════════════
+// PlanCache
+// ════════════════════════════════════════════════════════════════
+
+std::string PlanCache::normalize_key(const std::string& task,
+                                      const std::vector<ToolDef>& tools) {
+    std::string key;
+    // 工具签名（排序后拼接）
+    std::vector<std::string> tnames;
+    for (const auto& t : tools) tnames.push_back(t.name);
+    std::sort(tnames.begin(), tnames.end());
+    for (const auto& n : tnames) key += n + ",";
+    key += "|";
+    // 任务归一化：小写，去多余空格
+    std::string norm;
+    bool last_space = true;
+    for (char c : task) {
+        if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+        if (c == ' ' || c == '\t' || c == '\n') {
+            if (!last_space) { norm += ' '; last_space = true; }
+        } else { norm += c; last_space = false; }
+    }
+    while (!norm.empty() && norm.back() == ' ') norm.pop_back();
+    key += norm;
+    return key;
+}
+
+bool PlanCache::has(const std::string& key) const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return cache_.count(key) > 0;
+}
+
+WorkflowPlan PlanCache::get(const std::string& key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = cache_.find(key);
+    if (it == cache_.end()) { ++stats_.misses; return {}; }
+    ++stats_.hits;
+    order_.remove(key);
+    order_.push_front(key);
+    return it->second;
+}
+
+void PlanCache::put(const std::string& key, const WorkflowPlan& plan) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (cache_.count(key)) {
+        order_.remove(key);
+    } else if (cache_.size() >= max_size_) {
+        auto lru = order_.back();
+        order_.pop_back();
+        cache_.erase(lru);
+    }
+    cache_[key] = plan;
+    order_.push_front(key);
+}
+
+// ════════════════════════════════════════════════════════════════
 // WorkflowEngine
 // ════════════════════════════════════════════════════════════════
 
@@ -890,7 +1084,7 @@ WorkflowEngine::WorkflowEngine(const EngineConfig& cfg) : config_(cfg) {
     llm_      = std::make_unique<LLMClient>(cfg.orchestrator, cfg.subagent);
     tools_    = std::make_unique<ToolRegistry>();
     planner_  = std::make_unique<WorkflowPlanner>(*llm_);
-    executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, cfg.max_concurrency);
+    executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, cfg.max_concurrency, metrics_);
 }
 
 void WorkflowEngine::register_tool(const ToolDef& def, ToolFn fn) {
@@ -914,6 +1108,8 @@ WorkflowResult WorkflowEngine::run(const std::string& task, WorkflowContext& ctx
 }
 
 WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowContext* ctx) {
+    reset_cancel();
+    llm_->reset_usage();
     WorkflowResult res;
     auto t0 = std::chrono::steady_clock::now();
     // Generate a short workflow ID for correlation
@@ -921,11 +1117,30 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
         std::chrono::system_clock::now().time_since_epoch().count() % 1000000);
     metrics_->record({MetricEvent::Kind::WORKFLOW_START, wf_id, "", "", "", 0, true, task});
     try {
+        // Input guardrails
+        json task_json = {{"task", task}};
+        for (const auto& guard : input_guardrails_) {
+            auto err = guard(task_json);
+            if (err) throw GuardrailError("Input guardrail: " + *err);
+        }
+
         auto tools    = tools_->list_tools();
         WorkflowContext empty_ctx;
         WorkflowContext& use_ctx = ctx ? *ctx : empty_ctx;
-        // A1: 使用单次规划（比 analyze_task+plan_static 少一次 LLM 调用）
-        auto plan = planner_->plan(task, tools, use_ctx);
+        // 计划缓存：命中则跳过 ORCHESTRATOR 规划调用
+        std::string cache_key;
+        WorkflowPlan plan;
+        if (cache_enabled_) {
+            cache_key = PlanCache::normalize_key(task, tools);
+            if (plan_cache_.has(cache_key)) {
+                plan = plan_cache_.get(cache_key);
+            } else {
+                plan = planner_->plan(task, tools, use_ctx);
+                plan_cache_.put(cache_key, plan);
+            }
+        } else {
+            plan = planner_->plan(task, tools, use_ctx);
+        }
 
         // Plan-time tool validation: 提前发现"计划引用了未注册工具"
         for (const auto& step : plan.steps) {
@@ -940,7 +1155,9 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
                     (avail.empty() ? "(none)" : avail) + "]");
             }
         }
-        auto state    = executor_->execute(plan, {{"task", task}});
+        if (has_deadline_ && std::chrono::steady_clock::now() >= deadline_)
+            throw WorkflowCancelledError("Workflow deadline exceeded");
+        auto state    = executor_->execute(plan, {{"task", task}}, cancel_);
 
         auto leaves = plan.leaf_steps();
         if (leaves.size() == 1)
@@ -955,6 +1172,13 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
         res.traces     = state.traces;
         res.step_count = (int)plan.steps.size();
         res.success    = true;
+
+        // Output guardrails
+        for (const auto& guard : output_guardrails_) {
+            auto err = guard(res.output);
+            if (err) throw GuardrailError("Output guardrail: " + *err);
+        }
+
         if (ctx && res.has_output()) ctx->record(task, res.output);
 
         auto orc = llm_->stats(ModelTier::ORCHESTRATOR);
@@ -968,6 +1192,9 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
     }
     res.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
+    res.token_usage = llm_->total_usage();
+    metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "",
+                      res.duration_ms, res.success, res.error_message});
     return res;
 }
 
@@ -1018,22 +1245,24 @@ static size_t sse_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata)
     return size * nmemb;
 }
 
-static void do_stream_post(CURL* curl,
-                             const std::string& url,
+static void do_stream_post(const std::string& url,
                              const std::vector<std::string>& hdrs,
                              const std::string& body,
                              SseParser& parser,
                              double timeout_sec) {
+    CurlHandle curl;  // 每次流式请求独立 handle
+    CURL* c = curl.get();
     struct curl_slist* h = nullptr;
     for (const auto& s : hdrs) h = curl_slist_append(h, s.c_str());
-    curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER,    h);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS,    body.c_str());
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, sse_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA,     &parser);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT,       (long)timeout_sec);
-    CURLcode rc = curl_easy_perform(curl);
+    curl_easy_setopt(c, CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER,    h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS,    body.c_str());
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sse_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &parser);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,       (long)timeout_sec);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
+    CURLcode rc = curl_easy_perform(c);
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
         throw std::runtime_error(std::string("curl stream: ") + curl_easy_strerror(rc));
@@ -1049,7 +1278,7 @@ void AnthropicProvider::complete_stream(const std::string& prompt,
     if (!sys.empty()) body["system"] = sys;
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
     SseParser parser{on_chunk, "", "anthropic"};
-    do_stream_post(curl_.get(), base + "/v1/messages",
+    do_stream_post(base + "/v1/messages",
         {"Content-Type: application/json",
          "x-api-key: " + cfg_.api_key,
          "anthropic-version: 2023-06-01"},
@@ -1068,7 +1297,7 @@ void OpenAIChatProvider::complete_stream(const std::string& prompt,
     std::string base = cfg_.base_url.empty() ? "https://api.openai.com" : rtrim_slash(cfg_.base_url);
     std::string path = cfg_.completions_path.empty() ? "/v1/chat/completions" : cfg_.completions_path;
     SseParser parser{on_chunk, "", "openai"};
-    do_stream_post(curl_.get(), base + path,
+    do_stream_post(base + path,
         {"Content-Type: application/json",
          "Authorization: Bearer " + cfg_.api_key},
         body.dump(), parser, cfg_.timeout_sec);
@@ -1279,7 +1508,7 @@ WorkflowResult WorkflowEngine::run_with_recovery(const std::string& task,
         config_.subagent     = plan.config.subagent;
         llm_      = std::make_unique<LLMClient>(config_.orchestrator, config_.subagent);
         planner_  = std::make_unique<WorkflowPlanner>(*llm_);
-        executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, config_.max_concurrency);
+        executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, config_.max_concurrency, metrics_);
         result = run(task);
         if (result.success) {
             std::cout << "[RECOVERY] Success on attempt " << (attempt+1) << "\n";
@@ -1291,12 +1520,38 @@ WorkflowResult WorkflowEngine::run_with_recovery(const std::string& task,
 
 WorkflowResult WorkflowEngine::run_stream(const std::string& task,
                                            StreamCallback on_chunk) {
+    reset_cancel();
+    llm_->reset_usage();
     WorkflowResult res;
     auto t0 = std::chrono::steady_clock::now();
+    auto wf_id = "wfs_" + std::to_string(
+        std::chrono::system_clock::now().time_since_epoch().count() % 1000000);
+    metrics_->record({MetricEvent::Kind::WORKFLOW_START, wf_id, "", "", "", 0, true, task});
     try {
+        // Input guardrails
+        json task_json = {{"task", task}};
+        for (const auto& guard : input_guardrails_) {
+            auto err = guard(task_json);
+            if (err) throw GuardrailError("Input guardrail: " + *err);
+        }
+
         auto tools = tools_->list_tools();
-        WorkflowContext ctx;
-        auto plan = planner_->plan(task, tools, ctx);  // A1: 单次规划
+        // Plan caching
+        std::string cache_key;
+        WorkflowPlan plan;
+        if (cache_enabled_) {
+            cache_key = PlanCache::normalize_key(task, tools);
+            if (plan_cache_.has(cache_key)) {
+                plan = plan_cache_.get(cache_key);
+            } else {
+                WorkflowContext ctx;
+                plan = planner_->plan(task, tools, ctx);
+                plan_cache_.put(cache_key, plan);
+            }
+        } else {
+            WorkflowContext ctx;
+            plan = planner_->plan(task, tools, ctx);
+        }
 
         auto leaves = plan.leaf_steps();
         std::set<std::string> leaf_ids;
@@ -1304,20 +1559,25 @@ WorkflowResult WorkflowEngine::run_stream(const std::string& task,
 
         WorkflowState state;
         state.task_input = {{"task", task}};
+        bool streamed_final = false;
 
         for (const auto& batch : plan.topological_batches()) {
-            // Check if this is the final single-LLM batch
+            if (cancel_->load()) throw WorkflowCancelledError("Stream workflow cancelled");
+            if (has_deadline_ && std::chrono::steady_clock::now() >= deadline_)
+                throw WorkflowCancelledError("Stream workflow deadline exceeded");
             bool is_final = (batch.size() == 1)
                          && leaf_ids.count(batch[0].id)
                          && (batch[0].type == StepType::LLM);
 
             if (is_final) {
+                streamed_final = true;
                 const auto& step   = batch[0];
                 auto        inputs = state.resolve_inputs(step.inputs);
                 std::string prompt = step.action;
                 if (!inputs.empty()) prompt += "\n\nContext:\n" + inputs.dump(2);
                 std::string acc;
-                llm_->complete_as_stream(step.model_tier, prompt, "", 0.0,
+                double temp = (step.temperature >= 0.0) ? step.temperature : 0.0;
+                llm_->complete_as_stream(step.model_tier, prompt, step.system_prompt, temp,
                     [&](const std::string& chunk){ acc += chunk; on_chunk(chunk); });
                 state.step_outputs[step.id] = acc;
             } else {
@@ -1336,10 +1596,23 @@ WorkflowResult WorkflowEngine::run_stream(const std::string& task,
                 for (auto& [step, fut] : futs) {
                     auto [ok, rj, tr] = fut.get();
                     for (auto& te : tr) state.record_trace(std::move(te));
-                    if (ok) state.step_outputs[step.id] = rj;
-                    else if (step.on_error == OnError::FAIL)
-                        throw StepExecutionError(step.id, step.description,
-                                              rj.value("error",""));
+                    if (ok) {
+                        state.step_outputs[step.id] = rj;
+                    } else {
+                        switch (step.on_error) {
+                        case OnError::FAIL:
+                            throw StepExecutionError(step.id, step.description,
+                                                  rj.value("error",""));
+                        case OnError::SKIP:
+                            state.errors[step.id]      = rj.value("error","");
+                            state.step_outputs[step.id] = nullptr;
+                            break;
+                        case OnError::FALLBACK:
+                            state.errors[step.id]      = rj.value("error","");
+                            state.step_outputs[step.id] = step.fallback;
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1355,8 +1628,12 @@ WorkflowResult WorkflowEngine::run_stream(const std::string& task,
         }
         res.traces = state.traces; res.step_count = (int)plan.steps.size();
         res.success = true;
-        // L5: always call on_chunk even if final step is non-LLM
-        if (res.has_output() && !res.output.is_null()) {
+        // Output guardrails
+        for (const auto& guard : output_guardrails_) {
+            auto err = guard(res.output);
+            if (err) throw GuardrailError("Output guardrail: " + *err);
+        }
+        if (!streamed_final && res.has_output() && !res.output.is_null()) {
             std::string _out = res.output.is_string()
                 ? res.output.get<std::string>() : res.output.dump(2);
             std::istringstream _iss(_out); std::string _w;
@@ -1367,6 +1644,9 @@ WorkflowResult WorkflowEngine::run_stream(const std::string& task,
     }
     res.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
+    res.token_usage = llm_->total_usage();
+    metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "",
+                      res.duration_ms, res.success, res.error_message});
     return res;
 }
 
@@ -1395,6 +1675,8 @@ Rules:
 - Use loop_back if your current approach is clearly not working
 - Never fabricate tool results — always call the tool to get real data
 - Be concise in thought; be complete in final_answer
+- IMPORTANT: When only 1-2 iterations remain, you MUST provide a final_answer using whatever information you have gathered so far. Do NOT waste the last iterations on more tool calls.
+- If repeated tool calls return similar unhelpful results, stop and give a final_answer with what you know.
 )SYS";
 
 static AgentAction parse_agent_action(const std::string& raw) {
@@ -1411,6 +1693,10 @@ static AgentAction parse_agent_action(const std::string& raw) {
         } else if (type == "loop_back") {
             action.type   = AgentAction::Type::LOOP_BACK;
             action.reason = a.value("reason", "");
+        } else if (type == "handoff") {
+            action.type         = AgentAction::Type::HANDOFF;
+            action.target_agent = a.value("target_agent", a.value("target", ""));
+            action.reason       = a.value("reason", "");
         } else {
             action.type     = AgentAction::Type::FINAL_ANSWER;
             action.response = a.value("response", raw);
@@ -1424,15 +1710,62 @@ static AgentAction parse_agent_action(const std::string& raw) {
     return action;
 }
 
+struct LoopDetector {
+    struct Fingerprint {
+        std::string tool_name;
+        size_t      args_hash = 0;
+        size_t      output_hash = 0;
+        bool operator==(const Fingerprint& o) const {
+            return tool_name == o.tool_name && args_hash == o.args_hash;
+        }
+    };
+    std::deque<Fingerprint> window;
+    static constexpr size_t MAX_WINDOW = 10;
+
+    void record(const std::string& tool, const json& args, const json& obs) {
+        Fingerprint fp{tool, std::hash<std::string>{}(args.dump()),
+                       std::hash<std::string>{}(obs.dump())};
+        window.push_back(fp);
+        if (window.size() > MAX_WINDOW) window.pop_front();
+    }
+
+    bool exact_repeat(int n = 3) const {
+        if ((int)window.size() < n) return false;
+        for (int i = 1; i < n; ++i)
+            if (!(window[window.size()-1-i] == window.back())) return false;
+        return true;
+    }
+
+    bool outputs_converged(int n = 3) const {
+        if ((int)window.size() < n) return false;
+        size_t h = window[window.size()-n].output_hash;
+        for (int i = (int)window.size()-n+1; i < (int)window.size(); ++i)
+            if (window[i].output_hash != h) return false;
+        return true;
+    }
+
+    bool is_stuck() const {
+        return exact_repeat(3) || (exact_repeat(2) && outputs_converged(2));
+    }
+};
+
 static std::string build_agent_prompt(const std::string& task,
                                        const std::vector<ToolDef>& tools,
-                                       const std::string& history) {
+                                       const std::string& history,
+                                       int iteration,
+                                       int max_iterations) {
     json tool_list = json::array();
     for (const auto& t : tools)
         tool_list.push_back({{"name",t.name},{"description",t.description},{"inputs",t.input_schema}});
 
     std::string prompt = "Available tools:\n" + tool_list.dump(2) + "\n\n";
     prompt += "Task: " + task + "\n";
+    int remaining = max_iterations - iteration;
+    prompt += "[Iteration " + std::to_string(iteration + 1) + "/" + std::to_string(max_iterations)
+            + ", " + std::to_string(remaining) + " remaining]\n";
+    if (remaining <= 2)
+        prompt += "WARNING: Running low on iterations. Provide a final_answer NOW with whatever information you have.\n";
+    // Convergence injection handled by caller via history prefix
     if (!history.empty())
         prompt += "\nWork done so far:\n" + history;
     prompt += "\nRespond with your next action as a JSON object.";
@@ -1441,14 +1774,25 @@ static std::string build_agent_prompt(const std::string& task,
 
 AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iterations,
                                            std::function<void(const AgentStep&)> on_step) {
+    llm_->reset_usage();
+    reset_cancel();
     AgentResult result;
     result.max_iterations = max_iterations;
     auto t0 = std::chrono::steady_clock::now();
 
     auto tools = tools_->list_tools();
     std::string history;
+    LoopDetector loop_detector;
 
     for (int iter = 0; iter < max_iterations; ++iter) {
+        if (cancel_->load()) {
+            result.error = "Agent cancelled";
+            break;
+        }
+        if (has_deadline_ && std::chrono::steady_clock::now() >= deadline_) {
+            result.error = "Agent deadline exceeded";
+            break;
+        }
         auto step_t0 = std::chrono::steady_clock::now();
         AgentStep step;
         step.iteration = iter + 1;
@@ -1458,7 +1802,7 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
         try {
             const char* sys_to_use = custom_agent_prompt_.empty() ? AGENT_SYS : custom_agent_prompt_.c_str();
             raw = llm_->complete_as(ModelTier::ORCHESTRATOR,
-                                    build_agent_prompt(task, tools, history),
+                                    build_agent_prompt(task, tools, history, iter, max_iterations),
                                     sys_to_use, 0.0);
         } catch (const std::exception& e) {
             result.error = std::string("LLM error on iteration ") +
@@ -1506,6 +1850,14 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
                 if (cut != std::string::npos) history = history.substr(cut);
             }
 
+            // 收敛检测：记录指纹，检测循环
+            loop_detector.record(action.tool_name, action.tool_args, obs);
+            if (loop_detector.is_stuck()) {
+                history += "\n*** LOOP DETECTED: You have called " + action.tool_name
+                         + " repeatedly with similar arguments and results. "
+                           "You MUST provide a final_answer NOW using the information already gathered. ***\n\n";
+            }
+
         } else if (action.type == AgentAction::Type::LOOP_BACK) {
             history += "[iter " + std::to_string(iter+1) + " — reconsidering]\n"
                     +  "Thought: " + action.thought + "\n"
@@ -1527,11 +1879,384 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
 
     result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
+    result.token_usage = llm_->total_usage();
     return result;
+}
+
+static std::string build_multiagent_prompt(const std::string& task,
+                                            const AgentDef& agent,
+                                            const std::vector<ToolDef>& tools,
+                                            const std::string& history,
+                                            int iteration, int max_iterations) {
+    json tool_list = json::array();
+    for (const auto& t : tools)
+        tool_list.push_back({{"name",t.name},{"description",t.description},{"inputs",t.input_schema}});
+
+    std::string prompt = "You are agent '" + agent.name + "'.\n";
+    if (!agent.handoff_targets.empty()) {
+        prompt += "You can hand off to these agents: ";
+        for (const auto& t : agent.handoff_targets) prompt += t + " ";
+        prompt += "\nTo hand off, respond with action type 'handoff' and a 'target_agent' field.\n";
+    }
+    prompt += "Available tools:\n" + tool_list.dump(2) + "\n\n";
+    prompt += "Task: " + task + "\n";
+    int remaining = max_iterations - iteration;
+    prompt += "[Iteration " + std::to_string(iteration + 1) + "/" + std::to_string(max_iterations)
+            + ", " + std::to_string(remaining) + " remaining]\n";
+    if (remaining <= 2)
+        prompt += "WARNING: Running low on iterations. Provide a final_answer NOW.\n";
+    if (!history.empty()) prompt += "\nWork done so far:\n" + history;
+    prompt += "\nRespond with your next action as a JSON object.";
+    return prompt;
+}
+
+AgentResult WorkflowEngine::run_multi_agent(const std::string& task,
+                                             const std::vector<AgentDef>& agents,
+                                             const std::string& start_agent,
+                                             int max_iterations,
+                                             std::function<void(const AgentStep&)> on_step) {
+    llm_->reset_usage();
+    reset_cancel();
+    AgentResult result;
+    result.max_iterations = max_iterations;
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Input guardrails
+    json task_json = {{"task", task}};
+    for (const auto& guard : input_guardrails_) {
+        auto err = guard(task_json);
+        if (err) { result.error = "Input guardrail: " + *err; return result; }
+    }
+
+    std::map<std::string, AgentDef> agent_map;
+    for (const auto& a : agents) agent_map[a.name] = a;
+    if (!agent_map.count(start_agent)) {
+        result.error = "Start agent '" + start_agent + "' not found";
+        return result;
+    }
+
+    std::string current = start_agent;
+    std::string history;
+    auto all_tools = tools_->list_tools();
+
+    for (int iter = 0; iter < max_iterations; ++iter) {
+        if (cancel_->load()) { result.error = "Multi-agent cancelled"; break; }
+        const AgentDef& agent = agent_map[current];
+
+        // 过滤当前 agent 允许的工具
+        std::vector<ToolDef> agent_tools;
+        if (agent.allowed_tools.empty()) {
+            agent_tools = all_tools;
+        } else {
+            for (const auto& t : all_tools)
+                if (std::find(agent.allowed_tools.begin(), agent.allowed_tools.end(), t.name)
+                    != agent.allowed_tools.end())
+                    agent_tools.push_back(t);
+        }
+
+        auto step_t0 = std::chrono::steady_clock::now();
+        AgentStep step;
+        step.iteration = iter + 1;
+
+        std::string raw;
+        try {
+            std::string sys = agent.system_prompt.empty() ? AGENT_SYS : agent.system_prompt;
+            raw = llm_->complete_as(agent.model_tier,
+                build_multiagent_prompt(task, agent, agent_tools, history, iter, max_iterations),
+                sys, 0.0);
+        } catch (const std::exception& e) {
+            result.error = std::string("LLM error: ") + e.what();
+            break;
+        }
+
+        AgentAction action = parse_agent_action(raw);
+        step.thought = action.thought;
+        step.action  = action;
+
+        if (action.type == AgentAction::Type::FINAL_ANSWER) {
+            step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - step_t0).count();
+            result.steps.push_back(step);
+            result.success = true;
+            result.final_answer = action.response;
+            result.iterations_used = iter + 1;
+            // Output guardrails
+            for (const auto& guard : output_guardrails_) {
+                auto err = guard(json(action.response));
+                if (err) { result.success = false; result.error = "Output guardrail: " + *err; }
+            }
+            if (on_step) on_step(step);
+            break;
+        }
+
+        if (action.type == AgentAction::Type::HANDOFF) {
+            std::string target = action.target_agent;
+            if (agent_map.count(target)) {
+                history += "[iter " + std::to_string(iter+1) + " — handoff]\n"
+                        +  current + " → " + target + ": " + action.reason + "\n\n";
+                current = target;
+            } else {
+                history += "[iter " + std::to_string(iter+1) + "]\nInvalid handoff target '"
+                        + target + "'. Continue with current agent.\n\n";
+            }
+        } else if (action.type == AgentAction::Type::TOOL_CALL) {
+            json obs;
+            try {
+                obs = tools_->call(action.tool_name, action.tool_args);
+            } catch (const std::exception& e) {
+                obs = {{"error", std::string("tool failed: ") + e.what()}};
+            }
+            step.observation = obs;
+            std::string obs_str = obs.dump();
+            if (obs_str.size() > 800) obs_str = obs_str.substr(0, 800) + "...[truncated]";
+            history += "[iter " + std::to_string(iter+1) + " | " + current + "]\n"
+                    +  "Thought: " + action.thought + "\n"
+                    +  "Called: " + action.tool_name + "(" + action.tool_args.dump() + ")\n"
+                    +  "Result: " + obs_str + "\n\n";
+            if (history.size() > 4000) {
+                auto cut = history.find("\n[iter ", history.size() / 3);
+                if (cut != std::string::npos) history = history.substr(cut);
+            }
+        }
+
+        step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - step_t0).count();
+        result.steps.push_back(step);
+        if (on_step) on_step(step);
+    }
+
+    if (!result.success && result.error.empty()) {
+        result.error = "Max iterations reached without final answer";
+        result.iterations_used = max_iterations;
+    }
+    result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    result.token_usage = llm_->total_usage();
+    return result;
+}
+
+// ════════════════════════════════════════════════════════════════
+// MCP Client — stdio transport + JSON-RPC 2.0
+// ════════════════════════════════════════════════════════════════
+
+#ifdef _WIN32
+#include <windows.h>
+
+StdioTransport::StdioTransport(const std::string& command, const std::vector<std::string>& args) {
+    std::string cmdline = command;
+    for (const auto& a : args) cmdline += " " + a;
+
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE child_stdin_rd, child_stdin_wr, child_stdout_rd, child_stdout_wr;
+    CreatePipe(&child_stdin_rd, &child_stdin_wr, &sa, 0);
+    SetHandleInformation(child_stdin_wr, HANDLE_FLAG_INHERIT, 0);
+    CreatePipe(&child_stdout_rd, &child_stdout_wr, &sa, 0);
+    SetHandleInformation(child_stdout_rd, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput  = child_stdin_rd;
+    si.hStdOutput = child_stdout_wr;
+    si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessA(nullptr, const_cast<char*>(cmdline.c_str()),
+                        nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+        throw std::runtime_error("MCP: failed to spawn: " + command);
+    CloseHandle(child_stdin_rd);
+    CloseHandle(child_stdout_wr);
+    CloseHandle(pi.hThread);
+    process_handle_ = pi.hProcess;
+    stdin_write_    = child_stdin_wr;
+    stdout_read_    = child_stdout_rd;
+    closed_ = false;
+}
+
+StdioTransport::~StdioTransport() { close(); }
+
+void StdioTransport::send(const json& message) {
+    if (closed_) throw std::runtime_error("MCP: transport closed");
+    std::string line = message.dump() + "\n";
+    DWORD written;
+    WriteFile(stdin_write_, line.c_str(), (DWORD)line.size(), &written, nullptr);
+}
+
+json StdioTransport::receive() {
+    if (closed_) throw std::runtime_error("MCP: transport closed");
+    std::string line;
+    char ch;
+    DWORD rd;
+    while (ReadFile(stdout_read_, &ch, 1, &rd, nullptr) && rd > 0) {
+        if (ch == '\n') break;
+        if (ch != '\r') line += ch;
+    }
+    if (line.empty()) throw std::runtime_error("MCP: empty response");
+    return json::parse(line);
+}
+
+void StdioTransport::close() {
+    if (closed_) return;
+    closed_ = true;
+    if (stdin_write_) { CloseHandle(stdin_write_); stdin_write_ = nullptr; }
+    if (stdout_read_) { CloseHandle(stdout_read_); stdout_read_ = nullptr; }
+    if (process_handle_) {
+        WaitForSingleObject(process_handle_, 5000);
+        TerminateProcess(process_handle_, 0);
+        CloseHandle(process_handle_);
+        process_handle_ = nullptr;
+    }
+}
+
+#else // POSIX
+
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+
+StdioTransport::StdioTransport(const std::string& command, const std::vector<std::string>& args) {
+    int stdin_pipe[2], stdout_pipe[2];
+    if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0)
+        throw std::runtime_error("MCP: pipe failed");
+    pid_t pid = fork();
+    if (pid < 0) throw std::runtime_error("MCP: fork failed");
+    if (pid == 0) {
+        ::close(stdin_pipe[1]); dup2(stdin_pipe[0], STDIN_FILENO); ::close(stdin_pipe[0]);
+        ::close(stdout_pipe[0]); dup2(stdout_pipe[1], STDOUT_FILENO); ::close(stdout_pipe[1]);
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(command.c_str()));
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp(command.c_str(), argv.data());
+        _exit(127);
+    }
+    ::close(stdin_pipe[0]); ::close(stdout_pipe[1]);
+    stdin_fd_  = stdin_pipe[1];
+    stdout_fd_ = stdout_pipe[0];
+    child_pid_ = pid;
+    closed_ = false;
+}
+
+StdioTransport::~StdioTransport() { close(); }
+
+void StdioTransport::send(const json& message) {
+    if (closed_) throw std::runtime_error("MCP: transport closed");
+    std::string line = message.dump() + "\n";
+    ::write(stdin_fd_, line.c_str(), line.size());
+}
+
+json StdioTransport::receive() {
+    if (closed_) throw std::runtime_error("MCP: transport closed");
+    std::string line;
+    char ch;
+    while (::read(stdout_fd_, &ch, 1) == 1) {
+        if (ch == '\n') break;
+        if (ch != '\r') line += ch;
+    }
+    if (line.empty()) throw std::runtime_error("MCP: empty response");
+    return json::parse(line);
+}
+
+void StdioTransport::close() {
+    if (closed_) return;
+    closed_ = true;
+    if (stdin_fd_ >= 0) { ::close(stdin_fd_); stdin_fd_ = -1; }
+    if (stdout_fd_ >= 0) { ::close(stdout_fd_); stdout_fd_ = -1; }
+    if (child_pid_ > 0) {
+        kill(child_pid_, SIGTERM);
+        int status; waitpid(child_pid_, &status, WNOHANG);
+        child_pid_ = -1;
+    }
+}
+
+#endif // _WIN32 / POSIX
+
+// ── McpClient ────────────────────────────────────────────────
+
+McpClient::McpClient(std::unique_ptr<IMcpTransport> transport)
+    : transport_(std::move(transport)) {}
+
+McpClient::~McpClient() { close(); }
+
+json McpClient::make_request(const std::string& method, const json& params) {
+    json req = {{"jsonrpc","2.0"},{"id",next_id_++},{"method",method}};
+    if (!params.empty()) req["params"] = params;
+    transport_->send(req);
+    auto resp = transport_->receive();
+    if (resp.contains("error"))
+        throw std::runtime_error("MCP error: " + resp["error"].value("message", "unknown"));
+    return resp.value("result", json::object());
+}
+
+json McpClient::initialize(const std::string& client_name, const std::string& version) {
+    auto result = make_request("initialize", {
+        {"protocolVersion", "2025-06-18"},
+        {"capabilities", json::object()},
+        {"clientInfo", {{"name", client_name}, {"version", version}}}
+    });
+    // Send required initialized notification
+    transport_->send({{"jsonrpc","2.0"},{"method","notifications/initialized"}});
+    initialized_ = true;
+    return result;
+}
+
+std::vector<ToolDef> McpClient::list_tools() {
+    if (!initialized_) throw std::runtime_error("MCP: not initialized");
+    auto result = make_request("tools/list");
+    discovered_tools_.clear();
+    if (result.contains("tools")) {
+        for (const auto& t : result["tools"]) {
+            ToolDef def;
+            def.name        = t.value("name", "");
+            def.description = t.value("description", "");
+            def.input_schema  = t.value("inputSchema", json::object());
+            def.output_schema = t.value("outputSchema", json::object());
+            discovered_tools_.push_back(def);
+        }
+    }
+    return discovered_tools_;
+}
+
+json McpClient::call_tool(const std::string& name, const json& arguments) {
+    if (!initialized_) throw std::runtime_error("MCP: not initialized");
+    auto result = make_request("tools/call", {{"name", name}, {"arguments", arguments}});
+    if (result.value("isError", false)) {
+        std::string err;
+        if (result.contains("content") && !result["content"].empty())
+            err = result["content"][0].value("text", "tool error");
+        throw ToolError(name, err);
+    }
+    if (result.contains("structuredContent")) return result["structuredContent"];
+    if (result.contains("content") && !result["content"].empty())
+        return result["content"][0].value("text", "");
+    return result;
+}
+
+void McpClient::close() {
+    if (transport_) {
+        try { transport_->close(); } catch (...) {}
+    }
+    initialized_ = false;
+}
+
+void McpClient::register_all_tools(ToolRegistry& registry) {
+    if (discovered_tools_.empty()) list_tools();
+    for (const auto& def : discovered_tools_) {
+        auto name = def.name;
+        auto* client = this;
+        registry.register_tool(def, [client, name](const json& params) -> json {
+            return client->call_tool(name, params);
+        });
+    }
+}
+
+void WorkflowEngine::add_input_guardrail(GuardrailFn fn) { input_guardrails_.push_back(std::move(fn)); }
+void WorkflowEngine::add_output_guardrail(GuardrailFn fn) { output_guardrails_.push_back(std::move(fn)); }
+void WorkflowEngine::add_tool_guardrail(const std::string& tool_name, GuardrailFn fn) {
+    tools_->add_guardrail(tool_name, std::move(fn));
 }
 
 void WorkflowEngine::set_planner_prompt(const std::string& sys_prompt) {
     custom_planner_prompt_ = sys_prompt;
+    planner_->set_system_prompt(sys_prompt);
 }
 void WorkflowEngine::set_agent_prompt(const std::string& sys_prompt) {
     custom_agent_prompt_ = sys_prompt;
@@ -1540,5 +2265,15 @@ void WorkflowEngine::set_agent_prompt(const std::string& sys_prompt) {
 void WorkflowEngine::set_metrics(std::shared_ptr<IMetricsCollector> collector) {
     if (collector) metrics_ = std::move(collector);
     else           metrics_ = std::make_shared<NoOpMetrics>();
+    executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, config_.max_concurrency, metrics_);
 }
+
+void WorkflowEngine::cancel() { cancel_->store(true); }
+void WorkflowEngine::reset_cancel() { cancel_->store(false); }
+void WorkflowEngine::set_deadline(std::chrono::seconds timeout) {
+    has_deadline_ = true;
+    deadline_ = std::chrono::steady_clock::now() + timeout;
+}
+void WorkflowEngine::clear_deadline() { has_deadline_ = false; }
+
 } // namespace ariadne

@@ -11,7 +11,7 @@ option(ARIADNE_BUILD_EXAMPLES "Build examples"    ON)
 
 # Compiler warnings — MSVC uses different flags than GCC/Clang
 if(MSVC)
-    add_compile_options(/W3 /wd4068 /wd4702)  # W3 moderate, silence pragma/unreachable warnings
+    add_compile_options(/W3 /wd4068 /wd4702 /utf-8)  # W3 moderate, silence pragma/unreachable warnings, UTF-8 source
 else()
     add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 endif()
@@ -38,6 +38,35 @@ if(ARIADNE_BUILD_TESTS)
 
     add_executable(eval_runner tests/eval_runner.cpp)
     target_link_libraries(eval_runner PRIVATE ariadne)
+endif()
+
+# ── Ariadne Studio (visual workflow editor) ──────────────────────
+option(ARIADNE_BUILD_STUDIO "Build Ariadne Studio" ON)
+if(ARIADNE_BUILD_STUDIO)
+    # Embed index.html into a C++ header at build time
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/studio_embedded.h
+        COMMAND ${CMAKE_COMMAND}
+            -DINPUT=${CMAKE_CURRENT_SOURCE_DIR}/studio/index.html
+            -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/studio_embedded.h
+            -DVAR=studio_html
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_resource.cmake
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/studio/index.html
+                ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_resource.cmake
+        COMMENT "Embedding studio/index.html into binary"
+    )
+    add_custom_target(embed_studio DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/studio_embedded.h)
+
+    add_executable(ariadne-studio studio/studio.cpp)
+    add_dependencies(ariadne-studio embed_studio)
+    target_include_directories(ariadne-studio PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps
+        ${CMAKE_CURRENT_SOURCE_DIR}/studio
+        ${CMAKE_CURRENT_BINARY_DIR})
+    target_link_libraries(ariadne-studio PRIVATE ariadne)
+    if(WIN32)
+        target_link_libraries(ariadne-studio PRIVATE ws2_32)
+    endif()
 endif()
 
 # ── Install (for vcpkg / system install) ─────────────────────────

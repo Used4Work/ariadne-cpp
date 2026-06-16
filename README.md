@@ -11,7 +11,7 @@
 
 </div>
 
-C++ LLM workflow orchestration. DAG planning, ReACT agent loops, auto-probe providers, circuit breakers, streaming.
+C++ LLM workflow orchestration. DAG planning, ReACT agent loops, auto-probe providers, circuit breakers, streaming, plan caching, guardrails, multi-agent handoffs.
 
 ## Why C++ over LangChain?
 
@@ -21,8 +21,28 @@ C++ LLM workflow orchestration. DAG planning, ReACT agent loops, auto-probe prov
 | Cold start | **~12 ms** | **~1 800 ms** |
 | DAG parallelism | ✓ automatic | requires LCEL |
 | Agent loops | ✓ | ✓ LangGraph |
-| Structured output | ✓ json_mode | ✓ |
+| Structured output | ✓ strict json_schema | ✓ |
+| Plan caching | ✓ LRU template cache | partial |
+| Token tracking | ✓ per-run | ✓ |
+| Guardrails | ✓ input/output/tool | ✓ |
+| Multi-agent handoffs | ✓ | ✓ LangGraph |
 | Exception types | ✓ hierarchy | ✓ |
+
+## Features
+
+- **DAG workflows** — single-call planning, automatic topological parallelization
+- **ReACT agents** — iterative reasoning with convergence detection (auto-stops stuck loops)
+- **Multi-agent handoffs** — agents transfer control while sharing history
+- **Plan caching** — normalized-key LRU cache skips redundant planning (−50% cost per research)
+- **Strict structured output** — provider-level JSON schema enforcement (OpenAI json_schema)
+- **Guardrails** — input/output/tool validation hooks that abort on violation
+- **Token usage tracking** — per-run input/output/total exposed in results
+- **Cancellation & timeout** — `cancel()` and `set_deadline()` for runaway protection
+- **Circuit breakers + rate limiting** — per-provider fault tolerance with 429 handling
+- **Streaming** — SSE token delivery
+- **LLM response caching** — exact-match FNV-1a hash, LRU eviction, temperature-aware
+- **MCP client** — Model Context Protocol stdio transport, auto-discover and call remote tools
+- **Metrics** — pluggable `IMetricsCollector`, 7 event kinds emitted
 
 
 ## Windows
@@ -117,7 +137,7 @@ catch (const AriadneError& e)              { /* any framework error */ }
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | build + 37 unit tests |
+| `ci.yml` | every push | build + 85 unit tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `model-check.yml` | weekly | update models.json |
 

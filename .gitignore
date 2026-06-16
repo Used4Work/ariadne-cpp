@@ -4,3 +4,8 @@ build/
 .DS_Store
 include/nlohmann/
 benchmark/
+.env
+*.local
+deps/
+build.bat
+CLAUDE.md

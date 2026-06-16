@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ariadne Studio</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jerosoler/Drawflow@0.0.60/dist/drawflow.min.css">
+<style>
+:root{--bg0:#111;--bg1:#1e1e1e;--bg2:#252526;--bg3:#2d2d30;--border:#3e3e42;--text:#ccc;--bright:#e0e0e0;--accent:#007acc;--accent2:#1a8ad4;--ok:#4ec9b0;--err:#f44747;--warn:#dcdcaa;--purple:#c586c0}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg1);color:var(--text);height:100vh;overflow:hidden}
+.app{display:grid;grid-template-columns:200px 1fr 260px;grid-template-rows:42px 1fr 160px;grid-template-areas:"tb tb tb" "pl cv pr" "pl lg lg";height:100vh}
+.toolbar{grid-area:tb;background:var(--bg3);display:flex;align-items:center;padding:0 12px;border-bottom:1px solid var(--border);gap:6px}
+.toolbar .logo{font-size:14px;font-weight:700;color:var(--accent);margin-right:12px;letter-spacing:1px}
+.toolbar .sep{width:1px;height:20px;background:var(--border);margin:0 6px}
+.btn{background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:4px 12px;border-radius:3px;cursor:pointer;font-size:12px;transition:all .15s}
+.btn:hover{border-color:var(--accent);color:var(--bright)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent2)}
+.btn.danger{border-color:var(--err);color:var(--err)}
+.btn.danger:hover{background:var(--err);color:#fff}
+.palette{grid-area:pl;background:var(--bg2);border-right:1px solid var(--border);overflow-y:auto;padding:10px}
+.palette h3{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1.5px;margin:12px 0 6px}
+.palette-item{padding:7px 10px;margin:2px 0;background:var(--bg3);border:1px solid var(--border);border-radius:4px;cursor:grab;font-size:12px;transition:border-color .15s;display:flex;align-items:center;gap:6px}
+.palette-item:hover{border-color:var(--accent)}
+.palette-item .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.canvas{grid-area:cv;background:var(--bg0);position:relative}
+#drawflow{width:100%;height:100%}
+.props{grid-area:pr;background:var(--bg2);border-left:1px solid var(--border);overflow-y:auto;padding:12px}
+.props h3{font-size:11px;color:var(--accent);margin-bottom:8px;text-transform:uppercase;letter-spacing:1px}
+.props label{display:block;font-size:11px;margin:8px 0 3px;color:#999}
+.props input,.props select,.props textarea{width:100%;padding:5px 8px;background:var(--bg3);border:1px solid var(--border);color:var(--bright);border-radius:3px;font-size:12px;font-family:inherit}
+.props textarea{min-height:50px;resize:vertical}
+.log{grid-area:lg;background:#0d0d0d;border-top:1px solid var(--border);overflow-y:auto;padding:8px;font-family:'Cascadia Code','Consolas',monospace;font-size:11px}
+.log-entry{padding:1px 0;white-space:pre-wrap}
+.log-entry.info{color:var(--text)}.log-entry.ok{color:var(--ok)}.log-entry.err{color:var(--err)}.log-entry.warn{color:var(--warn)}.log-entry.step{color:var(--purple)}
+.drawflow{background:var(--bg0)!important}
+.drawflow .connection .main-path{stroke:var(--accent);stroke-width:2}
+.drawflow .drawflow-node{background:var(--bg2);border:1px solid var(--border);color:var(--text);border-radius:8px;min-width:160px;font-size:12px}
+.drawflow .drawflow-node.selected{border-color:var(--accent);box-shadow:0 0 8px rgba(0,122,204,.3)}
+.drawflow .drawflow-node .input,.drawflow .drawflow-node .output{width:12px;height:12px;background:var(--accent);border:2px solid var(--bg2);border-radius:50%}
+.drawflow .drawflow-node .output{background:var(--ok)}
+.node-header{padding:6px 10px;font-weight:600;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:6px}
+.node-header .ndot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.node-body{padding:8px 10px}
+.node-body input,.node-body select,.node-body textarea{width:100%;padding:3px 6px;margin:2px 0;background:var(--bg3);border:1px solid var(--border);color:var(--bright);border-radius:3px;font-size:11px}
+.node-body textarea{min-height:36px;resize:vertical}
+.node-body .fl{font-size:10px;color:#888;margin-top:4px}
+.llm-node .node-header{background:#1a3a5c}.llm-node .ndot{background:#4fc3f7}
+.tool-node .node-header{background:#2d4a2d}.tool-node .ndot{background:#81c784}
+.transform-node .node-header{background:#4a3a1a}.transform-node .ndot{background:#ffb74d}
+.condition-node .node-header{background:#3a1a4a}.condition-node .ndot{background:#ce93d8}
+.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.active{display:flex}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:20px;min-width:400px;max-width:600px;max-height:80vh;overflow-y:auto}
+.modal h2{font-size:14px;margin-bottom:12px;color:var(--bright)}
+.tcard{padding:10px;margin:6px 0;background:var(--bg3);border:1px solid var(--border);border-radius:4px;cursor:pointer}
+.tcard:hover{border-color:var(--accent)}
+.tcard h4{font-size:12px;color:var(--bright)}.tcard p{font-size:11px;color:#888;margin-top:4px}
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="toolbar">
+    <span class="logo">ARIADNE STUDIO</span><div class="sep"></div>
+    <button class="btn primary" onclick="runWorkflow()">Run</button>
+    <button class="btn" onclick="saveWorkflow()">Save</button>
+    <button class="btn" onclick="showLoadModal()">Load</button>
+    <button class="btn" onclick="showTemplates()">Templates</button>
+    <button class="btn" onclick="exportJSON()">Export</button>
+    <div class="sep"></div>
+    <button class="btn danger" onclick="editor.clear()">Clear</button>
+    <div style="flex:1"></div>
+    <span style="font-size:11px;color:#666" id="status-text">Ready</span>
+  </div>
+  <div class="palette">
+    <h3>LLM</h3>
+    <div class="palette-item" draggable="true" ondragstart="drag(event,'llm')"><span class="dot" style="background:#4fc3f7"></span> LLM Call</div>
+    <h3>Tools</h3>
+    <div class="palette-item" draggable="true" ondragstart="drag(event,'tool')"><span class="dot" style="background:#81c784"></span> Tool Call</div>
+    <h3>Data</h3>
+    <div class="palette-item" draggable="true" ondragstart="drag(event,'transform')"><span class="dot" style="background:#ffb74d"></span> Transform</div>
+    <h3>Control</h3>
+    <div class="palette-item" draggable="true" ondragstart="drag(event,'condition')"><span class="dot" style="background:#ce93d8"></span> Condition</div>
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:10px">
+      <h3>Registered Tools</h3>
+      <div id="tool-list" style="font-size:11px;color:#888"></div>
+    </div>
+  </div>
+  <div class="canvas" ondrop="drop(event)" ondragover="event.preventDefault()"><div id="drawflow"></div></div>
+  <div class="props" id="props-panel"><h3>Properties</h3><p style="color:#666;font-size:11px">Select a node to edit</p></div>
+  <div class="log" id="log-panel"><div class="log-entry info">Ariadne Studio ready. Drag nodes from the palette to build your workflow.</div></div>
+</div>
+<div class="modal-overlay" id="modal-overlay"><div class="modal" id="modal-content"></div></div>
+<script src="https://cdn.jsdelivr.net/gh/jerosoler/Drawflow@0.0.60/dist/drawflow.min.js"></script>
+<script>
+const editor=new Drawflow(document.getElementById('drawflow'));
+editor.reroute=true;editor.start();
+const NODES={
+  llm:{inputs:1,outputs:1,cls:'llm-node',
+    data:{action:'',system_prompt:'',model_tier:'subagent',json_mode:false,temperature:-1},
+    html:`<div class="node-header"><span class="ndot"></span>LLM Call</div><div class="node-body"><div class="fl">Prompt</div><textarea df-action placeholder="Summarize the input..."></textarea><div class="fl">System Prompt</div><input df-system_prompt placeholder="(optional)"><div class="fl">Tier</div><select df-model_tier><option value="subagent">Subagent</option><option value="orchestrator">Orchestrator</option></select></div>`},
+  tool:{inputs:1,outputs:1,cls:'tool-node',
+    data:{action:'',tool_input_key:'query',tool_input_value:''},
+    html:`<div class="node-header"><span class="ndot"></span>Tool Call</div><div class="node-body"><div class="fl">Tool Name</div><input df-action placeholder="web_search"><div class="fl">Input Key</div><input df-tool_input_key value="query"><div class="fl">Input Value</div><input df-tool_input_value placeholder="$node_1 or literal"></div>`},
+  transform:{inputs:1,outputs:1,cls:'transform-node',
+    data:{action:'join'},
+    html:`<div class="node-header"><span class="ndot"></span>Transform</div><div class="node-body"><div class="fl">Operation</div><select df-action><option value="join">join</option><option value="parse_json">parse_json</option><option value="head">head</option><option value="to_list">to_list</option></select></div>`},
+  condition:{inputs:1,outputs:2,cls:'condition-node',
+    data:{action:'check',expression:''},
+    html:`<div class="node-header"><span class="ndot"></span>Condition</div><div class="node-body"><div class="fl">Expression</div><input df-expression placeholder="$node_1.success"><div style="font-size:10px;color:#888;margin-top:4px">Out 1=True, Out 2=False</div></div>`}
+};
+function drag(ev,t){ev.dataTransfer.setData('ntype',t)}
+function drop(ev){ev.preventDefault();const t=ev.dataTransfer.getData('ntype'),n=NODES[t];if(!n)return;const r=document.getElementById('drawflow').getBoundingClientRect();editor.addNode(t,n.inputs,n.outputs,ev.clientX-r.left,ev.clientY-r.top,n.cls,{...n.data},n.html)}
+editor.on('nodeSelected',id=>{const n=editor.getNodeFromId(id),p=document.getElementById('props-panel');p.innerHTML='';const h3=document.createElement('h3');h3.textContent='Node #'+id+' ('+n.name+')';p.appendChild(h3);for(const[k,v]of Object.entries(n.data)){const lbl=document.createElement('label');lbl.textContent=k;p.appendChild(lbl);if(typeof v==='boolean'){const cb=document.createElement('input');cb.type='checkbox';cb.checked=v;cb.addEventListener('change',function(){updN(id,k,this.checked)});lbl.prepend(cb)}else if(String(v).length>40||k.includes('prompt')){const ta=document.createElement('textarea');ta.value=v;ta.addEventListener('change',function(){updN(id,k,this.value)});p.appendChild(ta)}else{const inp=document.createElement('input');inp.value=v;inp.addEventListener('change',function(){updN(id,k,this.value)});p.appendChild(inp)}}});
+editor.on('nodeUnselected',()=>{document.getElementById('props-panel').innerHTML='<h3>Properties</h3><p style="color:#666;font-size:11px">Select a node</p>'});
+function updN(id,k,v){editor.getNodeFromId(id).data[k]=v}
+function log(m,l='info'){const e=document.createElement('div');e.className='log-entry '+l;e.textContent=`[${new Date().toLocaleTimeString()}] ${m}`;const p=document.getElementById('log-panel');p.appendChild(e);p.scrollTop=p.scrollHeight}
+function d2s(data){const nodes=data.drawflow.Home.data,steps=[];for(const[nid,node]of Object.entries(nodes)){const s={id:'node_'+nid,type:node.name,action:node.data.action||'',inputs:{},depends_on:[],description:node.name,model_tier:node.data.model_tier||'subagent',system_prompt:node.data.system_prompt||'',json_mode:node.data.json_mode||false,temperature:parseFloat(node.data.temperature)||-1};if(node.inputs)for(const[_,inp]of Object.entries(node.inputs))for(const c of inp.connections)s.depends_on.push('node_'+c.node);if(node.name==='tool'&&node.data.tool_input_key){s.inputs[node.data.tool_input_key]=node.data.tool_input_value||''}if(node.name==='condition')s.inputs={value:node.data.expression};steps.push(s)}return steps}
+async function runWorkflow(){const data=editor.export(),nodes=data.drawflow?.Home?.data;if(!nodes||Object.keys(nodes).length===0){log('No nodes','warn');return}const steps=d2s(data);log('Submitting '+steps.length+' steps...','info');document.getElementById('status-text').textContent='Running...';try{const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({steps})});const j=await r.json();if(j.run_id){log('Run: '+j.run_id,'ok');const es=new EventSource('/api/stream/'+j.run_id);es.addEventListener('step_start',e=>{const d=JSON.parse(e.data);log('Step ['+d.step_id+'] started...','step')});es.addEventListener('step_done',e=>{const d=JSON.parse(e.data);log('Step ['+d.step_id+'] done ('+d.duration_ms+'ms): '+String(d.output).substring(0,300),'ok')});es.addEventListener('step_error',e=>{const d=JSON.parse(e.data);log('Step ['+d.step_id+'] FAILED: '+d.error,'err')});es.addEventListener('complete',e=>{const d=JSON.parse(e.data);log('Complete! '+d.summary,'ok');document.getElementById('status-text').textContent='Done';es.close()});es.onerror=()=>{es.close();document.getElementById('status-text').textContent='Ready'}}else{log('Failed: '+(j.error||'?'),'err');document.getElementById('status-text').textContent='Error'}}catch(e){log('Error: '+e.message,'err')}}
+async function saveWorkflow(){const name=prompt('Workflow name:','My Workflow');if(!name)return;try{const r=await fetch('/api/workflows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,drawflow:editor.export()})});const j=await r.json();log('Saved: '+j.id,'ok')}catch(e){log('Save failed','err')}}
+async function showLoadModal(){try{const r=await fetch('/api/workflows');const wfs=await r.json();const c=document.createElement('div');const t=document.createElement('h2');t.textContent='Load Workflow';c.appendChild(t);if(!wfs.length){const p=document.createElement('p');p.style.color='#888';p.textContent='No saved workflows';c.appendChild(p)}for(const w of wfs){const d=document.createElement('div');d.className='tcard';d.addEventListener('click',()=>loadWF(w.id));const h=document.createElement('h4');h.textContent=w.name;const p=document.createElement('p');p.textContent=w.id;d.appendChild(h);d.appendChild(p);c.appendChild(d)}const btn=document.createElement('button');btn.className='btn';btn.textContent='Cancel';btn.addEventListener('click',closeModal);c.appendChild(document.createElement('br'));c.appendChild(btn);document.getElementById('modal-content').innerHTML='';document.getElementById('modal-content').appendChild(c);document.getElementById('modal-overlay').classList.add('active')}catch(e){log('Load failed','err')}}
+async function loadWF(id){try{const r=await fetch('/api/workflows/'+id);const j=await r.json();editor.import(j.drawflow);log('Loaded: '+j.name,'ok');closeModal()}catch(e){log('Load failed','err')}}
+async function showTemplates(){try{const r=await fetch('/api/templates');const ts=await r.json();const c=document.createElement('div');const tt=document.createElement('h2');tt.textContent='Templates';c.appendChild(tt);for(const t of ts){const d=document.createElement('div');d.className='tcard';d.addEventListener('click',()=>loadTpl(t.id));const h=document.createElement('h4');h.textContent=t.name;const p=document.createElement('p');p.textContent=t.description;d.appendChild(h);d.appendChild(p);c.appendChild(d)}const btn=document.createElement('button');btn.className='btn';btn.textContent='Cancel';btn.addEventListener('click',closeModal);c.appendChild(document.createElement('br'));c.appendChild(btn);document.getElementById('modal-content').innerHTML='';document.getElementById('modal-content').appendChild(c);document.getElementById('modal-overlay').classList.add('active')}catch(e){log('Templates failed','err')}}
+async function loadTpl(id){try{const r=await fetch('/api/templates/'+id);const j=await r.json();editor.import(j.drawflow);log('Template: '+j.name,'ok');closeModal()}catch(e){log('Template failed','err')}}
+function exportJSON(){const steps=d2s(editor.export());const blob=new Blob([JSON.stringify({steps},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='workflow.json';a.click();log('Exported '+steps.length+' steps','ok')}
+function showModal(h){document.getElementById('modal-content').innerHTML=h;document.getElementById('modal-overlay').classList.add('active')}
+function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
+document.getElementById('modal-overlay').addEventListener('click',e=>{if(e.target.id==='modal-overlay')closeModal()});
+(async()=>{try{const r=await fetch('/api/tools');const tools=await r.json();const el=document.getElementById('tool-list');if(!tools.length){el.textContent='(none)';return}el.innerHTML=tools.map(t=>`<div style="padding:2px 0">${t.name}</div>`).join('')}catch(e){}})();
+</script>
+</body>
+</html>

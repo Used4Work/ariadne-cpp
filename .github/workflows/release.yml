@@ -92,10 +92,11 @@ jobs:
         run: |
           TAG="${{ steps.tag.outputs.tag }}"
           DIST="ariadne-${TAG}-${{ matrix.name }}"
-          mkdir -p "${DIST}/include" "${DIST}/lib" "${DIST}/cmake"
+          mkdir -p "${DIST}/include" "${DIST}/lib" "${DIST}/cmake" "${DIST}/bin"
           cp ariadne.hpp "${DIST}/include/"
           cp "build/${{ matrix.lib }}" "${DIST}/lib/"
           cp cmake/ariadne-release-config.cmake "${DIST}/cmake/ariadne-config.cmake"
+          [ -f build/ariadne-studio ] && cp build/ariadne-studio "${DIST}/bin/"
           cp README.md LICENSE "${DIST}/"
           tar -czf "ariadne-${TAG}-${{ matrix.name }}.tar.gz" "${DIST}"
 
@@ -105,10 +106,11 @@ jobs:
         run: |
           $tag = "${{ steps.tag.outputs.tag }}"
           $dist = "ariadne-$tag-windows-x64"
-          New-Item -ItemType Directory -Path "$dist\include","$dist\lib","$dist\cmake" -Force
+          New-Item -ItemType Directory -Path "$dist\include","$dist\lib","$dist\cmake","$dist\bin" -Force
           Copy-Item ariadne.hpp "$dist\include\"
           Copy-Item "build\${{ matrix.lib }}" "$dist\lib\"
           Copy-Item cmake\ariadne-release-config.cmake "$dist\cmake\ariadne-config.cmake"
+          if (Test-Path "build\ariadne-studio.exe") { Copy-Item "build\ariadne-studio.exe" "$dist\bin\" }
           Copy-Item README.md,LICENSE "$dist\"
           Compress-Archive -Path "$dist\*" -DestinationPath "ariadne-$tag-windows-x64.zip"
 
@@ -149,6 +151,14 @@ jobs:
             find_package(ariadne CONFIG REQUIRED
               PATHS "path/to/ariadne-*/cmake" NO_DEFAULT_PATH)
             target_link_libraries(myapp PRIVATE ariadne::ariadne)
+            ```
+
+            ### Ariadne Studio (Visual Workflow Editor)
+            ```bash
+            # Set your API key and launch
+            export GITHUB_TOKEN=ghp_...
+            ./bin/ariadne-studio
+            # Open http://localhost:8080 in your browser
             ```
 
             See README.md for full build-from-source instructions.

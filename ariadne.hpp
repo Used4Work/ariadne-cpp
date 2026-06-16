@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
+#include <optional>
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 
@@ -32,8 +33,27 @@ namespace ariadne {
 
 
 // ════════════════════════════════════════════════════════════════
+// Token 用量追踪
+// ════════════════════════════════════════════════════════════════
+
+struct TokenUsage {
+    long input_tokens  = 0;
+    long output_tokens = 0;
+    long total_tokens  = 0;
+    TokenUsage& operator+=(const TokenUsage& o) {
+        input_tokens += o.input_tokens; output_tokens += o.output_tokens;
+        total_tokens += o.total_tokens; return *this;
+    }
+};
+
+inline thread_local TokenUsage g_last_token_usage{};
+
+// ════════════════════════════════════════════════════════════════
 // 异常层次 — 替代散落的 std::runtime_error
 // ════════════════════════════════════════════════════════════════
+
+/** 取消令牌 — 线程安全的共享取消信号 */
+using CancelToken = std::shared_ptr<std::atomic<bool>>;
 
 /** 所有 Ariadne 异常的基类 */
 class AriadneError : public std::exception {
@@ -58,6 +78,19 @@ class AllProvidersExhaustedError : public ProviderError {
 class PlanningError : public AriadneError {
     using AriadneError::AriadneError;
 };
+
+/** 工作流被主动取消或超时 */
+class WorkflowCancelledError : public AriadneError {
+    using AriadneError::AriadneError;
+};
+
+/** Guardrail 验证失败 */
+class GuardrailError : public AriadneError {
+    using AriadneError::AriadneError;
+};
+
+/** Guardrail 验证函数：返回 nullopt=通过，或 string=错误原因 */
+using GuardrailFn = std::function<std::optional<std::string>(const json&)>;
 
 /** 工具相关错误 */
 class ToolError : public AriadneError {
@@ -171,7 +204,8 @@ public:
     virtual std::string complete(const std::string& prompt,
                                   const std::string& system     = "",
                                   double             temperature = 0.0,
-                                  bool               force_json  = false) const = 0;
+                                  bool               force_json  = false,
+                                  const json&        output_schema = json()) const = 0;
     virtual void complete_stream(const std::string& prompt,
                                   const std::string& system,
                                   double             temperature,
@@ -182,18 +216,22 @@ public:
 
 /**
  * HttpProvider — 共享 curl 逻辑的基类 (R1)
- * 子类只需实现 build_request() 和 parse_response()
+ * 每次请求创建独立 CurlHandle，线程安全。
  */
 class HttpProvider : public ILLMProvider {
 public:
     explicit HttpProvider(const ProviderConfig& cfg) : cfg_(cfg) {}
 protected:
     ProviderConfig cfg_;
-    CurlHandle     curl_;
 
-    std::string http_post(const std::string& url,
-                           const std::vector<std::string>& headers,
-                           const std::string& body) const;
+    struct HttpResponse {
+        std::string body;
+        long        status_code = 0;
+    };
+
+    HttpResponse http_post(const std::string& url,
+                            const std::vector<std::string>& headers,
+                            const std::string& body) const;
 private:
     static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata);
 };
@@ -205,7 +243,8 @@ public:
     std::string complete(const std::string& prompt,
                           const std::string& system,
                           double temperature,
-                          bool force_json = false) const override;
+                          bool force_json = false,
+                          const json& output_schema = json()) const override;
     void complete_stream(const std::string& prompt,
                           const std::string& system,
                           double temperature,
@@ -221,7 +260,8 @@ public:
     std::string complete(const std::string& prompt,
                           const std::string& system,
                           double temperature,
-                          bool force_json = false) const override;
+                          bool force_json = false,
+                          const json& output_schema = json()) const override;
     void complete_stream(const std::string& prompt,
                           const std::string& system,
                           double temperature,
@@ -239,7 +279,8 @@ public:
     std::string complete(const std::string& prompt,
                           const std::string& system,
                           double temperature,
-                          bool force_json = false) const override;
+                          bool force_json = false,
+                          const json& output_schema = json()) const override;
     void complete_stream(const std::string& prompt,
                           const std::string& system,
                           double temperature,
@@ -249,6 +290,26 @@ public:
 };
 
 std::unique_ptr<ILLMProvider> make_provider(const ProviderConfig& cfg);
+
+/** 测试用 Mock Provider — 返回预设响应 */
+class MockProvider : public ILLMProvider {
+public:
+    explicit MockProvider(std::string response, std::string name = "mock", std::string model = "mock-1")
+        : response_(std::move(response)), name_(std::move(name)), model_(std::move(model)) {}
+
+    std::string complete(const std::string&, const std::string&,
+                          double, bool, const json& = json()) const override { return response_; }
+    void complete_stream(const std::string&, const std::string&,
+                          double, StreamCallback on_chunk) const override {
+        on_chunk(response_);
+    }
+    std::string provider_name() const override { return name_; }
+    std::string model_name()    const override { return model_; }
+
+    void set_response(const std::string& r) { response_ = r; }
+private:
+    std::string response_, name_, model_;
+};
 
 // ════════════════════════════════════════════════════════════════
 // 3. ModelTier — 高性能 vs 低消耗
@@ -372,15 +433,22 @@ struct ProviderStats {
 // 6. LLMClient — 双 Tier + 熔断降级
 // ════════════════════════════════════════════════════════════════
 
+class ResponseCache;  // forward declaration
+
 class LLMClient {
 public:
     LLMClient(TierConfig orchestrator, TierConfig subagent);
+
+    /** 测试用构造器 — 直接注入 Provider，跳过 ProviderConfig */
+    LLMClient(std::unique_ptr<ILLMProvider> orchestrator_provider,
+              std::unique_ptr<ILLMProvider> subagent_provider);
 
     std::string complete_as(ModelTier tier,
                              const std::string& prompt,
                              const std::string& system     = "",
                              double             temperature = 0.0,
-                             bool               force_json  = false) const;
+                             bool               force_json  = false,
+                             const json&        output_schema = json()) const;
 
     /** 流式：chunk 通过 on_chunk 回调推送 */
     void complete_as_stream(ModelTier tier,
@@ -398,6 +466,10 @@ public:
 
     std::vector<ProviderStats> stats(ModelTier tier) const;
     void print_status() const;
+    TokenUsage total_usage() const;
+    void reset_usage();
+    void enable_response_cache(bool on = true);
+    long response_cache_hits() const;
 
 private:
     struct Slot {
@@ -408,6 +480,10 @@ private:
         mutable long calls = 0, successes = 0, failures = 0;
     };
     std::vector<Slot> orchestrators_, subagents_;
+    mutable std::mutex usage_mu_;
+    mutable TokenUsage cumulative_usage_;
+    mutable std::unique_ptr<ResponseCache> response_cache_;
+    bool resp_cache_enabled_ = false;
 
     static std::vector<Slot> build_slots(const TierConfig& cfg);
     std::string try_slots(const std::vector<Slot>& slots,
@@ -415,7 +491,8 @@ private:
                            const std::string& system,
                            double temperature,
                            ModelTier tier,
-                           bool force_json = false) const;
+                           bool force_json = false,
+                           const json& output_schema = json()) const;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -472,6 +549,9 @@ struct WorkflowState {
     json resolve_ref   (const std::string& ref) const;
     json resolve_inputs(const json& inputs)      const;
     void record_trace  (TraceEntry entry) noexcept;
+
+private:
+    json resolve_value(const json& v) const;
 };
 
 
@@ -511,9 +591,11 @@ public:
     json                 call         (const std::string& name, const json& params) const;
     std::vector<ToolDef> list_tools   ()                                            const;
     bool                 has_tool     (const std::string& name)                     const;
+    void                 add_guardrail(const std::string& tool_name, GuardrailFn fn);
 private:
     std::map<std::string, ToolDef> defs_;
     std::map<std::string, ToolFn>  fns_;
+    std::map<std::string, std::vector<GuardrailFn>> guardrails_;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -549,7 +631,7 @@ private:
 
 class WorkflowPlanner {
 public:
-    explicit WorkflowPlanner(LLMClient& llm);
+    explicit WorkflowPlanner(LLMClient& llm, const std::string& custom_sys = "");
 
     /** 单次 LLM 调用完成分析+规划（推荐；比 analyze_task+plan_static 快 1-2s）*/
     WorkflowPlan plan        (const std::string& task,
@@ -557,23 +639,14 @@ public:
                                const WorkflowContext& ctx = {},
                                int max_attempts = 3) const;
 
-    /** @deprecated since v0.2.0 — use plan() directly */
-    [[deprecated("use plan() instead")]] json analyze_task(const std::string& task,
-                               const std::vector<ToolDef>& tools,
-                               const WorkflowContext& ctx = {}) const;
-    [[deprecated("use plan() instead")]] WorkflowPlan plan_static(const std::string& task,
-                               const json& analysis,
-                               const std::vector<ToolDef>& tools,
-                               int max_attempts = 3) const;
-    [[deprecated("use plan() instead")]] WorkflowPlan replan(const std::string& task,
-                               const WorkflowPlan& current,
-                               const std::vector<json>& failures) const;
-
     static json         extract_json(const std::string& text);
     static WorkflowPlan parse_plan  (const json& raw, const std::string& task);
 
+    void set_system_prompt(const std::string& sys) { custom_sys_ = sys; }
+
 private:
     LLMClient& llm_;
+    std::string custom_sys_;
 };
 
 
@@ -666,11 +739,43 @@ using WorkflowExecutionError = StepExecutionError;
 
 
 
+class IMetricsCollector;  // forward declaration
+
+// ════════════════════════════════════════════════════════════════
+// LLM 响应缓存 — exact-match，temperature=0 时高命中率
+// ════════════════════════════════════════════════════════════════
+
+class ResponseCache {
+public:
+    explicit ResponseCache(size_t max_size = 200) : max_size_(max_size) {}
+
+    static std::string make_key(const std::string& model, const std::string& system,
+                                 const std::string& prompt, double temperature,
+                                 bool force_json);
+    bool has(const std::string& key) const;
+    std::string get(const std::string& key);
+    void put(const std::string& key, const std::string& response);
+    size_t size() const { return cache_.size(); }
+    void clear() { cache_.clear(); order_.clear(); }
+
+    struct Stats { long hits = 0; long misses = 0; };
+    Stats stats() const { return stats_; }
+
+private:
+    size_t max_size_;
+    std::unordered_map<std::string, std::string> cache_;
+    std::list<std::string> order_;
+    mutable Stats stats_;
+    mutable std::mutex mu_;
+};
+
 class WorkflowExecutor {
 public:
-    WorkflowExecutor(LLMClient& llm, ToolRegistry& tools, size_t max_threads = 0);
+    WorkflowExecutor(LLMClient& llm, ToolRegistry& tools, size_t max_threads = 0,
+                      std::shared_ptr<IMetricsCollector> metrics = nullptr);
     WorkflowState execute(const WorkflowPlan& plan,
-                           const json& task_input) const;
+                           const json& task_input,
+                           CancelToken cancel = nullptr) const;
     /** Used by run_stream to execute non-final steps */
     json run_step_pub(const Step& s, const WorkflowState& st, std::vector<TraceEntry>& tr) const {
         return run_step(s, st, tr);
@@ -682,7 +787,8 @@ public:
 private:
     LLMClient&    llm_;
     ToolRegistry& tools_;
-    mutable ThreadPool pool_;  ///< bounded thread pool (mutable: execute() is const)
+    mutable ThreadPool pool_;
+    std::shared_ptr<IMetricsCollector> metrics_;
 
     json run_step      (const Step&, const WorkflowState&, std::vector<TraceEntry>&) const;
     json dispatch      (const Step&, const json& resolved) const;
@@ -767,7 +873,6 @@ struct EngineConfig {
     TierConfig  orchestrator;
     TierConfig  subagent;
     int         max_concurrency = 8;
-    std::string checkpoint_dir  = "";
 
     static EngineConfig from_single(const ProviderConfig& p, int thr = 3) {
         TierConfig t{p, {}, thr, 60.0};
@@ -793,6 +898,8 @@ struct WorkflowResult {
     int                        step_count    = 0;
     std::vector<TraceEntry>    traces;
     std::vector<ProviderStats> provider_stats;
+
+    TokenUsage                 token_usage;
 
     bool        has_output() const { return !output.is_null() && !output.empty(); }
     std::string summary()    const;
@@ -877,13 +984,23 @@ private:
 // ════════════════════════════════════════════════════════════════
 
 struct AgentAction {
-    enum class Type { TOOL_CALL, FINAL_ANSWER, LOOP_BACK };
+    enum class Type { TOOL_CALL, FINAL_ANSWER, LOOP_BACK, HANDOFF };
     Type        type     = Type::FINAL_ANSWER;
     std::string thought;
     std::string tool_name;
     json        tool_args;
-    std::string response;   // FINAL_ANSWER
-    std::string reason;     // LOOP_BACK
+    std::string response;     // FINAL_ANSWER
+    std::string reason;       // LOOP_BACK
+    std::string target_agent; // HANDOFF
+};
+
+/** 多 Agent 编排：Agent 定义 */
+struct AgentDef {
+    std::string              name;
+    std::string              system_prompt;
+    std::vector<std::string> allowed_tools;     // 空 = 所有工具
+    ModelTier                model_tier = ModelTier::ORCHESTRATOR;
+    std::vector<std::string> handoff_targets;   // 可移交的 agent 名
 };
 
 struct AgentStep {
@@ -902,6 +1019,7 @@ struct AgentResult {
     int                    max_iterations  = 0;
     std::string            error;
     long                   duration_ms    = 0;
+    TokenUsage             token_usage;
 
     bool   reached_max() const { return iterations_used >= max_iterations; }
     double avg_step_ms() const {
@@ -909,6 +1027,93 @@ struct AgentResult {
         long t=0; for (const auto& s:steps) t+=s.duration_ms;
         return (double)t/steps.size();
     }
+};
+
+// ════════════════════════════════════════════════════════════════
+// PlanCache — 计划模板缓存 (基于 NeurIPS 2025 APC 论文)
+// 关键词 exact match，LRU 驱逐，跳过 ORCHESTRATOR 规划调用
+// ════════════════════════════════════════════════════════════════
+
+class PlanCache {
+public:
+    explicit PlanCache(size_t max_size = 50) : max_size_(max_size) {}
+
+    static std::string normalize_key(const std::string& task,
+                                      const std::vector<ToolDef>& tools);
+    bool has(const std::string& key) const;
+    WorkflowPlan get(const std::string& key);
+    void put(const std::string& key, const WorkflowPlan& plan);
+    size_t size() const { return cache_.size(); }
+    void clear() { cache_.clear(); order_.clear(); }
+
+    struct Stats { long hits = 0; long misses = 0; };
+    Stats stats() const { return stats_; }
+
+private:
+    size_t max_size_;
+    std::unordered_map<std::string, WorkflowPlan> cache_;
+    std::list<std::string> order_;  // front = most recent
+    Stats stats_;
+    mutable std::mutex mu_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// MCP Client — Model Context Protocol (stdio transport)
+// JSON-RPC 2.0 over subprocess stdin/stdout (NDJSON)
+// ════════════════════════════════════════════════════════════════
+
+/** MCP 传输层接口 */
+class IMcpTransport {
+public:
+    virtual ~IMcpTransport() = default;
+    virtual void send(const json& message) = 0;
+    virtual json receive() = 0;
+    virtual void close() = 0;
+};
+
+/** Stdio 传输：通过子进程 stdin/stdout 通信 */
+class StdioTransport : public IMcpTransport {
+public:
+    StdioTransport(const std::string& command, const std::vector<std::string>& args = {});
+    ~StdioTransport();
+    void send(const json& message) override;
+    json receive() override;
+    void close() override;
+private:
+    FILE* pipe_ = nullptr;
+    bool closed_ = true;
+#ifdef _WIN32
+    void* process_handle_ = nullptr;
+    void* stdin_write_ = nullptr;
+    void* stdout_read_ = nullptr;
+#else
+    int stdin_fd_ = -1;
+    int stdout_fd_ = -1;
+    int child_pid_ = -1;
+#endif
+};
+
+/** MCP 客户端：初始化 → 工具发现 → 工具调用 */
+class McpClient {
+public:
+    explicit McpClient(std::unique_ptr<IMcpTransport> transport);
+    ~McpClient();
+
+    json initialize(const std::string& client_name = "ariadne",
+                     const std::string& version = "0.3.0");
+    std::vector<ToolDef> list_tools();
+    json call_tool(const std::string& name, const json& arguments);
+    void close();
+
+    void register_all_tools(ToolRegistry& registry);
+
+private:
+    std::unique_ptr<IMcpTransport> transport_;
+    int next_id_ = 1;
+    bool initialized_ = false;
+    std::vector<ToolDef> discovered_tools_;
+
+    json make_request(const std::string& method, const json& params = json::object());
 };
 
 class WorkflowEngine {
@@ -950,6 +1155,16 @@ public:
                            int max_iterations = 10,
                            std::function<void(const AgentStep&)> on_step = nullptr);
 
+    /**
+     * 多 Agent 编排：从 start_agent 开始，agent 可通过 HANDOFF 移交控制权。
+     * 全程共享对话历史。
+     */
+    AgentResult run_multi_agent(const std::string& task,
+                                 const std::vector<AgentDef>& agents,
+                                 const std::string& start_agent,
+                                 int max_iterations = 15,
+                                 std::function<void(const AgentStep&)> on_step = nullptr);
+
     /** Override the planner system prompt (default: PLANNER_SYS constant) */
     void set_planner_prompt(const std::string& sys_prompt);
 
@@ -963,7 +1178,28 @@ public:
      */
     void set_metrics(std::shared_ptr<IMetricsCollector> collector);
 
-    // run_agent: see 3-param overload with on_step callback above
+    /** 取消当前正在执行的 workflow/agent。线程安全。 */
+    void cancel();
+
+    /** 重置取消状态（在下次 run 前自动调用） */
+    void reset_cancel();
+
+    /** 获取取消令牌（用于外部检查） */
+    CancelToken cancel_token() const { return cancel_; }
+
+    /** 设置全局超时（从 run 开始计时，覆盖所有步骤） */
+    void set_deadline(std::chrono::seconds timeout);
+    void clear_deadline();
+
+    /** Guardrails — 输入/输出/工具验证钩子 */
+    void add_input_guardrail(GuardrailFn fn);
+    void add_output_guardrail(GuardrailFn fn);
+    void add_tool_guardrail(const std::string& tool_name, GuardrailFn fn);
+
+    /** 计划缓存控制 */
+    void enable_plan_cache(bool on = true) { cache_enabled_ = on; }
+    PlanCache::Stats plan_cache_stats() const { return plan_cache_.stats(); }
+    void clear_plan_cache() { plan_cache_.clear(); }
 
 private:
     EngineConfig                      config_;
@@ -974,6 +1210,14 @@ private:
     std::string                       custom_planner_prompt_;
     std::string                       custom_agent_prompt_;
     std::shared_ptr<IMetricsCollector> metrics_{std::make_shared<NoOpMetrics>()};
+    CancelToken                       cancel_{std::make_shared<std::atomic<bool>>(false)};
+    std::chrono::steady_clock::time_point deadline_{};
+    bool                              has_deadline_ = false;
+    PlanCache                         plan_cache_;
+    bool                              cache_enabled_ = true;
+    std::vector<GuardrailFn>          input_guardrails_;
+    std::vector<GuardrailFn>          output_guardrails_;
+    std::map<std::string, std::vector<GuardrailFn>> tool_guardrails_;
 
     WorkflowResult run_internal(const std::string& task, WorkflowContext* ctx);
 };
