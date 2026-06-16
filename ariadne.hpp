@@ -913,7 +913,7 @@ class WorkflowPlanner {
 public:
     explicit WorkflowPlanner(LLMClient& llm, const std::string& custom_sys = "");
 
-    /** 单次 LLM 调用完成分析+规划（推荐；比 analyze_task+plan_static 快 1-2s）*/
+    /** LLM 调用完成分析+规划 */
     WorkflowPlan plan        (const std::string& task,
                                const std::vector<ToolDef>& tools,
                                const WorkflowContext& ctx = {},

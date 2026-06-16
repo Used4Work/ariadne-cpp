@@ -1364,7 +1364,7 @@ json WorkflowExecutor::run_step(const Step& step, const WorkflowState& state,
     for (int i = 0; i <= step.retry; ++i) {
         try {
             auto result = dispatch(step, inputs);
-            long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            auto ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             TraceEntry te{step.id, type_str, "ok", "", ms, ""};
             if (step.type == StepType::LLM) {
@@ -1389,7 +1389,7 @@ json WorkflowExecutor::run_step(const Step& step, const WorkflowState& state,
             }
         }
     }
-    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    auto ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     try { std::rethrow_exception(last); } catch (const std::exception& e) {
         traces.push_back({step.id, type_str, "failed", "", ms, e.what()});
@@ -1415,7 +1415,7 @@ json WorkflowExecutor::exec_tool(const Step& s, const json& in) const {
     metrics_->record({MetricEvent::Kind::TOOL_CALL, "", s.id, "", "", 0, true, "", {{"tool", s.action}}});
     auto t0 = std::chrono::steady_clock::now();
     auto result = tools_.call(s.action, in);
-    long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    auto ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     metrics_->record({MetricEvent::Kind::TOOL_RESPONSE, "", s.id, "", "", (long)ms, true, ""});
     return result;
@@ -1454,13 +1454,13 @@ json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
                     log_msg(LogLevel::LOG_WARN, "Executor", viol_msg);
                 }
             }
-            auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            auto llm_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - llm_t0).count();
             metrics_->record({MetricEvent::Kind::LLM_RESPONSE, "", s.id, "", "", (long)llm_ms, true, ""});
             return result;
         }
         catch (...) {
-            auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            auto llm_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - llm_t0).count();
             metrics_->record({MetricEvent::Kind::LLM_RESPONSE, "", s.id, "", "", (long)llm_ms, true, ""});
             return raw;
@@ -1469,7 +1469,7 @@ json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
 
     double temp = (s.temperature >= 0.0) ? s.temperature : 0.0;
     auto result = llm_.complete_as(s.model_tier, prompt, s.system_prompt, temp);
-    auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    auto llm_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - llm_t0).count();
     metrics_->record({MetricEvent::Kind::LLM_RESPONSE, "", s.id, "", "", (long)llm_ms, true, ""});
     return result;
@@ -2334,7 +2334,7 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
         res.success       = false;
         res.error_message = e.what();
     }
-    res.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    res.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     res.token_usage = llm_->total_usage();
     metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "",
@@ -2517,11 +2517,11 @@ ProbeResult ProviderAutoPlanner::probe_one(const Candidate& c,
     if (fut.wait_for(timeout) == std::future_status::timeout) {
         r.alive = false;
         r.error = "timeout (" + std::to_string(timeout.count()) + "s)";
-        r.latency_ms = timeout.count() * 1000;
+        r.latency_ms = (long)(timeout.count() * 1000);
         return r;
     }
     auto [ok, msg] = fut.get();
-    r.latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    r.latency_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     r.alive = ok;
     if (!ok) r.error = msg;
@@ -2788,7 +2788,7 @@ WorkflowResult WorkflowEngine::run_stream(const std::string& task,
     } catch (const std::exception& e) {
         res.success = false; res.error_message = e.what();
     }
-    res.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    res.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     res.token_usage = llm_->total_usage();
     metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "",
@@ -3029,7 +3029,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
             step.action.type = AgentAction::Type::FINAL_ANSWER;
             step.action.response = resp.content;
             step.action.thought = step.thought;
-            step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            step.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - step_t0).count();
             result.steps.push_back(step);
             result.success = true;
@@ -3039,7 +3039,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
             break;
         }
 
-        step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        step.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - step_t0).count();
         result.steps.push_back(step);
         result.traces.push_back({
@@ -3054,7 +3054,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         result.error = "Max iterations reached without final answer";
         result.iterations_used = max_iterations;
     }
-    result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    result.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     result.token_usage = llm_->total_usage();
     // Output guardrails
@@ -3129,7 +3129,7 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
 
         // ── Dispatch ──────────────────────────────────────────
         if (action.type == AgentAction::Type::FINAL_ANSWER) {
-            step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            step.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - step_t0).count();
             result.steps.push_back(step);
             result.success        = true;
@@ -3176,7 +3176,7 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
                     +  "Reason: " + action.reason + "\n\n";
         }
 
-        step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        step.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - step_t0).count();
         result.steps.push_back(step);
         // Agent trace entry
@@ -3197,7 +3197,7 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
         result.iterations_used = max_iterations;
     }
 
-    result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    result.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     result.token_usage = llm_->total_usage();
 
@@ -3304,7 +3304,7 @@ AgentResult WorkflowEngine::run_multi_agent(const std::string& task,
         step.action  = action;
 
         if (action.type == AgentAction::Type::FINAL_ANSWER) {
-            step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            step.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - step_t0).count();
             result.steps.push_back(step);
             result.success = true;
@@ -3349,7 +3349,7 @@ AgentResult WorkflowEngine::run_multi_agent(const std::string& task,
             }
         }
 
-        step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        step.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - step_t0).count();
         result.steps.push_back(step);
         if (on_step) on_step(step);
@@ -3359,7 +3359,7 @@ AgentResult WorkflowEngine::run_multi_agent(const std::string& task,
         result.error = "Max iterations reached without final answer";
         result.iterations_used = max_iterations;
     }
-    result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    result.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     result.token_usage = llm_->total_usage();
     return result;
