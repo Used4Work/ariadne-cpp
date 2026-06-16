@@ -57,8 +57,16 @@ HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
     curl_easy_setopt(c, CURLOPT_HTTPHEADER,    h);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS,    body.c_str());
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    // Header callback to capture Retry-After
+    std::string resp_headers;
+    auto header_cb = [](char* buf, size_t size, size_t nitems, void* userdata) -> size_t {
+        static_cast<std::string*>(userdata)->append(buf, size * nitems);
+        return size * nitems;
+    };
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA,     &resp.body);
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, +header_cb);
+    curl_easy_setopt(c, CURLOPT_HEADERDATA,     &resp_headers);
     curl_easy_setopt(c, CURLOPT_TIMEOUT,        (long)cfg_.timeout_sec);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
@@ -66,6 +74,15 @@ HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
         throw std::runtime_error(std::string("curl: ") + curl_easy_strerror(rc));
+    // Parse Retry-After from response headers
+    auto ra_pos = resp_headers.find("retry-after:");
+    if (ra_pos == std::string::npos) ra_pos = resp_headers.find("Retry-After:");
+    if (ra_pos != std::string::npos) {
+        auto val_start = resp_headers.find_first_not_of(" \t", ra_pos + 12);
+        auto val_end = resp_headers.find_first_of("\r\n", val_start);
+        if (val_start != std::string::npos)
+            resp.retry_after = resp_headers.substr(val_start, val_end - val_start);
+    }
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp.status_code);
     return resp;
 }
@@ -107,15 +124,118 @@ std::string AnthropicProvider::complete(const std::string& prompt,
          "x-api-key: " + cfg_.api_key,
          "anthropic-version: 2024-10-22"},
         body.dump());
-    if (resp.status_code == 429 || resp.status_code == 503)
-        throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 429 || resp.status_code == 503) {
+        std::string msg = "Anthropic: " + std::to_string(resp.status_code) + " rate limited";
+        if (!resp.retry_after.empty()) msg += " retry_after=" + resp.retry_after;
+        throw ProviderError(msg);
+    }
     if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
         throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " server error (retryable)");
-    auto j = json::parse(resp.body);
+    json j;
+    try { j = json::parse(resp.body); }
+    catch (...) { throw ProviderError("Anthropic: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
     if (j.contains("error"))
         throw ProviderError("Anthropic: " + j["error"]["message"].get<std::string>());
     extract_token_usage(j);
     return j["content"][0]["text"].get<std::string>();
+}
+
+// ── AnthropicProvider::complete_chat (native tools) ─────────────
+
+LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& messages,
+                                               const std::vector<ToolDef>& tools,
+                                               double temperature) const {
+    // Build messages array (Anthropic format: user/assistant alternating)
+    json msgs = json::array();
+    std::string system_prompt;
+    for (const auto& m : messages) {
+        if (m.role == "system") { system_prompt = m.content; continue; }
+        if (m.role == "user") {
+            // Check if this is a tool_result message
+            if (!m.tool_call_id.empty()) {
+                msgs.push_back({{"role","user"},{"content", json::array({
+                    {{"type","tool_result"},{"tool_use_id",m.tool_call_id},{"content",m.content}}
+                })}});
+            } else {
+                msgs.push_back({{"role","user"},{"content",m.content}});
+            }
+        } else if (m.role == "tool") {
+            // Anthropic: tool results go as user messages with tool_result content
+            msgs.push_back({{"role","user"},{"content", json::array({
+                {{"type","tool_result"},{"tool_use_id",m.tool_call_id},{"content",m.content}}
+            })}});
+        } else if (m.role == "assistant") {
+            if (!m.tool_calls.is_null() && !m.tool_calls.empty()) {
+                // Reconstruct assistant content with tool_use blocks
+                json content = json::array();
+                if (!m.content.empty())
+                    content.push_back({{"type","text"},{"text",m.content}});
+                for (const auto& tc : m.tool_calls) {
+                    json args = tc.contains("arguments") ? tc["arguments"] : json::object();
+                    if (args.is_string()) try { args = json::parse(args.get<std::string>()); } catch (...) {}
+                    content.push_back({{"type","tool_use"},
+                        {"id", tc.value("id","")},
+                        {"name", tc.contains("function") ? tc["function"].value("name","") : tc.value("name","")},
+                        {"input", args}});
+                }
+                msgs.push_back({{"role","assistant"},{"content",content}});
+            } else {
+                msgs.push_back({{"role","assistant"},{"content",m.content}});
+            }
+        }
+    }
+
+    json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
+                  {"temperature", temperature}, {"messages", msgs}};
+    if (!system_prompt.empty()) body["system"] = system_prompt;
+
+    // Add tools if provided (Anthropic format)
+    if (!tools.empty()) {
+        json tools_arr = json::array();
+        for (const auto& t : tools) {
+            tools_arr.push_back({
+                {"name", t.name},
+                {"description", t.description},
+                {"input_schema", t.input_schema.empty() ? json({{"type","object"}}) : t.input_schema}
+            });
+        }
+        body["tools"] = tools_arr;
+        body["tool_choice"] = {{"type","auto"}};
+    }
+
+    std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
+    auto resp = http_post(base + "/v1/messages",
+        {"Content-Type: application/json",
+         "x-api-key: " + cfg_.api_key,
+         "anthropic-version: 2024-10-22"},
+        body.dump());
+    if (resp.status_code == 429 || resp.status_code == 503)
+        throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
+        throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " server error (retryable)");
+    json j;
+    try { j = json::parse(resp.body); }
+    catch (...) { throw ProviderError("Anthropic: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
+    if (j.contains("error"))
+        throw ProviderError("Anthropic: " + j["error"]["message"].get<std::string>());
+    extract_token_usage(j);
+
+    LLMResponse result;
+    // Parse Anthropic response: content array with text and tool_use blocks
+    if (j.contains("content") && j["content"].is_array()) {
+        for (const auto& block : j["content"]) {
+            if (block.value("type","") == "text")
+                result.content += block.value("text","");
+            else if (block.value("type","") == "tool_use") {
+                LLMToolCall tc;
+                tc.id = block.value("id","");
+                tc.name = block.value("name","");
+                tc.arguments = block.value("input", json::object());
+                result.tool_calls.push_back(std::move(tc));
+            }
+        }
+    }
+    return result;
 }
 
 // ── OpenAIChatProvider ───────────────────────────────────────────
@@ -147,8 +267,11 @@ std::string OpenAIChatProvider::complete(const std::string& prompt,
         {"Content-Type: application/json",
          "Authorization: Bearer " + cfg_.api_key},
         body.dump());
-    if (resp.status_code == 429 || resp.status_code == 503)
-        throw ProviderError("OpenAI Chat: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 429 || resp.status_code == 503) {
+        std::string msg = "OpenAI Chat: " + std::to_string(resp.status_code) + " rate limited";
+        if (!resp.retry_after.empty()) msg += " retry_after=" + resp.retry_after;
+        throw ProviderError(msg);
+    }
     if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
         throw ProviderError("OpenAI Chat: " + std::to_string(resp.status_code) + " server error (retryable)");
     json j;
@@ -452,7 +575,14 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                     throw AllProvidersExhaustedError(
                         slot.provider->provider_name() + ": fatal error — " + emsg);
                 } else if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
-                    int backoff_sec = 3 * (1 << rate_retry);  // 3s, 6s, 12s
+                    int backoff_sec = 3 * (1 << rate_retry);  // default: 3s, 6s, 12s
+                    // Honor Retry-After header if present in error message
+                    auto ra_pos = emsg.find("retry_after=");
+                    if (ra_pos != std::string::npos) {
+                        try { backoff_sec = std::stoi(emsg.substr(ra_pos + 12)); }
+                        catch (...) {}
+                    }
+                    if (backoff_sec > 120) backoff_sec = 120;
                     log_msg(LogLevel::LOG_WARN, "LLMClient",
                         slot.provider->provider_name() + " rate limited, retry "
                         + std::to_string(rate_retry+1) + "/" + std::to_string(MAX_RATE_RETRIES)
@@ -1321,7 +1451,7 @@ std::vector<json> DynamicWorkflow::fan_out_agents(const std::vector<std::string>
     agent_tasks.reserve(tasks.size());
     for (size_t i = 0; i < tasks.size(); ++i) {
         agent_tasks.push_back([this, &tasks, i, max_iterations]() -> json {
-            auto result = engine_.run_agent(tasks[i], max_iterations);
+            auto result = engine_.run_agent_native(tasks[i], max_iterations);
             return {{"task", tasks[i]},
                     {"success", result.success},
                     {"answer", result.final_answer},
@@ -1493,7 +1623,7 @@ OrchestratorResult AdaptiveOrchestrator::execute_plan(const std::string& task,
 
         case OrchestratorStrategy::AGENT_LOOP: {
             emit("Executing as agent loop (" + std::to_string(plan.max_iterations) + " max iterations)...");
-            auto ar = engine_.run_agent(task, plan.max_iterations,
+            auto ar = engine_.run_agent_native(task, plan.max_iterations,
                 [&](const AgentStep& s) {
                     emit("[iter " + std::to_string(s.iteration) + "] " +
                          s.thought.substr(0, 80));
@@ -1509,7 +1639,7 @@ OrchestratorResult AdaptiveOrchestrator::execute_plan(const std::string& task,
             if (plan.subtasks.empty()) {
                 // Fallback: run as single agent
                 emit("No subtasks found, falling back to agent loop");
-                auto ar = engine_.run_agent(task, plan.max_iterations);
+                auto ar = engine_.run_agent_native(task, plan.max_iterations);
                 result.success = ar.success;
                 result.output  = ar.final_answer;
                 if (!ar.success) result.error = ar.error;

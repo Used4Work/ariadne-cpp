@@ -34,6 +34,13 @@ using json = nlohmann::json;
 
 namespace ariadne {
 
+/** 粗略 token 估算（英文 ~4 chars/token, 中文 ~2 chars/token） */
+inline long estimate_tokens(const std::string& text) {
+    long ascii = 0, non_ascii = 0;
+    for (unsigned char c : text) { if (c < 128) ++ascii; else ++non_ascii; }
+    return ascii / 4 + non_ascii / 2 + 1;
+}
+
 /** 库版本号 */
 constexpr const char* ARIADNE_VERSION = "0.8.0";
 inline std::string version() { return ARIADNE_VERSION; }
@@ -375,6 +382,7 @@ protected:
     struct HttpResponse {
         std::string body;
         long        status_code = 0;
+        std::string retry_after;
     };
 
     HttpResponse http_post(const std::string& url,
@@ -397,6 +405,10 @@ public:
                           const std::string& system,
                           double temperature,
                           StreamCallback on_chunk) const override;
+    LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
+                               const std::vector<ToolDef>& tools = {},
+                               double temperature = 0.0) const override;
+    bool supports_native_tools() const override { return true; }
     std::string provider_name() const override { return "anthropic"; }
     std::string model_name()    const override { return cfg_.model;   }
 };

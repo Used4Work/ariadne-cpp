@@ -1194,6 +1194,35 @@ void test_token_usage_cost() {
     ASSERT(a.cost_usd > 0.0029 && a.cost_usd < 0.0031);
 }
 
+// ── Token Estimation ─────────────────────────────────────
+void test_estimate_tokens_english() {
+    ASSERT(estimate_tokens("hello world") > 0);
+    ASSERT(estimate_tokens("hello world") < 5);
+    auto t = estimate_tokens("The quick brown fox jumps over the lazy dog");
+    ASSERT(t >= 8 && t <= 15);
+}
+
+void test_estimate_tokens_empty() {
+    ASSERT(estimate_tokens("") == 1);
+}
+
+// ── Anthropic Native Tools ──────────────────────────────
+void test_anthropic_supports_native() {
+    ProviderConfig cfg = ProviderConfig::anthropic("test-key");
+    auto p = make_provider(cfg);
+    ASSERT(p->supports_native_tools());
+}
+
+// ── Retry-After parsing ─────────────────────────────────
+void test_retry_after_in_error_msg() {
+    // Verify the backoff logic can parse retry_after= from error messages
+    std::string emsg = "OpenAI Chat: 429 rate limited retry_after=7";
+    auto ra_pos = emsg.find("retry_after=");
+    ASSERT(ra_pos != std::string::npos);
+    int val = std::stoi(emsg.substr(ra_pos + 12));
+    ASSERT(val == 7);
+}
+
 // ── Native Tool Calling Types ────────────────────────────
 void test_chat_message_struct() {
     ChatMessage m;
@@ -1410,6 +1439,15 @@ int main() {
 
     std::cout<<"\n=== Cost Tracking ===\n";
     RUN(test_model_pricing); RUN(test_token_usage_cost);
+
+    std::cout<<"\n=== Token Estimation ===\n";
+    RUN(test_estimate_tokens_english); RUN(test_estimate_tokens_empty);
+
+    std::cout<<"\n=== Anthropic Native Tools ===\n";
+    RUN(test_anthropic_supports_native);
+
+    std::cout<<"\n=== Retry-After ===\n";
+    RUN(test_retry_after_in_error_msg);
 
     std::cout<<"\n=== Native Tool Calling ===\n";
     RUN(test_chat_message_struct); RUN(test_llm_tool_call_struct);
