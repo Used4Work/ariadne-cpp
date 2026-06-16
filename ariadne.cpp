@@ -855,7 +855,10 @@ json WorkflowPlan::to_json() const {
 }
 
 WorkflowPlan WorkflowPlan::from_json(const json& j) {
-    return WorkflowPlanner::parse_plan(j, j.value("metadata", json::object()).value("task", ""));
+    auto plan = WorkflowPlanner::parse_plan(j, j.value("metadata", json::object()).value("task", ""));
+    if (j.contains("id")) plan.id = j["id"].get<std::string>();
+    if (j.contains("metadata")) plan.metadata = j["metadata"];
+    return plan;
 }
 
 // ════════════════════════════════════════════════════════════════

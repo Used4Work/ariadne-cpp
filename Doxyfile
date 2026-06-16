@@ -1,0 +1,22 @@
+PROJECT_NAME           = "Ariadne"
+PROJECT_NUMBER         = 1.2.1
+PROJECT_BRIEF          = "C++17 LLM Workflow Orchestration"
+
+INPUT                  = ariadne.hpp
+FILE_PATTERNS          = *.hpp
+RECURSIVE              = NO
+
+EXTRACT_ALL            = YES
+EXTRACT_PRIVATE        = NO
+EXTRACT_STATIC         = NO
+
+GENERATE_HTML          = YES
+HTML_OUTPUT            = docs/html
+GENERATE_LATEX         = NO
+
+HAVE_DOT               = NO
+QUIET                  = YES
+
+JAVADOC_AUTOBRIEF      = YES
+SORT_MEMBER_DOCS       = YES
+SHOW_NAMESPACES        = YES

@@ -44,6 +44,9 @@ if(ARIADNE_BUILD_TESTS)
 
     add_executable(eval_runner tests/eval_runner.cpp)
     target_link_libraries(eval_runner PRIVATE ariadne)
+
+    add_executable(benchmark tests/benchmark.cpp)
+    target_link_libraries(benchmark PRIVATE ariadne)
 endif()
 
 # ── Ariadne Studio (visual workflow editor) ──────────────────────
@@ -110,3 +113,15 @@ configure_package_config_file(
     INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ariadne)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ariadneConfig.cmake
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ariadne)
+
+# pkg-config for Linux consumers
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/ariadne.pc.in
+    ${CMAKE_CURRENT_BINARY_DIR}/ariadne.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ariadne.pc
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
+
+# Install models.json if present (runtime dependency for model-check)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/models.json)
+    install(FILES models.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ariadne)
+endif()
