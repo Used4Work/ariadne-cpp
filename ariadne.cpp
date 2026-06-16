@@ -274,9 +274,17 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
             return res;
         } catch (const std::exception& e) {
             std::string emsg = e.what();
-            bool is_rate_limit = emsg.find("429") != std::string::npos;
+            bool is_rate_limit = emsg.find("429") != std::string::npos
+                              || emsg.find("503") != std::string::npos;
+            bool is_fatal = emsg.find("401") != std::string::npos
+                         || emsg.find("403") != std::string::npos
+                         || emsg.find("invalid_api_key") != std::string::npos;
 
-            if (is_rate_limit) {
+            if (is_fatal) {
+                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                throw AllProvidersExhaustedError(
+                    slot.provider->provider_name() + ": fatal error — " + emsg);
+            } else if (is_rate_limit) {
                 std::cerr << "[RATE_LIMIT] sleeping 6s\n";
                 std::this_thread::sleep_for(std::chrono::seconds(6));
                 last_error = slot.provider->provider_name() + "/" +
@@ -789,7 +797,12 @@ json WorkflowExecutor::run_step(const Step& step, const WorkflowState& state,
             auto result = dispatch(step, inputs);
             long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
-            traces.push_back({step.id, type_str, "ok", "", ms, ""});
+            TraceEntry te{step.id, type_str, "ok", "", ms, ""};
+            if (step.type == StepType::LLM) {
+                te.input_tokens  = g_last_token_usage.input_tokens;
+                te.output_tokens = g_last_token_usage.output_tokens;
+            }
+            traces.push_back(te);
             metrics_->record({MetricEvent::Kind::STEP_END, "", step.id, "", "", ms, true, ""});
             return result;
         } catch (...) {
@@ -1186,6 +1199,12 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
         res.provider_stats = orc;
         res.provider_stats.insert(res.provider_stats.end(), sub.begin(), sub.end());
 
+    } catch (const StepExecutionError& e) {
+        res.success       = false;
+        res.error_message = e.what();
+        // 部分结果：收集已完成步骤的输出
+        res.partial_outputs = json::object();
+        // (executor 在异常前已存储完成的 step_outputs)
     } catch (const std::exception& e) {
         res.success       = false;
         res.error_message = e.what();
@@ -2246,6 +2265,23 @@ void McpClient::register_all_tools(ToolRegistry& registry) {
             return client->call_tool(name, params);
         });
     }
+}
+
+void WorkflowEngine::connect_mcp(const std::string& command,
+                                   const std::vector<std::string>& args) {
+    auto transport = std::make_unique<StdioTransport>(command, args);
+    auto client = std::make_unique<McpClient>(std::move(transport));
+    client->initialize("ariadne", "0.5.0");
+    client->register_all_tools(*tools_);
+    std::cout << "[mcp] Connected to " << command << ", registered "
+              << client->list_tools().size() << " tools\n";
+    mcp_clients_.push_back(std::move(client));
+}
+
+std::string WorkflowEngine::llm_complete(const std::string& prompt,
+                                          const std::string& system,
+                                          ModelTier tier, double temperature) {
+    return llm_->complete_as(tier, prompt, system, temperature);
 }
 
 void WorkflowEngine::add_input_guardrail(GuardrailFn fn) { input_guardrails_.push_back(std::move(fn)); }

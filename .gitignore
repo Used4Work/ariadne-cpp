@@ -8,4 +8,7 @@ benchmark/
 *.local
 deps/
 build.bat
+build-test/
+vcpkg_installed/
+eval_report.json
 CLAUDE.md

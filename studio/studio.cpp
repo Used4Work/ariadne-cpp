@@ -245,9 +245,10 @@ int main(int argc, char* argv[]) {
         std::cerr << "[studio] Starting without LLM provider (edit-only mode).\n";
     }
 
-    // Active SSE streams
+    // Active SSE streams and background threads
     std::mutex streams_mu;
     std::map<std::string, std::shared_ptr<EventStream>> streams;
+    std::vector<std::thread> run_threads;
 
     // HTTP Server
     httplib::Server svr;
@@ -342,8 +343,8 @@ int main(int argc, char* argv[]) {
                 streams[run_id] = stream;
             }
 
-            // Execute in background thread
-            std::thread([stream, steps, &engine, run_id]() {
+            // Execute in background thread (stored for cleanup)
+            std::thread t([stream, steps, &engine, run_id]() {
                 try {
                     auto plan = convert_steps(steps);
                     validate_dag(plan);
@@ -369,16 +370,20 @@ int main(int argc, char* argv[]) {
                                 auto inputs = state.resolve_inputs(step.inputs);
 
                                 if (step.type == StepType::TOOL) {
-                                    // Direct tool call
-                                    result = json("(tool execution placeholder)");
+                                    result = json("(tool: " + step.action + ")");
                                 } else if (step.type == StepType::LLM) {
                                     std::string prompt = step.action;
                                     if (!inputs.empty()) prompt += "\n\nContext:\n" + inputs.dump(2);
-                                    result = engine->run("LLM: " + prompt).output;
+                                    auto tier = (step.model_tier == ModelTier::ORCHESTRATOR)
+                                                ? ModelTier::ORCHESTRATOR : ModelTier::SUBAGENT;
+                                    result = engine->llm_complete(prompt, step.system_prompt, tier);
                                 } else if (step.type == StepType::TRANSFORM) {
                                     result = inputs;
+                                } else if (step.type == StepType::CONDITION) {
+                                    auto v = inputs.value("value", json(nullptr));
+                                    result = !v.is_null() && v != false && v != 0;
                                 } else {
-                                    result = true;
+                                    result = inputs;
                                 }
 
                                 state.step_outputs[step.id] = result;
@@ -413,7 +418,11 @@ int main(int argc, char* argv[]) {
                         {"success", false}, {"error", e.what()}});
                 }
                 stream->complete();
-            }).detach();
+            });
+            {
+                std::lock_guard<std::mutex> lk(streams_mu);
+                run_threads.push_back(std::move(t));
+            }
 
             res.set_content(json({{"run_id", run_id}}).dump(), "application/json");
 
@@ -476,6 +485,13 @@ int main(int argc, char* argv[]) {
               << "  ║     Press Ctrl+C to stop              ║\n"
               << "  ╚═══════════════════════════════════════╝\n\n";
 
-    svr.listen("0.0.0.0", port);
+    svr.listen("127.0.0.1", port);
+
+    // Join all background threads on shutdown
+    {
+        std::lock_guard<std::mutex> lk(streams_mu);
+        for (auto& t : run_threads)
+            if (t.joinable()) t.join();
+    }
     return 0;
 }

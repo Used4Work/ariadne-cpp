@@ -512,6 +512,7 @@ struct Step {
     double                   timeout_sec = 30.0;
     OnError                  on_error    = OnError::FAIL;
     json                     fallback    = nullptr;
+    std::string              fallback_model;   ///< 失败时用此模型重试（空=不重试）
     std::string              description;
     ModelTier                model_tier  = ModelTier::SUBAGENT;
     // ── LLM step extensions ──────────────────────────────
@@ -535,9 +536,11 @@ struct TraceEntry {
     std::string step_id;
     std::string step_type;    // "tool" | "llm" | "transform" | "condition"
     std::string status;       // "ok" | "failed" | "skipped" | "fallback"
-    std::string provider;     // 哪个 provider 处理的（仅 llm 步骤）
+    std::string provider;
     long        duration_ms = 0;
-    std::string error;        // 失败时填写
+    std::string error;
+    long        input_tokens  = 0;  ///< LLM 步骤的 prompt token 数
+    long        output_tokens = 0;  ///< LLM 步骤的 completion token 数
 };
 
 struct WorkflowState {
@@ -900,6 +903,7 @@ struct WorkflowResult {
     std::vector<ProviderStats> provider_stats;
 
     TokenUsage                 token_usage;
+    json                       partial_outputs;  ///< 部分成功时的中间结果
 
     bool        has_output() const { return !output.is_null() && !output.empty(); }
     std::string summary()    const;
@@ -1196,10 +1200,23 @@ public:
     void add_output_guardrail(GuardrailFn fn);
     void add_tool_guardrail(const std::string& tool_name, GuardrailFn fn);
 
+    /** 直接 LLM 调用（跳过 Planner，用于单步执行） */
+    std::string llm_complete(const std::string& prompt,
+                              const std::string& system = "",
+                              ModelTier tier = ModelTier::SUBAGENT,
+                              double temperature = 0.0);
+
     /** 计划缓存控制 */
     void enable_plan_cache(bool on = true) { cache_enabled_ = on; }
     PlanCache::Stats plan_cache_stats() const { return plan_cache_.stats(); }
     void clear_plan_cache() { plan_cache_.clear(); }
+
+    /** LLM 响应缓存控制 */
+    void enable_response_cache(bool on = true) { llm_->enable_response_cache(on); }
+    long response_cache_hits() const { return llm_->response_cache_hits(); }
+
+    /** MCP 工具注册（通过子进程连接 MCP 服务器，自动发现并注册工具） */
+    void connect_mcp(const std::string& command, const std::vector<std::string>& args = {});
 
 private:
     EngineConfig                      config_;
@@ -1215,6 +1232,7 @@ private:
     bool                              has_deadline_ = false;
     PlanCache                         plan_cache_;
     bool                              cache_enabled_ = true;
+    std::vector<std::unique_ptr<McpClient>> mcp_clients_;
     std::vector<GuardrailFn>          input_guardrails_;
     std::vector<GuardrailFn>          output_guardrails_;
     std::map<std::string, std::vector<GuardrailFn>> tool_guardrails_;

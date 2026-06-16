@@ -45,7 +45,7 @@ jobs:
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DARIADNE_BUILD_TESTS=ON -DARIADNE_BUILD_EXAMPLES=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DARIADNE_BUILD_TESTS=ON -DARIADNE_BUILD_EXAMPLES=OFF -DARIADNE_BUILD_STUDIO=ON
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
@@ -56,7 +56,8 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$root/scripts/buildsystems/vcpkg.cmake" `
             -DVCPKG_TARGET_TRIPLET=x64-windows-static `
             -DARIADNE_BUILD_TESTS=ON `
-            -DARIADNE_BUILD_EXAMPLES=OFF
+            -DARIADNE_BUILD_EXAMPLES=OFF `
+            -DARIADNE_BUILD_STUDIO=ON
 
       - name: Build
         run: cmake --build build --config Release --parallel 4

@@ -127,7 +127,7 @@ function exportJSON(){const steps=d2s(editor.export());const blob=new Blob([JSON
 function showModal(h){document.getElementById('modal-content').innerHTML=h;document.getElementById('modal-overlay').classList.add('active')}
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
 document.getElementById('modal-overlay').addEventListener('click',e=>{if(e.target.id==='modal-overlay')closeModal()});
-(async()=>{try{const r=await fetch('/api/tools');const tools=await r.json();const el=document.getElementById('tool-list');if(!tools.length){el.textContent='(none)';return}el.innerHTML=tools.map(t=>`<div style="padding:2px 0">${t.name}</div>`).join('')}catch(e){}})();
+(async()=>{try{const r=await fetch('/api/tools');const tools=await r.json();const el=document.getElementById('tool-list');el.textContent='';if(!tools.length){el.textContent='(none)';return}tools.forEach(t=>{const d=document.createElement('div');d.style.cssText='padding:2px 0';d.textContent=t.name;el.appendChild(d)})}catch(e){}})();
 </script>
 </body>
 </html>
