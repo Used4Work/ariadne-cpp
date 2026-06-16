@@ -68,9 +68,12 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg1);color:var
     <button class="btn" onclick="showLoadModal()">Load</button>
     <button class="btn" onclick="showTemplates()">Templates</button>
     <button class="btn" onclick="exportJSON()">Export</button>
+    <button class="btn" onclick="importJSON()">Import</button>
     <div class="sep"></div>
     <button class="btn danger" onclick="editor.clear()">Clear</button>
     <div style="flex:1"></div>
+    <span style="font-size:11px;color:#666" id="node-count">0 nodes</span>
+    <div class="sep"></div>
     <span style="font-size:11px;color:#666" id="status-text">Ready</span>
   </div>
   <div class="palette">
@@ -124,9 +127,13 @@ async function loadWF(id){try{const r=await fetch('/api/workflows/'+id);const j=
 async function showTemplates(){try{const r=await fetch('/api/templates');const ts=await r.json();const c=document.createElement('div');const tt=document.createElement('h2');tt.textContent='Templates';c.appendChild(tt);for(const t of ts){const d=document.createElement('div');d.className='tcard';d.addEventListener('click',()=>loadTpl(t.id));const h=document.createElement('h4');h.textContent=t.name;const p=document.createElement('p');p.textContent=t.description;d.appendChild(h);d.appendChild(p);c.appendChild(d)}const btn=document.createElement('button');btn.className='btn';btn.textContent='Cancel';btn.addEventListener('click',closeModal);c.appendChild(document.createElement('br'));c.appendChild(btn);document.getElementById('modal-content').innerHTML='';document.getElementById('modal-content').appendChild(c);document.getElementById('modal-overlay').classList.add('active')}catch(e){log('Templates failed','err')}}
 async function loadTpl(id){try{const r=await fetch('/api/templates/'+id);const j=await r.json();editor.import(j.drawflow);log('Template: '+j.name,'ok');closeModal()}catch(e){log('Template failed','err')}}
 function exportJSON(){const steps=d2s(editor.export());const blob=new Blob([JSON.stringify({steps},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='workflow.json';a.click();log('Exported '+steps.length+' steps','ok')}
+function importJSON(){const inp=document.createElement('input');inp.type='file';inp.accept='.json';inp.addEventListener('change',async e=>{const file=e.target.files[0];if(!file)return;try{const text=await file.text();const j=JSON.parse(text);if(j.drawflow){editor.import(j.drawflow);log('Imported workflow (Drawflow format)','ok')}else if(j.steps){log('Imported '+j.steps.length+' steps (Ariadne format). Use Templates to load.','info')}else{log('Unknown format','warn')}}catch(err){log('Import error: '+err.message,'err')}});inp.click()}
 function showModal(h){document.getElementById('modal-content').innerHTML=h;document.getElementById('modal-overlay').classList.add('active')}
 function closeModal(){document.getElementById('modal-overlay').classList.remove('active')}
 document.getElementById('modal-overlay').addEventListener('click',e=>{if(e.target.id==='modal-overlay')closeModal()});
+function updateNodeCount(){const data=editor.export();const nodes=data.drawflow?.Home?.data;const n=nodes?Object.keys(nodes).length:0;document.getElementById('node-count').textContent=n+' node'+(n!==1?'s':'')}
+editor.on('nodeCreated',updateNodeCount);editor.on('nodeRemoved',updateNodeCount);
+document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'||e.target.tagName==='TEXTAREA'||e.target.tagName==='SELECT')return;if(e.ctrlKey&&e.key==='s'){e.preventDefault();saveWorkflow()}else if(e.ctrlKey&&e.key==='r'){e.preventDefault();runWorkflow()}else if(e.key==='Delete'){const sel=editor.node_selected;if(sel){editor.removeNodeId('node-'+sel);log('Deleted node #'+sel,'info')}}});
 (async()=>{try{const r=await fetch('/api/tools');const tools=await r.json();const el=document.getElementById('tool-list');el.textContent='';if(!tools.length){el.textContent='(none)';return}tools.forEach(t=>{const d=document.createElement('div');d.style.cssText='padding:2px 0';d.textContent=t.name;el.appendChild(d)})}catch(e){}})();
 </script>
 </body>

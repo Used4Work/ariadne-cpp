@@ -985,6 +985,49 @@ void test_provider_factories_new() {
     ASSERT(m.max_rps == 1.0);
 }
 
+// ── InterruptError ───────────────────────────────────────
+void test_interrupt_error_type() {
+    try {
+        throw InterruptError("step_3", "needs approval", {{"partial", true}});
+    } catch (const AriadneError& e) {
+        ASSERT(std::string(e.what()).find("step_3") != std::string::npos);
+    }
+    // Verify fields
+    InterruptError err("s1", "review needed", {{"output", 42}});
+    ASSERT(err.step_id == "s1");
+    ASSERT(err.reason_ == "review needed");
+    ASSERT(err.state_snapshot["output"] == 42);
+}
+
+void test_interrupt_in_executor() {
+    auto orc = std::make_unique<MockProvider>("llm out");
+    auto sub = std::make_unique<MockProvider>("sub out");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    tools.register_tool({"echo","",{},{}}, [](const json& p)->json{ return p; });
+    WorkflowExecutor exec(client, tools);
+    WorkflowPlan plan{"int_test", {
+        {"s1", StepType::TOOL, "echo", {{"x",1}}, {}, 0, 30, OnError::FAIL},
+        {"s2", StepType::LLM, "Summarize", {}, {"s1"}, 0, 30, OnError::FAIL},
+    }};
+    // Interrupt at s2 (after s1 completes)
+    bool interrupted = false;
+    try {
+        exec.execute(plan, {{"task","test"}}, nullptr,
+            [](const Step& s, const WorkflowState& st) -> std::optional<std::string> {
+                if (s.id == "s2") return std::string("needs human review");
+                return std::nullopt;
+            });
+    } catch (const InterruptError& e) {
+        interrupted = true;
+        ASSERT(e.step_id == "s2");
+        ASSERT(e.state_snapshot.contains("step_outputs"));
+        // s1 should be in the state snapshot
+        ASSERT(e.state_snapshot["step_outputs"].contains("s1"));
+    }
+    ASSERT(interrupted);
+}
+
 // ── Engine call_tool ─────────────────────────────────────
 void test_engine_call_tool() {
     auto orc = std::make_unique<MockProvider>("ok");
@@ -1106,6 +1149,9 @@ int main() {
 
     std::cout<<"\n=== Provider Factories ===\n";
     RUN(test_provider_factories_new);
+
+    std::cout<<"\n=== Human-in-the-loop ===\n";
+    RUN(test_interrupt_error_type); RUN(test_interrupt_in_executor);
 
     std::cout<<"\n=== Engine call_tool ===\n";
     RUN(test_engine_call_tool);

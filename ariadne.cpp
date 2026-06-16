@@ -758,7 +758,8 @@ WorkflowExecutor::WorkflowExecutor(LLMClient& llm, ToolRegistry& tools, size_t m
 
 WorkflowState WorkflowExecutor::execute(const WorkflowPlan& plan,
                                          const json& task_input,
-                                         CancelToken cancel) const {
+                                         CancelToken cancel,
+                                         StepInterruptFn interrupt) const {
     WorkflowState state;
     state.task_input = task_input;
 
@@ -775,6 +776,13 @@ WorkflowState WorkflowExecutor::execute(const WorkflowPlan& plan,
         std::vector<std::pair<Step, std::future<FutResult>>> futs;
 
         for (const auto& step : batch) {
+            // Human-in-the-loop: interrupt check before each step
+            if (interrupt) {
+                auto reason = interrupt(step, state);
+                if (reason) {
+                    throw InterruptError(step.id, *reason, state.to_json());
+                }
+            }
             // CONDITION 分支控制：如果任意依赖的 CONDITION 步骤返回 false，跳过此步骤
             bool blocked = false;
             for (const auto& dep : step.depends_on) {
@@ -1316,7 +1324,7 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
         }
         if (has_deadline_ && std::chrono::steady_clock::now() >= deadline_)
             throw WorkflowCancelledError("Workflow deadline exceeded");
-        auto state    = executor_->execute(plan, {{"task", task}}, cancel_);
+        auto state    = executor_->execute(plan, {{"task", task}}, cancel_, interrupt_hook_);
 
         auto leaves = plan.leaf_steps();
         if (leaves.size() == 1)
@@ -2438,7 +2446,7 @@ void WorkflowEngine::connect_mcp(const std::string& command,
                                    const std::vector<std::string>& args) {
     auto transport = std::make_unique<StdioTransport>(command, args);
     auto client = std::make_unique<McpClient>(std::move(transport));
-    client->initialize("ariadne", "0.5.0");
+    client->initialize("ariadne", "0.6.0");
     client->register_all_tools(*tools_);
     std::cout << "[mcp] Connected to " << command << ", registered "
               << client->list_tools().size() << " tools\n";

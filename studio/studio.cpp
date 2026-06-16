@@ -207,9 +207,25 @@ static json get_templates() {
 // ════════════════════════════════════════════════════════════════
 
 int main(int argc, char* argv[]) {
-    // Parse port from command line
+    // Port resolution: CLI arg > env var > default 8080
     int port = 8080;
-    if (argc > 1) port = std::atoi(argv[1]);
+    if (argc > 1) {
+        std::string arg = argv[1];
+        if (arg == "--help" || arg == "-h") {
+            std::cout << "Usage: ariadne-studio [port]\n"
+                      << "  port: HTTP port (default: 8080, or ARIADNE_PORT env var)\n"
+                      << "  --help: show this message\n";
+            return 0;
+        }
+        port = std::atoi(argv[1]);
+    } else {
+        const char* env_port = std::getenv("ARIADNE_PORT");
+        if (env_port) port = std::atoi(env_port);
+    }
+    if (port < 1 || port > 65535) {
+        std::cerr << "[studio] Invalid port: " << port << ". Using 8080.\n";
+        port = 8080;
+    }
 
     // Load API key
     const char* key = std::getenv("GITHUB_TOKEN");
@@ -425,12 +441,14 @@ int main(int argc, char* argv[]) {
 
                     auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
-                    stream->send("complete", {
+                    json completion = {
                         {"summary", std::to_string(plan.steps.size()) + " steps, " +
                                     std::to_string(total_ms) + "ms"},
                         {"duration_ms", total_ms},
-                        {"success", true}
-                    });
+                        {"success", true},
+                        {"step_count", (int)plan.steps.size()}
+                    };
+                    stream->send("complete", completion);
                 } catch (const std::exception& e) {
                     stream->send("complete", {{"summary", "Failed: " + std::string(e.what())},
                         {"success", false}, {"error", e.what()}});
@@ -495,15 +513,72 @@ int main(int argc, char* argv[]) {
         }
     });
 
-    // ── Start Server ──────────────────────────────────
-    std::cout << "\n"
-              << "  ╔═══════════════════════════════════════╗\n"
-              << "  ║     ARIADNE STUDIO                    ║\n"
-              << "  ║     http://localhost:" << port << "              ║\n"
-              << "  ║     Press Ctrl+C to stop              ║\n"
-              << "  ╚═══════════════════════════════════════╝\n\n";
+    // ── Health endpoint ───────────────────────────────
+    svr.Get("/api/health", [&](const httplib::Request&, httplib::Response& res) {
+        json h = {{"status", "ok"}, {"engine", engine != nullptr}, {"port", port}};
+        if (engine) {
+            h["tools"] = (int)engine->list_tools().size();
+        }
+        res.set_content(h.dump(), "application/json");
+    });
 
-    svr.listen("127.0.0.1", port);
+    // ── Workflow Import ──────────────────────────────
+    svr.Post("/api/import", [&](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto body = json::parse(req.body);
+            // Accept both raw {steps:[...]} and {drawflow:{...}} formats
+            if (body.contains("steps")) {
+                auto plan = convert_steps(body["steps"]);
+                validate_dag(plan);
+                res.set_content(json({{"ok", true},
+                    {"step_count", (int)plan.steps.size()}}).dump(), "application/json");
+            } else {
+                res.set_content(json({{"ok", true}}).dump(), "application/json");
+            }
+        } catch (const std::exception& e) {
+            res.status = 400;
+            res.set_content(json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    // ── Start Server (auto-retry on port conflict) ───
+    constexpr int MAX_PORT_RETRIES = 10;
+    int actual_port = port;
+    bool bound = false;
+    for (int i = 0; i < MAX_PORT_RETRIES; ++i) {
+        actual_port = port + i;
+        if (actual_port > 65535) break;
+
+        // cpp-httplib: set_address_family before bind
+        auto bound_ok = svr.bind_to_port("127.0.0.1", actual_port);
+        if (bound_ok) {
+            bound = true;
+            break;
+        }
+        if (i == 0)
+            std::cerr << "[studio] Port " << actual_port << " in use, trying alternatives...\n";
+    }
+
+    if (!bound) {
+        std::cerr << "[studio] ERROR: Could not bind to any port in range "
+                  << port << "-" << (port + MAX_PORT_RETRIES - 1) << "\n";
+        return 1;
+    }
+
+    // Dynamic banner with correct alignment
+    std::string url = "http://localhost:" + std::to_string(actual_port);
+    int pad = 37 - (int)url.size();
+    if (pad < 0) pad = 0;
+    std::cout << "\n"
+              << "  +=======================================+\n"
+              << "  |     ARIADNE STUDIO                    |\n"
+              << "  |     " << url << std::string(pad, ' ') << "|\n";
+    if (actual_port != port)
+        std::cout << "  |     (requested " << port << ", using " << actual_port << ")           |\n";
+    std::cout << "  |     Press Ctrl+C to stop              |\n"
+              << "  +=======================================+\n\n";
+
+    svr.listen_after_bind();
 
     // Join all background threads on shutdown
     {

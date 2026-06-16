@@ -96,6 +96,19 @@ class TokenBudgetError : public AriadneError {
     using AriadneError::AriadneError;
 };
 
+/** Human-in-the-loop 中断 — 抛出此异常暂停执行 */
+class InterruptError : public AriadneError {
+public:
+    InterruptError(std::string step_id, std::string reason, json state_snapshot)
+        : AriadneError("Interrupted at step '" + step_id + "': " + reason)
+        , step_id(std::move(step_id))
+        , reason_(std::move(reason))
+        , state_snapshot(std::move(state_snapshot)) {}
+    std::string step_id;
+    std::string reason_;
+    json state_snapshot;
+};
+
 /** Guardrail 验证函数：返回 nullopt=通过，或 string=错误原因 */
 using GuardrailFn = std::function<std::optional<std::string>(const json&)>;
 
@@ -841,11 +854,14 @@ private:
 
 class WorkflowExecutor {
 public:
+    using StepInterruptFn = std::function<std::optional<std::string>(const Step&, const WorkflowState&)>;
+
     WorkflowExecutor(LLMClient& llm, ToolRegistry& tools, size_t max_threads = 0,
                       std::shared_ptr<IMetricsCollector> metrics = nullptr);
     WorkflowState execute(const WorkflowPlan& plan,
                            const json& task_input,
-                           CancelToken cancel = nullptr) const;
+                           CancelToken cancel = nullptr,
+                           StepInterruptFn interrupt = nullptr) const;
     /** Used by run_stream to execute non-final steps */
     json run_step_pub(const Step& s, const WorkflowState& st, std::vector<TraceEntry>& tr) const {
         return run_step(s, st, tr);
@@ -1308,6 +1324,11 @@ public:
     /** Checkpointing — 设置存储后端，每步自动保存 */
     void set_checkpoint_store(std::shared_ptr<ICheckpointStore> store) { checkpoint_store_ = std::move(store); }
 
+    /** Human-in-the-loop 中断回调 — 在每个步骤执行前调用
+     *  返回 nullopt=继续, string=暂停原因 (抛出 InterruptError) */
+    using InterruptFn = std::function<std::optional<std::string>(const Step& step, const WorkflowState& state)>;
+    void set_interrupt_hook(InterruptFn fn) { interrupt_hook_ = std::move(fn); }
+
 private:
     EngineConfig                      config_;
     std::unique_ptr<LLMClient>        llm_;
@@ -1328,6 +1349,7 @@ private:
     std::vector<GuardrailFn>          output_guardrails_;
     std::map<std::string, std::vector<GuardrailFn>> tool_guardrails_;
     std::shared_ptr<ICheckpointStore> checkpoint_store_;
+    InterruptFn interrupt_hook_;
 
     WorkflowResult run_internal(const std::string& task, WorkflowContext* ctx);
 };
