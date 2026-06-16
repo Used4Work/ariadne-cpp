@@ -241,18 +241,28 @@ struct ProviderConfig {
     double       timeout_sec      = 60.0;
     std::string  completions_path = "";   // 空 = /v1/chat/completions
     double       max_rps          = 0.0;  // 每秒最大请求数；0=不限速
+    ModelPricing pricing;                 // 自动成本追踪
 
     static ProviderConfig anthropic(const std::string& key,
                                      const std::string& model = "claude-opus-4-8") {
-        return {ProviderType::ANTHROPIC, key, model, "", 4096, 60.0, ""};
+        ProviderConfig c{ProviderType::ANTHROPIC, key, model, "", 4096, 60.0, ""};
+        c.pricing = (model.find("opus") != std::string::npos) ? ModelPricing::claude_opus() :
+                    ModelPricing::claude_sonnet();
+        return c;
     }
     static ProviderConfig openai_chat(const std::string& key,
                                        const std::string& model = "gpt-4o") {
-        return {ProviderType::OPENAI_CHAT, key, model, "", 4096, 60.0, ""};
+        ProviderConfig c{ProviderType::OPENAI_CHAT, key, model, "", 4096, 60.0, ""};
+        c.pricing = (model.find("mini") != std::string::npos) ? ModelPricing::gpt4o_mini() :
+                    ModelPricing::gpt4o();
+        return c;
     }
     static ProviderConfig openai_responses(const std::string& key,
                                             const std::string& model = "gpt-4o") {
-        return {ProviderType::OPENAI_RESPONSES, key, model, "", 4096, 60.0, ""};
+        ProviderConfig c{ProviderType::OPENAI_RESPONSES, key, model, "", 4096, 60.0, ""};
+        c.pricing = (model.find("mini") != std::string::npos) ? ModelPricing::gpt4o_mini() :
+                    ModelPricing::gpt4o();
+        return c;
     }
     static ProviderConfig openai_compatible(const std::string& key,
                                              const std::string& base_url,
@@ -264,7 +274,7 @@ struct ProviderConfig {
     }
     static ProviderConfig github_models(const std::string& token,
                                          const std::string& model = "openai/gpt-4o-mini",
-                                         double max_rps = 0.1) {  // 6 RPM per tier (safe under GH Models limits)  // 15 RPM default
+                                         double max_rps = 0.1) {
         ProviderConfig c;
         c.type             = ProviderType::OPENAI_CHAT;
         c.api_key          = token;
@@ -272,6 +282,7 @@ struct ProviderConfig {
         c.base_url         = "https://models.github.ai/inference";
         c.completions_path = "/chat/completions";
         c.max_rps          = max_rps;
+        c.pricing          = ModelPricing::free();
         return c;
     }
     /** Groq free tier: 30 RPM = 0.5 RPS */

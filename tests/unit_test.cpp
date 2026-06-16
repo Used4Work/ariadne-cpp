@@ -1194,6 +1194,24 @@ void test_token_usage_cost() {
     ASSERT(a.cost_usd > 0.0029 && a.cost_usd < 0.0031);
 }
 
+// ── Provider Auto-Pricing ────────────────────────────────
+void test_provider_auto_pricing() {
+    auto a = ProviderConfig::anthropic("key", "claude-opus-4-8");
+    ASSERT(a.pricing.input_per_1m == 15.0);  // opus pricing
+
+    auto s = ProviderConfig::anthropic("key", "claude-sonnet-4-6");
+    ASSERT(s.pricing.input_per_1m == 3.0);  // sonnet pricing
+
+    auto o = ProviderConfig::openai_chat("key", "gpt-4o");
+    ASSERT(o.pricing.input_per_1m == 2.50);
+
+    auto m = ProviderConfig::openai_chat("key", "gpt-4o-mini");
+    ASSERT(m.pricing.input_per_1m == 0.15);
+
+    auto g = ProviderConfig::github_models("tok");
+    ASSERT(g.pricing.input_per_1m == 0.0);  // free tier
+}
+
 // ── AdaptiveOrchestrator Types ───────────────────────────
 void test_orchestrator_strategy_enum() {
     ASSERT(OrchestratorStrategy::SIMPLE_DAG != OrchestratorStrategy::AGENT_LOOP);
@@ -1353,6 +1371,9 @@ int main() {
 
     std::cout<<"\n=== Cost Tracking ===\n";
     RUN(test_model_pricing); RUN(test_token_usage_cost);
+
+    std::cout<<"\n=== Provider Auto-Pricing ===\n";
+    RUN(test_provider_auto_pricing);
 
     std::cout<<"\n=== Adaptive Orchestrator ===\n";
     RUN(test_orchestrator_strategy_enum); RUN(test_orchestrator_plan_struct);

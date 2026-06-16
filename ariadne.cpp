@@ -32,14 +32,27 @@ size_t HttpProvider::write_cb(char* p, size_t s, size_t n, void* u) {
     return s * n;
 }
 
+static std::string generate_idempotency_key() {
+    static thread_local std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<uint64_t> dist;
+    uint64_t a = dist(rng), b = dist(rng);
+    char buf[40];
+    snprintf(buf, sizeof(buf), "%016llx-%016llx",
+             (unsigned long long)a, (unsigned long long)b);
+    return buf;
+}
+
 HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
                                                     const std::vector<std::string>& hdrs,
                                                     const std::string& body) const {
-    CurlHandle curl;  // 每次请求独立 handle，线程安全
+    CurlHandle curl;
     CURL* c = curl.get();
     HttpResponse resp;
     struct curl_slist* h = nullptr;
     for (const auto& s : hdrs) h = curl_slist_append(h, s.c_str());
+    // Idempotency key — prevents double-billing on retried requests
+    auto idem_key = "Idempotency-Key: " + generate_idempotency_key();
+    h = curl_slist_append(h, idem_key.c_str());
     curl_easy_setopt(c, CURLOPT_URL,           url.c_str());
     curl_easy_setopt(c, CURLOPT_HTTPHEADER,    h);
     curl_easy_setopt(c, CURLOPT_POSTFIELDS,    body.c_str());
@@ -79,17 +92,19 @@ static void extract_token_usage(const json& j) {
 std::string AnthropicProvider::complete(const std::string& prompt,
                                           const std::string& sys,
                                           double temp,
-                                          bool /*force_json*/,
+                                          bool force_json,
                                           const json& /*output_schema*/) const {
     json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
                   {"temperature", temp},
                   {"messages", {{{"role","user"}, {"content", prompt}}}}};
     if (!sys.empty()) body["system"] = sys;
+    if (force_json)
+        body["response_format"] = {{"type", "json_object"}};
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
     auto resp = http_post(base + "/v1/messages",
         {"Content-Type: application/json",
          "x-api-key: " + cfg_.api_key,
-         "anthropic-version: 2023-06-01"},
+         "anthropic-version: 2024-10-22"},
         body.dump());
     if (resp.status_code == 429)
         throw ProviderError("Anthropic: 429 Too Many Requests");
@@ -285,7 +300,10 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                 auto res = slot.provider->complete(prompt, system, temperature, force_json, output_schema);
                 slot.breaker.on_success();
                 { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
-                { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
+                {
+                    std::lock_guard<std::mutex> lk(usage_mu_);
+                    cumulative_usage_ += g_last_token_usage;
+                }
                 if (resp_cache_enabled_ && response_cache_ && !cache_key.empty())
                     response_cache_->put(cache_key, res);
                 return res;
@@ -303,9 +321,10 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                         slot.provider->provider_name() + ": fatal error — " + emsg);
                 } else if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
                     int backoff_sec = 3 * (1 << rate_retry);  // 3s, 6s, 12s
-                    std::cerr << "[RATE_LIMIT] " << slot.provider->provider_name()
-                              << " retry " << (rate_retry+1) << "/" << MAX_RATE_RETRIES
-                              << ", backoff " << backoff_sec << "s\n";
+                    log_msg(LogLevel::LOG_WARN, "LLMClient",
+                        slot.provider->provider_name() + " rate limited, retry "
+                        + std::to_string(rate_retry+1) + "/" + std::to_string(MAX_RATE_RETRIES)
+                        + ", backoff " + std::to_string(backoff_sec) + "s");
                     std::this_thread::sleep_for(std::chrono::seconds(backoff_sec));
                     continue;
                 } else {
@@ -639,15 +658,15 @@ std::string WorkflowContext::to_prompt_prefix() const {
 
 json WorkflowPlanner::extract_json(const std::string& text) {
     try { return json::parse(text); } catch (const std::exception& e) {
-        std::cerr << "[extract_json] direct parse failed: " << e.what() << "\n";
+        log_msg(LogLevel::LOG_DEBUG, "Planner", std::string("direct parse failed: ") + e.what());
     }
     std::regex fence(R"(```(?:json)?\s*([\s\S]+?)\s*```)"); std::smatch m;
     if (std::regex_search(text, m, fence)) try { return json::parse(m[1].str()); } catch (const std::exception& e) {
-        std::cerr << "[extract_json] fence parse failed: " << e.what() << "\n";
+        log_msg(LogLevel::LOG_DEBUG, "Planner", std::string("fence parse failed: ") + e.what());
     }
     std::regex obj(R"(\{[\s\S]+\})");
     if (std::regex_search(text, m, obj)) try { return json::parse(m[0].str()); } catch (const std::exception& e) {
-        std::cerr << "[extract_json] regex parse failed: " << e.what() << "\n";
+        log_msg(LogLevel::LOG_DEBUG, "Planner", std::string("regex parse failed: ") + e.what());
     }
     throw PlanningError("Cannot extract JSON from LLM response: " + text.substr(0, 300));
 }
@@ -948,9 +967,10 @@ json WorkflowExecutor::exec_llm(const Step& s, const json& in) const {
                 auto violations = validate_json_schema(result, s.output_schema);
                 if (!violations.empty()) {
                     // 记录违规但不抛异常（LLM 输出的容错性）
-                    std::cerr << "[schema] Step '" << s.id << "' violations:\n";
+                    std::string viol_msg = "Step '" + s.id + "' schema violations:";
                     for (const auto& v : violations)
-                        std::cerr << "  " << v.path << ": " << v.message << "\n";
+                        viol_msg += " " + v.path + "=" + v.message + ";";
+                    log_msg(LogLevel::LOG_WARN, "Executor", viol_msg);
                 }
             }
             auto llm_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2057,7 +2077,7 @@ ProviderAutoPlanner::build_plan(const std::vector<ProbeResult>& results,
     if (strong_v.empty()) {
         plan.success = false;
         plan.error   = "No providers responded";
-        std::cerr << "[" << prefix << "] ERROR: " << plan.error << "\n";
+        log_msg(LogLevel::LOG_ERROR, "AutoPlanner", prefix + ": " + plan.error);
         return plan;
     }
 
