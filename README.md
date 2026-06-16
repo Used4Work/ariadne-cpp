@@ -80,11 +80,8 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 using namespace ariadne;
 
 int main() {
-    // Setup with fallback
-    auto primary = ProviderConfig::github_models(token);       // free
-    auto fallback = ProviderConfig::llm7("deepseek-v3-0324");  // free, no signup
-    TierConfig tier{primary, {fallback}, 3, 60.0};
-    WorkflowEngine engine(EngineConfig::with_fallbacks(tier, tier));
+    // One-line setup (convenience constructor)
+    WorkflowEngine engine(ProviderConfig::github_models(token));
 
     // Register tools
     engine.register_tool({"web_search","Search the web",

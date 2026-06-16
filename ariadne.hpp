@@ -1406,6 +1406,14 @@ class WorkflowEngine {
 public:
     explicit WorkflowEngine(const EngineConfig& config);
 
+    /** 便利构造器 — 单 provider，一行创建 engine */
+    explicit WorkflowEngine(const ProviderConfig& provider)
+        : WorkflowEngine(EngineConfig::from_single(provider)) {}
+
+    /** 便利构造器 — 双 provider（orchestrator + subagent） */
+    WorkflowEngine(const ProviderConfig& orchestrator, const ProviderConfig& subagent)
+        : WorkflowEngine(EngineConfig::from_two(orchestrator, subagent)) {}
+
     void           register_tool(const ToolDef& def, ToolFn fn);
 
     /** 单次运行，无记忆 */

@@ -1375,6 +1375,72 @@ void test_orchestrator_result_struct() {
     ASSERT(result.log.size() == 2);
 }
 
+// ── Convenience Constructor ──────────────────────────────
+void test_engine_single_provider() {
+    auto cfg = ProviderConfig::openai_compatible("test", "http://localhost:1", "mock");
+    WorkflowEngine engine(cfg);
+    ASSERT(engine.list_tools().empty());
+}
+
+void test_engine_dual_provider() {
+    auto orc = ProviderConfig::openai_compatible("t", "http://localhost:1", "orc");
+    auto sub = ProviderConfig::openai_compatible("t", "http://localhost:1", "sub");
+    WorkflowEngine engine(orc, sub);
+    ASSERT(engine.list_tools().empty());
+}
+
+// ── Integration: MockProvider DAG ────────────────────────
+void test_integration_mock_dag() {
+    auto orc = std::make_unique<MockProvider>(
+        R"({"steps":[{"id":"s1","type":"tool","action":"echo","inputs":{"x":1},"depends_on":[]},
+            {"id":"s2","type":"llm","action":"Summarize","inputs":{},"depends_on":["s1"]}]})");
+    auto sub = std::make_unique<MockProvider>("summary result");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    tools.register_tool({"echo","",{},{}}, [](const json& p)->json{ return p; });
+    WorkflowExecutor exec(client, tools);
+    WorkflowPlan plan{"int_test", {
+        {"s1", StepType::TOOL, "echo", {{"x",42}}, {}, 0, 30, OnError::FAIL},
+        {"s2", StepType::LLM, "Summarize", {{"data","$s1"}}, {"s1"}, 0, 30, OnError::FAIL},
+    }};
+    auto state = exec.execute(plan, {{"task","test"}});
+    ASSERT(state.step_outputs.count("s1"));
+    ASSERT(state.step_outputs["s1"]["x"] == 42);
+    ASSERT(state.step_outputs.count("s2"));
+    ASSERT(state.traces.size() == 2);
+}
+
+// ── Integration: DynamicWorkflow parallel ────────────────
+void test_integration_dynamic_parallel() {
+    auto orc = std::make_unique<MockProvider>("mock llm");
+    auto sub = std::make_unique<MockProvider>("mock sub");
+    LLMClient client(std::move(orc), std::move(sub));
+    ToolRegistry tools;
+    tools.register_tool({"add","",{},{}},
+        [](const json& p)->json{ return p["a"].get<int>() + p["b"].get<int>(); });
+    // Test DynamicWorkflow parallel primitive directly
+    ThreadPool pool(2);
+    std::vector<std::future<json>> futs;
+    futs.push_back(pool.submit([&]() -> json { return tools.call("add", {{"a",1},{"b",2}}); }));
+    futs.push_back(pool.submit([&]() -> json { return tools.call("add", {{"a",3},{"b",4}}); }));
+    std::vector<json> results;
+    for (auto& f : futs) results.push_back(f.get());
+    ASSERT(results[0] == 3);
+    ASSERT(results[1] == 7);
+}
+
+// ── Integration: Multimodal message construction ─────────
+void test_integration_multimodal_roundtrip() {
+    auto msg = ChatMessage::with_image("Describe", "AQID", "image/png");
+    ASSERT(msg.is_multimodal());
+    ASSERT(msg.content_parts.size() == 2);
+    // Verify it can serialize to JSON (as providers would)
+    json j = {{"role", msg.role}, {"content", msg.content_parts}};
+    ASSERT(j["content"].is_array());
+    ASSERT(j["content"][0]["type"] == "text");
+    ASSERT(j["content"][1]["type"] == "image_url");
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -1537,6 +1603,13 @@ int main() {
     std::cout<<"\n=== Adaptive Orchestrator ===\n";
     RUN(test_orchestrator_strategy_enum); RUN(test_orchestrator_plan_struct);
     RUN(test_orchestrator_result_struct);
+
+    std::cout<<"\n=== Convenience Constructor ===\n";
+    RUN(test_engine_single_provider); RUN(test_engine_dual_provider);
+
+    std::cout<<"\n=== Integration Tests ===\n";
+    RUN(test_integration_mock_dag); RUN(test_integration_dynamic_parallel);
+    RUN(test_integration_multimodal_roundtrip);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";
