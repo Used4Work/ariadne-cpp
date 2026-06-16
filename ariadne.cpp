@@ -12,6 +12,12 @@
 #include <iostream>
 #include <random>
 
+#ifndef _WIN32
+#include <unistd.h>
+#include <sys/wait.h>
+#include <signal.h>
+#endif
+
 namespace ariadne {
 
 // ════════════════════════════════════════════════════════════════
@@ -2126,10 +2132,6 @@ void StdioTransport::close() {
 }
 
 #else // POSIX
-
-#include <unistd.h>
-#include <sys/wait.h>
-#include <signal.h>
 
 StdioTransport::StdioTransport(const std::string& command, const std::vector<std::string>& args) {
     int stdin_pipe[2], stdout_pipe[2];
