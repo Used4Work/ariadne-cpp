@@ -2911,7 +2911,7 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
                     +  "Called: " + action.tool_name + "(" + action.tool_args.dump() + ")\n"
                     +  "Result: " + obs_str + "\n\n";
             // L2: Trim history if it exceeds 4000 chars (keep last 2/3)
-            if (history.size() > 4000) {
+            if (estimate_tokens(history) > 2000) {
                 auto cut = history.find("\n[iter ", history.size() / 3);
                 if (cut != std::string::npos) history = history.substr(cut);
             }
@@ -3097,7 +3097,7 @@ AgentResult WorkflowEngine::run_multi_agent(const std::string& task,
                     +  "Thought: " + action.thought + "\n"
                     +  "Called: " + action.tool_name + "(" + action.tool_args.dump() + ")\n"
                     +  "Result: " + obs_str + "\n\n";
-            if (history.size() > 4000) {
+            if (estimate_tokens(history) > 2000) {
                 auto cut = history.find("\n[iter ", history.size() / 3);
                 if (cut != std::string::npos) history = history.substr(cut);
             }

@@ -6,8 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(CURL REQUIRED)
 find_package(nlohmann_json 3.9 REQUIRED)
 
-option(ARIADNE_BUILD_TESTS    "Build unit tests"  ON)
-option(ARIADNE_BUILD_EXAMPLES "Build examples"    ON)
+# When included via add_subdirectory/FetchContent, disable extras by default
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(_ARIADNE_DEFAULT ON)
+else()
+    set(_ARIADNE_DEFAULT OFF)
+endif()
+option(ARIADNE_BUILD_TESTS    "Build unit tests"  ${_ARIADNE_DEFAULT})
+option(ARIADNE_BUILD_EXAMPLES "Build examples"    ${_ARIADNE_DEFAULT})
 
 # Compiler warnings — MSVC uses different flags than GCC/Clang
 if(MSVC)
@@ -41,7 +47,7 @@ if(ARIADNE_BUILD_TESTS)
 endif()
 
 # ── Ariadne Studio (visual workflow editor) ──────────────────────
-option(ARIADNE_BUILD_STUDIO "Build Ariadne Studio" ON)
+option(ARIADNE_BUILD_STUDIO "Build Ariadne Studio" ${_ARIADNE_DEFAULT})
 if(ARIADNE_BUILD_STUDIO)
     # Auto-download cpp-httplib if not present
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/httplib.h")

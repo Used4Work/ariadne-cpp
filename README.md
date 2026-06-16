@@ -8,72 +8,70 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-121%20passed-brightgreen)](#tests)
 
 </div>
 
-C++ LLM workflow orchestration. DAG planning, ReACT agent loops, auto-probe providers, circuit breakers, streaming, plan caching, guardrails, multi-agent handoffs.
+C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, native function calling (OpenAI + Anthropic), dynamic multi-agent orchestration, plan caching, circuit breakers, streaming, and a visual workflow editor.
 
-## Why C++ over LangChain?
+## Why C++?
 
 | | Ariadne C++ | LangChain Python |
 |---|---|---|
-| Process memory | **11 MB** | **~158 MB** |
-| Cold start | **~12 ms** | **~1 800 ms** |
-| DAG parallelism | ✓ automatic | requires LCEL |
-| Agent loops | ✓ | ✓ LangGraph |
-| Structured output | ✓ strict json_schema | ✓ |
-| Plan caching | ✓ LRU template cache | partial |
-| Token tracking | ✓ per-run | ✓ |
-| Guardrails | ✓ input/output/tool | ✓ |
-| Multi-agent handoffs | ✓ | ✓ LangGraph |
-| Exception types | ✓ hierarchy | ✓ |
+| Memory | **11 MB** | ~158 MB |
+| Cold start | **12 ms** | ~1800 ms |
+| Thread safety | Built-in (shared_mutex, atomics) | GIL-limited |
+| Native tools | OpenAI + Anthropic | OpenAI + Anthropic |
+| Dynamic orchestration | parallel/pipeline/loop_until | LCEL chains |
+| Auto strategy | AdaptiveOrchestrator (5 modes) | Manual selection |
 
 ## Features
 
-- **DAG workflows** — single-call planning, automatic topological parallelization
-- **ReACT agents** — iterative reasoning with convergence detection (auto-stops stuck loops)
-- **Multi-agent handoffs** — agents transfer control while sharing history
-- **Plan caching** — normalized-key LRU cache skips redundant planning (−50% cost per research)
-- **Strict structured output** — provider-level JSON schema enforcement (OpenAI json_schema)
-- **Guardrails** — input/output/tool validation hooks that abort on violation
-- **Token usage tracking** — per-run input/output/total exposed in results
-- **Cancellation & timeout** — `cancel()` and `set_deadline()` for runaway protection
-- **Circuit breakers + rate limiting** — per-provider fault tolerance with 429 handling
-- **Streaming** — SSE token delivery
-- **LLM response caching** — exact-match FNV-1a hash, LRU eviction, temperature-aware
-- **MCP client** — Model Context Protocol stdio transport, auto-discover and call remote tools
-- **Metrics** — pluggable `IMetricsCollector`, 7 event kinds emitted
+### Core Orchestration
+- **DAG workflows** -- single-call planning, automatic topological parallelization
+- **ReACT agents** -- iterative reasoning with convergence detection (LoopDetector)
+- **Native function calling** -- OpenAI `tools` API + Anthropic `tool_use` blocks (97-99% accuracy)
+- **Multi-agent handoffs** -- agents transfer control while sharing history
+- **AdaptiveOrchestrator** -- LLM auto-selects optimal strategy per task
 
+### Dynamic Workflow (Ultracode-level)
+- `parallel()` -- fan-out N tasks, barrier wait
+- `pipeline()` -- no-barrier item-by-item flow through stages
+- `map()` -- parallel map over collection
+- `loop_until()` -- dynamic loops with budget awareness
+- `fan_out_agents()` -- parallel ReACT agent spawning
+- `adversarial_verify()` -- multi-vote claim verification
 
-## Windows
+### Reliability
+- **8 providers** -- OpenAI, Anthropic, Groq, GitHub Models, Cerebras, SambaNova, Mistral, LLM7
+- **Circuit breakers** -- per-provider fault isolation (CLOSED/OPEN/HALF_OPEN)
+- **Rate limiting** -- token bucket per provider, configurable RPS
+- **429/5xx retry** -- exponential backoff with Retry-After header parsing
+- **Idempotency keys** -- auto-generated per request, prevents double-billing
+- **Token budget** -- enforcement with `TokenBudgetError` on exceed
 
-```powershell
-# 安装依赖（vcpkg，推荐）
-vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static
+### Observability
+- **Structured logging** -- `ILogger` interface, zero stdout/stderr by default
+- **Cost tracking** -- `ModelPricing` with auto-pricing per provider
+- **Metrics** -- pluggable `IMetricsCollector`, 10 event kinds
+- **Token estimation** -- `estimate_tokens()` heuristic
 
-# 构建
-cmake -B build ^
-  -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%\scripts\buildsystems\vcpkg.cmake ^
-  -DVCPKG_TARGET_TRIPLET=x64-windows-static ^
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release --parallel 4
+### Persistence
+- **Plan caching** -- NeurIPS 2025 APC pattern, context-aware LRU
+- **Response caching** -- FNV-1a hash, temperature-aware
+- **Checkpointing** -- `ICheckpointStore` / `FileCheckpointStore`
+- **Serialization** -- `WorkflowPlan::to_json()` / `from_json()`
 
-set GITHUB_TOKEN=ghp_...
-.\build\Release\example.exe dag
-```
+### Safety
+- **Guardrails** -- input/output/tool validation hooks
+- **Human-in-the-loop** -- `InterruptError` + `set_interrupt_hook()`
+- **Cancellation** -- `cancel()` + `set_deadline()`
+- **Thread-safe** -- `shared_mutex` on ToolRegistry, atomic flags
 
-或直接下载 [Releases](https://github.com/Used4Work/ariadne-cpp/releases) 里的预编译 `.lib` + 头文件。
-
-## Build
-
-```bash
-sudo apt install libcurl4-openssl-dev nlohmann-json3-dev cmake
-cmake -B build && cmake --build build --parallel 4
-export GITHUB_TOKEN=ghp_...
-./build/example dag
-./build/example agent
-./build/example probe
-```
+### Integration
+- **MCP client** -- Model Context Protocol (stdio transport, JSON-RPC 2.0)
+- **Ariadne Studio** -- visual workflow editor (localhost web UI)
+- **Streaming** -- SSE token delivery
 
 ## Quick Start
 
@@ -81,65 +79,104 @@ export GITHUB_TOKEN=ghp_...
 #include "ariadne.hpp"
 using namespace ariadne;
 
-// Auto-probe: finds fastest alive provider
-ProviderAutoPlanner planner;
-planner.add_candidate("claude", ProviderConfig::anthropic(key), "strong", 1);
-planner.add_candidate("groq",   ProviderConfig::openai_compatible(groq_key,
-    "https://api.groq.com/openai", "llama-3.3-70b-versatile"), "fast", 1);
-auto cfg = planner.probe_and_plan();
+int main() {
+    // Setup with fallback
+    auto primary = ProviderConfig::github_models(token);       // free
+    auto fallback = ProviderConfig::llm7("deepseek-v3-0324");  // free, no signup
+    TierConfig tier{primary, {fallback}, 3, 60.0};
+    WorkflowEngine engine(EngineConfig::with_fallbacks(tier, tier));
 
-WorkflowEngine engine(cfg.config);
-engine.register_tool({"web_search","Search",
-    {{"required",json::array({"query"})}},{}},
-    [](const json& p)->json{ /* impl */ return {}; });
+    // Register tools
+    engine.register_tool({"web_search","Search the web",
+        {{"required",json::array({"query"})}},{}},
+        [](const json& p)->json{ return {{"result","data"}}; });
 
-// DAG workflow (single-call planning, parallel execution)
-auto r1 = engine.run("Research Tesla Q4 revenue");
+    // 1. Adaptive orchestration (auto-selects best strategy)
+    AdaptiveOrchestrator orch(engine);
+    auto r = orch.run("Compare Tesla and BYD Q4 2025 sales");
+    // Auto: PARALLEL_RESEARCH -> fan_out 2 agents -> synthesize
 
-// ReACT agent with per-step callback
-auto r2 = engine.run_agent("Compare Tesla and BYD", 10,
-    [](const AgentStep& s){
-        std::cout << "[" << s.iteration << "] " << s.thought << "\n"; });
+    // 2. Native tool calling agent (97-99% accuracy)
+    auto agent_r = engine.run_agent_native("Research Tesla revenue", 10,
+        [](const AgentStep& s){ std::cout << s.thought << "\n"; });
 
-// Structured output (json_mode)
-Step s; s.json_mode = true;
-s.output_schema = {{"type","object"},{"properties",{{"revenue",{{"type","number"}}}}}};
+    // 3. Dynamic workflow
+    DynamicWorkflow dw(engine);
+    auto results = dw.fan_out_agents({"Search Tesla","Search BYD"}, 8);
+    auto verified = dw.adversarial_verify("Tesla leads EV market", 3);
 
-// Streaming
-engine.run_stream("Write summary", [](const std::string& c){ std::cout << c; });
+    // 4. Token budget
+    engine.set_token_budget(50000);  // throws TokenBudgetError on exceed
+
+    // 5. Structured logging
+    set_logger(std::make_shared<ConsoleLogger>(LogLevel::LOG_INFO));
+}
 ```
 
-## Exception Types
+## Build
 
-```cpp
-try { engine.run("task"); }
-catch (const AllProvidersExhaustedError& e) { /* retry / re-probe */ }
-catch (const ToolInputError& e)             { /* bad tool params */ }
-catch (const PlanningError& e)             { /* DAG generation failed */ }
-catch (const StepExecutionError& e)        { /* specific step failed */ }
-catch (const AriadneError& e)              { /* any framework error */ }
+```bash
+# Linux / macOS
+sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 4
+./build/unit_tests          # 121 tests
+./build/ariadne-studio      # visual editor at localhost:8080
+
+# Windows (vcpkg)
+vcpkg install --triplet x64-windows-static
+cmake -B build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
+cmake --build build --config Release
 ```
+
+## Ariadne Studio
+
+Visual workflow editor -- drag-and-drop DAG builder with real-time execution.
+
+```bash
+./build/ariadne-studio              # default port 8080
+./build/ariadne-studio 9090         # custom port
+ARIADNE_PORT=3000 ./ariadne-studio  # via env var (auto-retry on conflict)
+```
+
+Features: Drawflow canvas, 4 node types (LLM/Tool/Transform/Condition), adaptive orchestration button, SSE execution streaming, save/load/export/import, keyboard shortcuts (Ctrl+S/R, Del).
 
 ## Provider Support
 
-<!-- AUTO-UPDATED by model-check.yml -->
-<!-- Last updated: 2026-06-08 -->
+| Factory | Default Model | Free? | Rate Limit |
+|---|---|---|---|
+| `github_models(token)` | openai/gpt-4o-mini | Yes | 6 RPM |
+| `llm7()` | deepseek-v3-0324 | Yes (no signup) | 30 RPM |
+| `cerebras(key)` | llama-3.3-70b | Yes (1M tok/day) | 30 RPM |
+| `sambanova(key)` | Meta-Llama-3.3-70B | Yes | 30 RPM |
+| `groq(key)` | llama-3.3-70b | Yes | 30 RPM |
+| `mistral(key)` | mistral-small | Yes (1B tok/mo) | 60 RPM |
+| `openai_chat(key)` | gpt-4o | Paid | Unlimited |
+| `anthropic(key)` | claude-opus-4-8 | Paid | Unlimited |
 
-| Provider | Top Model | Tier | Key | Notes |
-|---|---|---|---|---|
-| Anthropic | `claude-opus-4-8` | ORCHESTRATOR | `ANTHROPIC_API_KEY` | Strongest |
-| OpenAI | `gpt-5.5-2026-04-23` | ORCHESTRATOR | `OPENAI_API_KEY` | Latest flagship |
-| Github Models | `openai/gpt-4.1` | SUBAGENT | `GITHUB_TOKEN` | **free** |
-| Groq | `llama-3.3-70b-versatile` | SUBAGENT | `GROQ_API_KEY` | **free** ~394 tok/s |
-| Ollama | `llama3.2` | SUBAGENT | *(none)* | local |
+## Exception Hierarchy
+
+```
+AriadneError
++-- ProviderError -> AllProvidersExhaustedError
++-- PlanningError
++-- WorkflowCancelledError
++-- GuardrailError
++-- TokenBudgetError
++-- InterruptError
++-- ToolError -> ToolNotFoundError, ToolInputError
++-- DAGValidationError
++-- StepExecutionError
+```
 
 ## CI/CD
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | build + 85 unit tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 121 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
-| `model-check.yml` | weekly | update models.json |
+| `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 
 ## License
+
 MIT
