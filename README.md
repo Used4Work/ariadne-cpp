@@ -8,11 +8,11 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-121%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-134%20passed-brightgreen)](#tests)
 
 </div>
 
-C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, native function calling (OpenAI + Anthropic + Gemini), multimodal vision input, dynamic multi-agent orchestration, plan caching, circuit breakers, streaming, and a visual workflow editor.
+C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, native function calling (OpenAI + Anthropic + Gemini), multimodal vision, dynamic multi-agent orchestration, plan caching, circuit breakers, streaming, and a visual workflow editor.
 
 ## Why C++?
 
@@ -21,7 +21,8 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 | Memory | **11 MB** | ~158 MB |
 | Cold start | **12 ms** | ~1800 ms |
 | Thread safety | Built-in (shared_mutex, atomics) | GIL-limited |
-| Native tools | OpenAI + Anthropic + Gemini + all compatible | OpenAI + Anthropic |
+| Native tools | All 9 providers | OpenAI + Anthropic |
+| Multimodal | Image input (base64 + URL) | Image input |
 | Dynamic orchestration | parallel/pipeline/loop_until | LCEL chains |
 | Auto strategy | AdaptiveOrchestrator (5 modes) | Manual selection |
 
@@ -30,9 +31,10 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 ### Core Orchestration
 - **DAG workflows** -- single-call planning, automatic topological parallelization
 - **ReACT agents** -- iterative reasoning with convergence detection (LoopDetector)
-- **Native function calling** -- OpenAI `tools` API + Anthropic `tool_use` blocks (97-99% accuracy)
+- **Native function calling** -- OpenAI/Anthropic/Gemini tools API, parallel tool calls (97-99% accuracy)
 - **Multi-agent handoffs** -- agents transfer control while sharing history
 - **AdaptiveOrchestrator** -- LLM auto-selects optimal strategy per task
+- **Multimodal vision** -- image input via base64 or URL (OpenAI + Anthropic + Gemini)
 
 ### Dynamic Workflow (Ultracode-level)
 - `parallel()` -- fan-out N tasks, barrier wait
@@ -43,7 +45,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - `adversarial_verify()` -- multi-vote claim verification
 
 ### Reliability
-- **8 providers** -- OpenAI, Anthropic, Groq, GitHub Models, Cerebras, SambaNova, Mistral, LLM7
+- **9 providers** -- OpenAI, Anthropic, Gemini, Groq, GitHub Models, Cerebras, SambaNova, Mistral, LLM7
 - **Circuit breakers** -- per-provider fault isolation (CLOSED/OPEN/HALF_OPEN)
 - **Rate limiting** -- token bucket per provider, configurable RPS
 - **429/5xx retry** -- exponential backoff with Retry-After header parsing
@@ -72,6 +74,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **MCP client** -- Model Context Protocol (stdio transport, JSON-RPC 2.0)
 - **Ariadne Studio** -- visual workflow editor (localhost web UI)
 - **Streaming** -- SSE token delivery
+- **CMake** -- FetchContent, find_package, pkg-config
 
 ## Quick Start
 
@@ -80,10 +83,8 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 using namespace ariadne;
 
 int main() {
-    // One-line setup (convenience constructor)
+    // One-line setup
     WorkflowEngine engine(ProviderConfig::github_models(token));
-
-    // Register tools
     engine.register_tool({"web_search","Search the web",
         {{"required",json::array({"query"})}},{}},
         [](const json& p)->json{ return {{"result","data"}}; });
@@ -91,27 +92,23 @@ int main() {
     // 1. Adaptive orchestration (auto-selects best strategy)
     AdaptiveOrchestrator orch(engine);
     auto r = orch.run("Compare Tesla and BYD Q4 2025 sales");
-    // Auto: PARALLEL_RESEARCH -> fan_out 2 agents -> synthesize
 
     // 2. Native tool calling agent (97-99% accuracy)
-    auto agent_r = engine.run_agent_native("Research Tesla revenue", 10,
-        [](const AgentStep& s){ std::cout << s.thought << "\n"; });
+    auto ar = engine.run_agent_native("Research Tesla revenue", 10);
 
     // 3. Dynamic workflow
     DynamicWorkflow dw(engine);
     auto results = dw.fan_out_agents({"Search Tesla","Search BYD"}, 8);
-    auto verified = dw.adversarial_verify("Tesla leads EV market", 3);
 
-    // 4. Token budget
-    engine.set_token_budget(50000);  // throws TokenBudgetError on exceed
-
-    // 5. Multimodal vision
-    auto img_msg = ChatMessage::with_image_url("What's in this image?",
+    // 4. Multimodal vision
+    auto msg = ChatMessage::with_image_url("Describe this image",
         "https://example.com/photo.jpg");
-    auto vision = engine.llm_complete(img_msg.content_parts.dump());
 
-    // 6. Structured logging
-    set_logger(std::make_shared<ConsoleLogger>(LogLevel::LOG_INFO));
+    // 5. DAG workflow
+    auto wr = engine.run("Search Tesla revenue and write a summary");
+
+    // 6. Streaming
+    engine.run_stream("Write a poem", [](auto& c){ std::cout << c; });
 }
 ```
 
@@ -122,13 +119,19 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 121 tests
+./build/unit_tests          # 134 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
 vcpkg install --triplet x64-windows-static
 cmake -B build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
 cmake --build build --config Release
+
+# As a dependency (FetchContent)
+include(FetchContent)
+FetchContent_Declare(ariadne GIT_REPOSITORY https://github.com/Used4Work/ariadne-cpp.git GIT_TAG v1.6.0)
+FetchContent_MakeAvailable(ariadne)
+target_link_libraries(myapp PRIVATE ariadne::ariadne)
 ```
 
 ## Ariadne Studio
@@ -145,17 +148,19 @@ Features: Drawflow canvas, 4 node types (LLM/Tool/Transform/Condition), adaptive
 
 ## Provider Support
 
-| Factory | Default Model | Free? | Rate Limit |
-|---|---|---|---|
-| `github_models(token)` | openai/gpt-4o-mini | Yes | 6 RPM |
-| `llm7()` | deepseek-v3-0324 | Yes (no signup) | 30 RPM |
-| `cerebras(key)` | llama-3.3-70b | Yes (1M tok/day) | 30 RPM |
-| `sambanova(key)` | Meta-Llama-3.3-70B | Yes | 30 RPM |
-| `gemini(key)` | gemini-2.0-flash | Yes (15 RPM) | 15 RPM |
-| `groq(key)` | llama-3.3-70b | Yes | 30 RPM |
-| `mistral(key)` | mistral-small | Yes (1B tok/mo) | 60 RPM |
-| `openai_chat(key)` | gpt-4o | Paid | Unlimited |
-| `anthropic(key)` | claude-opus-4-8 | Paid | Unlimited |
+All 9 providers support native tool calling via `complete_chat()`.
+
+| Factory | Default Model | Free? | Rate Limit | Native Tools |
+|---|---|---|---|---|
+| `github_models(token)` | openai/gpt-4o-mini | Yes | 6 RPM | Yes |
+| `llm7()` | deepseek-v3-0324 | Yes (no signup) | 30 RPM | Yes |
+| `gemini(key)` | gemini-2.0-flash | Yes (15 RPM) | 15 RPM | Yes |
+| `cerebras(key)` | llama-3.3-70b | Yes (1M tok/day) | 30 RPM | Yes |
+| `sambanova(key)` | Meta-Llama-3.3-70B | Yes | 30 RPM | Yes |
+| `groq(key)` | llama-3.3-70b | Yes | 30 RPM | Yes |
+| `mistral(key)` | mistral-small | Yes (1B tok/mo) | 60 RPM | Yes |
+| `openai_chat(key)` | gpt-4o | Paid | Unlimited | Yes |
+| `anthropic(key)` | claude-opus-4-8 | Paid | Unlimited | Yes |
 
 ## Exception Hierarchy
 
@@ -176,7 +181,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 121 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 134 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 
