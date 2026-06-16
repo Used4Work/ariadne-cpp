@@ -1223,6 +1223,265 @@ json DynamicWorkflow::adversarial_verify(const std::string& claim, int num_voter
 }
 
 // ════════════════════════════════════════════════════════════════
+// AdaptiveOrchestrator — 自动策略选择 + 动态编排
+// ════════════════════════════════════════════════════════════════
+
+static const char* ORCHESTRATOR_STRATEGY_SYS = R"(
+You are a workflow strategy planner. Analyze the user's task and decide the BEST execution strategy.
+
+Return ONLY a JSON object (no markdown, no explanation):
+{
+  "strategy": "simple_dag" | "agent_loop" | "parallel_research" | "pipeline_verify" | "multi_agent",
+  "reasoning": "one sentence explaining why this strategy",
+  "subtasks": ["subtask1", "subtask2"],
+  "synthesis_prompt": "instruction for combining results",
+  "max_iterations": 8
+}
+
+Strategy guide:
+- "simple_dag": Single-step or simple sequential tasks (e.g., "summarize this text", "translate X")
+- "agent_loop": Open-ended research or complex reasoning requiring multiple tool calls (e.g., "research topic X")
+- "parallel_research": Task involves comparing/analyzing MULTIPLE entities in parallel (e.g., "compare A vs B vs C"). Split into subtasks, one per entity. ALWAYS use this for comparison tasks.
+- "pipeline_verify": Task requires research THEN verification/fact-checking (e.g., "find and verify claims about X")
+- "multi_agent": Task needs specialized roles (e.g., "research X then write a report" → researcher + writer)
+
+Rules:
+- subtasks: list the parallel work items (for parallel_research: one per entity; for pipeline_verify: research topics)
+- synthesis_prompt: how to combine the parallel results into a final answer
+- max_iterations: 5-15 depending on complexity
+- For simple tasks, subtasks can be empty and synthesis_prompt can be empty
+)";
+
+AdaptiveOrchestrator::AdaptiveOrchestrator(WorkflowEngine& engine) : engine_(engine) {}
+
+std::string AdaptiveOrchestrator::strategy_name(OrchestratorStrategy s) {
+    switch (s) {
+    case OrchestratorStrategy::SIMPLE_DAG:        return "simple_dag";
+    case OrchestratorStrategy::AGENT_LOOP:        return "agent_loop";
+    case OrchestratorStrategy::PARALLEL_RESEARCH: return "parallel_research";
+    case OrchestratorStrategy::PIPELINE_VERIFY:   return "pipeline_verify";
+    case OrchestratorStrategy::MULTI_AGENT:       return "multi_agent";
+    default: return "unknown";
+    }
+}
+
+OrchestratorPlan AdaptiveOrchestrator::plan_strategy(const std::string& task) {
+    OrchestratorPlan plan;
+
+    // List available tools for context
+    auto tools = engine_.list_tools();
+    std::string tool_list;
+    for (const auto& t : tools) tool_list += t.name + " ";
+
+    std::string prompt = "Task: " + task + "\n";
+    if (!tool_list.empty()) prompt += "Available tools: " + tool_list + "\n";
+    prompt += "Select the optimal strategy:";
+
+    try {
+        auto raw = engine_.llm_complete(prompt, ORCHESTRATOR_STRATEGY_SYS,
+                                         ModelTier::ORCHESTRATOR, 0.0);
+        auto j = WorkflowPlanner::extract_json(raw);
+
+        const std::string s = j.value("strategy", "agent_loop");
+        plan.strategy = (s == "simple_dag")        ? OrchestratorStrategy::SIMPLE_DAG :
+                        (s == "parallel_research")  ? OrchestratorStrategy::PARALLEL_RESEARCH :
+                        (s == "pipeline_verify")    ? OrchestratorStrategy::PIPELINE_VERIFY :
+                        (s == "multi_agent")        ? OrchestratorStrategy::MULTI_AGENT :
+                                                     OrchestratorStrategy::AGENT_LOOP;
+        plan.reasoning = j.value("reasoning", "");
+        plan.subtasks  = j.value("subtasks", std::vector<std::string>{});
+        plan.synthesis_prompt = j.value("synthesis_prompt", "");
+        plan.max_iterations   = j.value("max_iterations", 8);
+    } catch (const std::exception& e) {
+        // Fallback to agent_loop on parse failure
+        plan.strategy = OrchestratorStrategy::AGENT_LOOP;
+        plan.reasoning = "LLM strategy planning failed, defaulting to agent loop: " + std::string(e.what());
+        plan.max_iterations = 8;
+    }
+    return plan;
+}
+
+OrchestratorPlan AdaptiveOrchestrator::analyze(const std::string& task) {
+    return plan_strategy(task);
+}
+
+OrchestratorResult AdaptiveOrchestrator::execute_plan(const std::string& task,
+                                                       const OrchestratorPlan& plan) {
+    OrchestratorResult result;
+    result.strategy_used = strategy_name(plan.strategy);
+    result.reasoning     = plan.reasoning;
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto emit = [&](const std::string& msg) {
+        result.log.push_back(msg);
+        if (progress_fn_) progress_fn_(result.strategy_used, msg);
+    };
+
+    emit("Strategy: " + result.strategy_used + " — " + plan.reasoning);
+
+    try {
+        switch (plan.strategy) {
+
+        case OrchestratorStrategy::SIMPLE_DAG: {
+            emit("Executing as DAG workflow...");
+            auto wr = engine_.run(task);
+            result.success = wr.success;
+            result.output  = wr.output;
+            if (!wr.success) result.error = wr.error_message;
+            result.token_usage = wr.token_usage;
+            break;
+        }
+
+        case OrchestratorStrategy::AGENT_LOOP: {
+            emit("Executing as agent loop (" + std::to_string(plan.max_iterations) + " max iterations)...");
+            auto ar = engine_.run_agent(task, plan.max_iterations,
+                [&](const AgentStep& s) {
+                    emit("[iter " + std::to_string(s.iteration) + "] " +
+                         s.thought.substr(0, 80));
+                });
+            result.success = ar.success;
+            result.output  = ar.final_answer;
+            if (!ar.success) result.error = ar.error;
+            result.token_usage = ar.token_usage;
+            break;
+        }
+
+        case OrchestratorStrategy::PARALLEL_RESEARCH: {
+            if (plan.subtasks.empty()) {
+                // Fallback: run as single agent
+                emit("No subtasks found, falling back to agent loop");
+                auto ar = engine_.run_agent(task, plan.max_iterations);
+                result.success = ar.success;
+                result.output  = ar.final_answer;
+                if (!ar.success) result.error = ar.error;
+                result.token_usage = ar.token_usage;
+                break;
+            }
+            DynamicWorkflow dw(engine_);
+            dw.on_progress([&](auto&, auto& msg) { emit(msg); });
+
+            // Phase 1: Parallel research
+            dw.phase("Research");
+            emit("Fan-out " + std::to_string(plan.subtasks.size()) + " parallel agents...");
+            auto agent_results = dw.fan_out_agents(plan.subtasks, plan.max_iterations);
+
+            // Phase 2: Synthesis
+            dw.phase("Synthesis");
+            std::string synthesis_input = "Research results:\n";
+            for (size_t i = 0; i < agent_results.size(); ++i) {
+                synthesis_input += "\n--- " + plan.subtasks[i] + " ---\n";
+                if (!agent_results[i].is_null())
+                    synthesis_input += agent_results[i].value("answer", agent_results[i].dump());
+                else
+                    synthesis_input += "(research failed)";
+                synthesis_input += "\n";
+            }
+            std::string synth_prompt = plan.synthesis_prompt.empty()
+                ? "Based on the research results above, provide a comprehensive combined answer to: " + task
+                : plan.synthesis_prompt + "\n\n" + synthesis_input;
+            if (!plan.synthesis_prompt.empty())
+                synth_prompt = synthesis_input + "\n\n" + plan.synthesis_prompt;
+            else
+                synth_prompt = synthesis_input + "\n\nProvide a comprehensive combined analysis for: " + task;
+
+            emit("Synthesizing results...");
+            auto synthesis = engine_.llm_complete(synth_prompt, "", ModelTier::ORCHESTRATOR, 0.0);
+            result.success = true;
+            result.output  = {{"research", agent_results}, {"synthesis", synthesis}};
+            break;
+        }
+
+        case OrchestratorStrategy::PIPELINE_VERIFY: {
+            DynamicWorkflow dw(engine_);
+            dw.on_progress([&](auto&, auto& msg) { emit(msg); });
+
+            // Research phase: fan out agents for each subtask
+            dw.phase("Research");
+            auto subtasks = plan.subtasks.empty()
+                ? std::vector<std::string>{task}
+                : plan.subtasks;
+            auto research = dw.fan_out_agents(subtasks, plan.max_iterations);
+
+            // Verify phase: pipeline each result through verification
+            dw.phase("Verify");
+            std::vector<json> to_verify;
+            for (size_t i = 0; i < research.size(); ++i) {
+                if (!research[i].is_null()) to_verify.push_back(research[i]);
+            }
+            auto verified = dw.pipeline(to_verify, {
+                [&](const json& r) -> json {
+                    std::string answer = r.value("answer", r.dump());
+                    auto v = dw.adversarial_verify(answer, 3);
+                    return {{"research", r}, {"verification", v}};
+                }
+            });
+
+            result.success = true;
+            result.output  = {{"verified_results", verified}};
+            break;
+        }
+
+        case OrchestratorStrategy::MULTI_AGENT: {
+            emit("Executing as multi-agent workflow...");
+            // Build agent definitions from subtasks
+            std::vector<AgentDef> agents;
+            if (plan.subtasks.size() >= 2) {
+                // First subtask owner = researcher, last = synthesizer
+                agents.push_back({
+                    "researcher", "You gather facts using available tools. When done, hand off to writer.",
+                    {}, ModelTier::ORCHESTRATOR, {"writer"}
+                });
+                agents.push_back({
+                    "writer", "You write a comprehensive answer from the research. Give a final_answer.",
+                    {}, ModelTier::ORCHESTRATOR, {}
+                });
+            } else {
+                agents.push_back({
+                    "researcher", "You research the topic and provide a final_answer.",
+                    {}, ModelTier::ORCHESTRATOR, {}
+                });
+            }
+            auto ar = engine_.run_multi_agent(task, agents,
+                agents[0].name, plan.max_iterations,
+                [&](const AgentStep& s) {
+                    emit("[iter " + std::to_string(s.iteration) + "] " +
+                         s.thought.substr(0, 80));
+                });
+            result.success = ar.success;
+            result.output  = ar.final_answer;
+            if (!ar.success) result.error = ar.error;
+            result.token_usage = ar.token_usage;
+            break;
+        }
+        }
+    } catch (const std::exception& e) {
+        result.success = false;
+        result.error   = e.what();
+        emit("ERROR: " + result.error);
+    }
+
+    result.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    emit("Complete: " + std::to_string(result.duration_ms) + "ms, "
+         + (result.success ? "success" : "failed"));
+    return result;
+}
+
+OrchestratorResult AdaptiveOrchestrator::run(const std::string& task) {
+    auto plan = plan_strategy(task);
+    return execute_plan(task, plan);
+}
+
+OrchestratorResult AdaptiveOrchestrator::run_with_strategy(const std::string& task,
+                                                            OrchestratorStrategy strategy) {
+    OrchestratorPlan plan;
+    plan.strategy = strategy;
+    plan.reasoning = "User-specified strategy";
+    plan.max_iterations = 10;
+    return execute_plan(task, plan);
+}
+
+// ════════════════════════════════════════════════════════════════
 // validate_dag
 // ════════════════════════════════════════════════════════════════
 

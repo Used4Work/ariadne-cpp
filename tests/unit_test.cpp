@@ -1140,6 +1140,36 @@ void test_dynamic_fan_out_types() {
     ASSERT(batch[0] == 20);
 }
 
+// ── AdaptiveOrchestrator Types ───────────────────────────
+void test_orchestrator_strategy_enum() {
+    ASSERT(OrchestratorStrategy::SIMPLE_DAG != OrchestratorStrategy::AGENT_LOOP);
+    ASSERT(OrchestratorStrategy::PARALLEL_RESEARCH != OrchestratorStrategy::PIPELINE_VERIFY);
+}
+
+void test_orchestrator_plan_struct() {
+    OrchestratorPlan plan;
+    plan.strategy = OrchestratorStrategy::PARALLEL_RESEARCH;
+    plan.reasoning = "Task compares two entities";
+    plan.subtasks = {"Search Tesla", "Search BYD"};
+    plan.synthesis_prompt = "Compare the two";
+    plan.max_iterations = 10;
+    ASSERT(plan.subtasks.size() == 2);
+    ASSERT(plan.max_iterations == 10);
+}
+
+void test_orchestrator_result_struct() {
+    OrchestratorResult result;
+    result.success = true;
+    result.strategy_used = "parallel_research";
+    result.reasoning = "comparison task";
+    result.output = {{"answer", "Tesla > BYD"}};
+    result.duration_ms = 5000;
+    result.log = {"step1", "step2"};
+    ASSERT(result.success);
+    ASSERT(result.strategy_used == "parallel_research");
+    ASSERT(result.log.size() == 2);
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -1257,6 +1287,10 @@ int main() {
     RUN(test_dynamic_parallel); RUN(test_dynamic_map_pure);
     RUN(test_dynamic_pipeline_pure); RUN(test_dynamic_loop_until);
     RUN(test_dynamic_result_struct); RUN(test_dynamic_fan_out_types);
+
+    std::cout<<"\n=== Adaptive Orchestrator ===\n";
+    RUN(test_orchestrator_strategy_enum); RUN(test_orchestrator_plan_struct);
+    RUN(test_orchestrator_result_struct);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

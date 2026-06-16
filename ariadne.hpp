@@ -1456,6 +1456,76 @@ private:
 };
 
 // ════════════════════════════════════════════════════════════════
+// Adaptive Orchestrator — 自动策略选择 + 动态编排
+//
+// 根据任务自动决定最优执行策略：
+//   SIMPLE_DAG       → 简单任务，用 engine.run()
+//   AGENT_LOOP       → 开放探索，用 engine.run_agent()
+//   PARALLEL_RESEARCH → 多子主题，fan_out_agents() + 综合
+//   PIPELINE_VERIFY   → 研究+验证，pipeline() 多阶段
+//   MULTI_AGENT       → 专业分工，run_multi_agent()
+//
+// 用法：
+//   AdaptiveOrchestrator orch(engine);
+//   auto result = orch.run("对比 Tesla 和 BYD 的 Q4 销量");
+//   // 自动选择 PARALLEL_RESEARCH，并行搜索 + 对比综合
+// ════════════════════════════════════════════════════════════════
+
+enum class OrchestratorStrategy {
+    SIMPLE_DAG,         // 直接 DAG workflow
+    AGENT_LOOP,         // 单 agent 循环
+    PARALLEL_RESEARCH,  // 并行扇出 + 综合
+    PIPELINE_VERIFY,    // 流水线：研究 → 分析 → 验证
+    MULTI_AGENT         // 多 agent 协作
+};
+
+struct OrchestratorPlan {
+    OrchestratorStrategy         strategy;
+    std::string                  reasoning;
+    std::vector<std::string>     subtasks;
+    std::string                  synthesis_prompt;
+    int                          max_iterations = 8;
+};
+
+struct OrchestratorResult {
+    bool        success = false;
+    json        output;
+    std::string strategy_used;
+    std::string reasoning;
+    long        duration_ms = 0;
+    TokenUsage  token_usage;
+    std::string error;
+    std::vector<std::string> log;
+};
+
+class AdaptiveOrchestrator {
+public:
+    explicit AdaptiveOrchestrator(WorkflowEngine& engine);
+
+    /** 自动分析任务 → 选择策略 → 编排执行 → 返回结果 */
+    OrchestratorResult run(const std::string& task);
+
+    /** 仅分析任务并返回推荐策略（不执行） */
+    OrchestratorPlan analyze(const std::string& task);
+
+    /** 使用指定策略执行（跳过自动分析） */
+    OrchestratorResult run_with_strategy(const std::string& task,
+                                          OrchestratorStrategy strategy);
+
+    /** 进度回调 */
+    void on_progress(ProgressFn fn) { progress_fn_ = std::move(fn); }
+
+private:
+    WorkflowEngine& engine_;
+    ProgressFn progress_fn_;
+
+    OrchestratorPlan plan_strategy(const std::string& task);
+    OrchestratorResult execute_plan(const std::string& task, const OrchestratorPlan& plan);
+
+    static std::string strategy_name(OrchestratorStrategy s);
+};
+
+// ════════════════════════════════════════════════════════════════
 // 13. DAG 校验
 // ════════════════════════════════════════════════════════════════
 
