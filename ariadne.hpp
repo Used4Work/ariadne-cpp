@@ -509,6 +509,10 @@ public:
                           const std::string& system,
                           double temperature,
                           StreamCallback on_chunk) const override;
+    LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
+                               const std::vector<ToolDef>& tools = {},
+                               double temperature = 0.0) const override;
+    bool supports_native_tools() const override { return true; }
     std::string provider_name() const override { return "gemini"; }
     std::string model_name()    const override { return cfg_.model; }
 };

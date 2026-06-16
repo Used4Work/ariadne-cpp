@@ -12,7 +12,7 @@
 
 </div>
 
-C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, native function calling (OpenAI + Anthropic), dynamic multi-agent orchestration, plan caching, circuit breakers, streaming, and a visual workflow editor.
+C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, native function calling (OpenAI + Anthropic + Gemini), multimodal vision input, dynamic multi-agent orchestration, plan caching, circuit breakers, streaming, and a visual workflow editor.
 
 ## Why C++?
 
@@ -149,6 +149,7 @@ Features: Drawflow canvas, 4 node types (LLM/Tool/Transform/Condition), adaptive
 | `llm7()` | deepseek-v3-0324 | Yes (no signup) | 30 RPM |
 | `cerebras(key)` | llama-3.3-70b | Yes (1M tok/day) | 30 RPM |
 | `sambanova(key)` | Meta-Llama-3.3-70B | Yes | 30 RPM |
+| `gemini(key)` | gemini-2.0-flash | Yes (15 RPM) | 15 RPM |
 | `groq(key)` | llama-3.3-70b | Yes | 30 RPM |
 | `mistral(key)` | mistral-small | Yes (1B tok/mo) | 60 RPM |
 | `openai_chat(key)` | gpt-4o | Paid | Unlimited |

@@ -1305,6 +1305,7 @@ void test_gemini_make_provider() {
     auto p = make_provider(ProviderConfig::gemini("key"));
     ASSERT(p->provider_name() == "gemini");
     ASSERT(p->model_name() == "gemini-2.0-flash");
+    ASSERT(p->supports_native_tools());
 }
 
 // ── Version from CMake ──────────────────────────────────

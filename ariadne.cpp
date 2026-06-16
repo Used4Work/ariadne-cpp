@@ -514,6 +514,105 @@ std::string GeminiProvider::complete(const std::string& prompt,
     return j["candidates"][0]["content"]["parts"][0]["text"].get<std::string>();
 }
 
+LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messages,
+                                           const std::vector<ToolDef>& tools,
+                                           double temperature) const {
+    json contents = json::array();
+    std::string system_instruction;
+    for (const auto& m : messages) {
+        if (m.role == "system") { system_instruction = m.content; continue; }
+        std::string role = (m.role == "assistant") ? "model" : "user";
+        if (m.role == "tool") role = "user";  // Gemini: tool results as user
+        json parts = json::array();
+        if (m.is_multimodal()) {
+            for (const auto& p : m.content_parts) {
+                if (p.value("type","") == "text")
+                    parts.push_back({{"text", p.value("text","")}});
+                else if (p.value("type","") == "image_url") {
+                    std::string url = p["image_url"].value("url","");
+                    if (url.find("data:") == 0) {
+                        auto comma = url.find(',');
+                        auto semi = url.find(';');
+                        std::string mt = (semi != std::string::npos) ? url.substr(5,semi-5) : "image/jpeg";
+                        std::string data = (comma != std::string::npos) ? url.substr(comma+1) : "";
+                        parts.push_back({{"inline_data",{{"mime_type",mt},{"data",data}}}});
+                    }
+                }
+            }
+        } else if (m.role == "tool" || !m.tool_call_id.empty()) {
+            parts.push_back({{"functionResponse",{
+                {"name", m.name.empty() ? "tool" : m.name},
+                {"response", {{"result", m.content}}}
+            }}});
+        } else if (!m.content.empty()) {
+            parts.push_back({{"text", m.content}});
+        }
+        // Gemini: assistant tool_calls → functionCall parts
+        if (m.role == "assistant" && !m.tool_calls.is_null()) {
+            for (const auto& tc : m.tool_calls) {
+                json args = tc.contains("arguments") ? tc["arguments"] : json::object();
+                if (args.is_string()) try { args = json::parse(args.get<std::string>()); } catch (...) {}
+                std::string fn_name = tc.contains("function")
+                    ? tc["function"].value("name","") : tc.value("name","");
+                parts.push_back({{"functionCall",{{"name",fn_name},{"args",args}}}});
+            }
+        }
+        if (!parts.empty())
+            contents.push_back({{"role",role},{"parts",parts}});
+    }
+
+    json body = {{"contents", contents}};
+    json gen_config = {{"temperature", temperature}, {"maxOutputTokens", cfg_.max_tokens}};
+    body["generationConfig"] = gen_config;
+    if (!system_instruction.empty())
+        body["systemInstruction"] = {{"parts",{{{"text",system_instruction}}}}};
+
+    if (!tools.empty()) {
+        json fn_decls = json::array();
+        for (const auto& t : tools)
+            fn_decls.push_back({{"name",t.name},{"description",t.description},
+                {"parameters", t.input_schema.empty() ? json({{"type","object"}}) : t.input_schema}});
+        body["tools"] = json::array({{{"functionDeclarations", fn_decls}}});
+    }
+
+    std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                    + cfg_.model + ":generateContent";
+    auto resp = http_post(url,
+        {"Content-Type: application/json", "x-goog-api-key: " + cfg_.api_key},
+        body.dump());
+    if (resp.status_code == 429 || resp.status_code == 503)
+        throw ProviderError("Gemini: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code >= 500)
+        throw ProviderError("Gemini: " + std::to_string(resp.status_code) + " server error");
+    json j;
+    try { j = json::parse(resp.body); }
+    catch (...) { throw ProviderError("Gemini: invalid JSON"); }
+    if (j.contains("error"))
+        throw ProviderError("Gemini: " + j["error"].value("message","unknown"));
+    if (j.contains("usageMetadata")) {
+        const auto& u = j["usageMetadata"];
+        g_last_token_usage.input_tokens  = u.value("promptTokenCount", 0L);
+        g_last_token_usage.output_tokens = u.value("candidatesTokenCount", 0L);
+        g_last_token_usage.total_tokens  = u.value("totalTokenCount", 0L);
+    }
+
+    LLMResponse result;
+    if (j.contains("candidates") && !j["candidates"].empty()) {
+        const auto& parts = j["candidates"][0]["content"]["parts"];
+        for (const auto& p : parts) {
+            if (p.contains("text")) result.content += p["text"].get<std::string>();
+            if (p.contains("functionCall")) {
+                LLMToolCall tc;
+                tc.name = p["functionCall"].value("name","");
+                tc.arguments = p["functionCall"].value("args", json::object());
+                tc.id = "gemini_" + tc.name;
+                result.tool_calls.push_back(std::move(tc));
+            }
+        }
+    }
+    return result;
+}
+
 void GeminiProvider::complete_stream(const std::string& prompt,
                                       const std::string& sys,
                                       double temp,
