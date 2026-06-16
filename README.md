@@ -21,7 +21,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 | Memory | **11 MB** | ~158 MB |
 | Cold start | **12 ms** | ~1800 ms |
 | Thread safety | Built-in (shared_mutex, atomics) | GIL-limited |
-| Native tools | OpenAI + Anthropic | OpenAI + Anthropic |
+| Native tools | OpenAI + Anthropic + Gemini + all compatible | OpenAI + Anthropic |
 | Dynamic orchestration | parallel/pipeline/loop_until | LCEL chains |
 | Auto strategy | AdaptiveOrchestrator (5 modes) | Manual selection |
 
@@ -108,7 +108,12 @@ int main() {
     // 4. Token budget
     engine.set_token_budget(50000);  // throws TokenBudgetError on exceed
 
-    // 5. Structured logging
+    // 5. Multimodal vision
+    auto img_msg = ChatMessage::with_image_url("What's in this image?",
+        "https://example.com/photo.jpg");
+    auto vision = engine.llm_complete(img_msg.content_parts.dump());
+
+    // 6. Structured logging
     set_logger(std::make_shared<ConsoleLogger>(LogLevel::LOG_INFO));
 }
 ```

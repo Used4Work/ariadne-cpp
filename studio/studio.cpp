@@ -499,7 +499,7 @@ int main(int argc, char* argv[]) {
             auto body = json::parse(req.body);
             std::string task = body.value("task", "");
             int max_iter = body.value("max_iterations", 10);
-            auto result = engine->run_agent(task, max_iter);
+            auto result = engine->run_agent_native(task, max_iter);
             res.set_content(json({
                 {"success", result.success},
                 {"final_answer", result.final_answer},

@@ -46,7 +46,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "1.4.0";
+constexpr const char* ARIADNE_VERSION = "1.5.1";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
