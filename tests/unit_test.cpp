@@ -1262,6 +1262,18 @@ void test_mock_supports_native() {
     ASSERT(!client.supports_native_tools(ModelTier::ORCHESTRATOR));
 }
 
+// ── Parallel Tool Calls ─────────────────────────────────
+void test_parallel_tool_calls_response() {
+    LLMResponse r;
+    r.content = "Let me search both";
+    r.tool_calls.push_back({"call_1", "search", {{"q","Tesla"}}});
+    r.tool_calls.push_back({"call_2", "search", {{"q","BYD"}}});
+    ASSERT(r.has_tool_calls());
+    ASSERT(r.tool_calls.size() == 2);
+    ASSERT(r.tool_calls[0].name == "search");
+    ASSERT(r.tool_calls[1].arguments["q"] == "BYD");
+}
+
 // ── Provider Auto-Pricing ────────────────────────────────
 void test_provider_auto_pricing() {
     auto a = ProviderConfig::anthropic("key", "claude-opus-4-8");
@@ -1452,6 +1464,9 @@ int main() {
     std::cout<<"\n=== Native Tool Calling ===\n";
     RUN(test_chat_message_struct); RUN(test_llm_tool_call_struct);
     RUN(test_llm_response_with_tools); RUN(test_mock_supports_native);
+
+    std::cout<<"\n=== Parallel Tool Calls ===\n";
+    RUN(test_parallel_tool_calls_response);
 
     std::cout<<"\n=== Provider Auto-Pricing ===\n";
     RUN(test_provider_auto_pricing);

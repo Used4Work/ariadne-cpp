@@ -2726,21 +2726,29 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
     AgentResult result;
     result.max_iterations = max_iterations;
     auto t0 = std::chrono::steady_clock::now();
+    auto wf_id = "native_" + std::to_string(
+        std::chrono::system_clock::now().time_since_epoch().count() % 1000000);
+    metrics_->record({MetricEvent::Kind::WORKFLOW_START, wf_id, "", "", "", 0, true, task});
 
     // Input guardrails
     json task_json = {{"task", task}};
     for (const auto& guard : input_guardrails_) {
         auto err = guard(task_json);
-        if (err) { result.error = "Input guardrail: " + *err; return result; }
+        if (err) {
+            result.error = "Input guardrail: " + *err;
+            metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "", 0, false, result.error});
+            return result;
+        }
     }
 
     auto tools = tools_->list_tools();
+    LoopDetector loop_detector;
 
-    // Build conversation messages
     std::vector<ChatMessage> messages;
     messages.push_back({"system",
         "You are a helpful AI agent. Use the provided tools to gather information. "
-        "When you have enough data, respond with a text message containing your final answer.",
+        "When you have enough data, respond with a text message containing your final answer. "
+        "You may call multiple tools in parallel when appropriate.",
         {}, "", ""});
     messages.push_back({"user", task, {}, "", ""});
 
@@ -2762,22 +2770,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         }
 
         if (resp.has_tool_calls()) {
-            // Native tool call — structured, no JSON parsing needed
-            const auto& tc = resp.tool_calls[0];
-            step.thought = resp.content.empty() ? "Using " + tc.name : resp.content;
-            step.action.type = AgentAction::Type::TOOL_CALL;
-            step.action.tool_name = tc.name;
-            step.action.tool_args = tc.arguments;
-            step.action.thought = step.thought;
-
-            json obs;
-            try { obs = tools_->call(tc.name, tc.arguments); }
-            catch (const std::exception& e) {
-                obs = {{"error", std::string("tool failed: ") + e.what()}};
-            }
-            step.observation = obs;
-
-            // Build assistant message with tool_calls for conversation history
+            // Build assistant message with ALL tool_calls for conversation history
             json tc_json = json::array();
             for (const auto& c : resp.tool_calls) {
                 tc_json.push_back({
@@ -2786,11 +2779,43 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
                 });
             }
             messages.push_back({"assistant", resp.content, tc_json, "", ""});
-            // Tool result message
-            messages.push_back({"tool", obs.dump(), {}, tc.id, tc.name});
+
+            // Execute ALL tool calls (parallel function calling)
+            std::string tool_names;
+            json all_obs = json::array();
+            for (const auto& tc : resp.tool_calls) {
+                json obs;
+                try { obs = tools_->call(tc.name, tc.arguments); }
+                catch (const std::exception& e) {
+                    obs = {{"error", std::string("tool failed: ") + e.what()}};
+                }
+                // Append tool result message for each call
+                messages.push_back({"tool", obs.dump(), {}, tc.id, tc.name});
+                all_obs.push_back(obs);
+                if (!tool_names.empty()) tool_names += "+";
+                tool_names += tc.name;
+
+                loop_detector.record(tc.name, tc.arguments, obs);
+            }
+
+            // Record step with first tool call's info (for backward compat)
+            const auto& first_tc = resp.tool_calls[0];
+            step.thought = resp.content.empty() ? "Using " + tool_names : resp.content;
+            step.action.type = AgentAction::Type::TOOL_CALL;
+            step.action.tool_name = first_tc.name;
+            step.action.tool_args = first_tc.arguments;
+            step.action.thought = step.thought;
+            step.observation = (all_obs.size() == 1) ? all_obs[0] : all_obs;
+
+            // Convergence detection
+            if (loop_detector.is_stuck()) {
+                messages.push_back({"user",
+                    "LOOP DETECTED: You have called tools repeatedly with similar results. "
+                    "Please provide your final answer now using the information already gathered.",
+                    {}, "", ""});
+            }
 
         } else {
-            // Text response — final answer
             step.thought = "Providing final answer";
             step.action.type = AgentAction::Type::FINAL_ANSWER;
             step.action.response = resp.content;
@@ -2823,6 +2848,15 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
     result.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t0).count();
     result.token_usage = llm_->total_usage();
+    // Output guardrails
+    if (result.success) {
+        for (const auto& guard : output_guardrails_) {
+            auto err = guard(json(result.final_answer));
+            if (err) { result.success = false; result.error = "Output guardrail: " + *err; }
+        }
+    }
+    metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "",
+                      result.duration_ms, result.success, result.error});
     return result;
 }
 
