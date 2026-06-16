@@ -513,6 +513,70 @@ int main(int argc, char* argv[]) {
         }
     });
 
+    // ── Adaptive Orchestrator endpoint ─────────────────
+    svr.Post("/api/adaptive", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!engine) {
+            res.set_content(json({{"error","No LLM provider"}}).dump(), "application/json");
+            return;
+        }
+        try {
+            auto body = json::parse(req.body);
+            std::string task = body.value("task", "");
+            if (task.empty()) {
+                res.status = 400;
+                res.set_content(json({{"error","'task' field required"}}).dump(), "application/json");
+                return;
+            }
+            AdaptiveOrchestrator orch(*engine);
+            auto result = orch.run(task);
+            json j = {
+                {"success", result.success},
+                {"strategy", result.strategy_used},
+                {"reasoning", result.reasoning},
+                {"output", result.output},
+                {"duration_ms", result.duration_ms},
+                {"error", result.error},
+                {"log", result.log}
+            };
+            res.set_content(j.dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
+    // ── Analyze strategy (preview without executing) ──
+    svr.Post("/api/analyze", [&](const httplib::Request& req, httplib::Response& res) {
+        if (!engine) {
+            res.set_content(json({{"error","No LLM provider"}}).dump(), "application/json");
+            return;
+        }
+        try {
+            auto body = json::parse(req.body);
+            std::string task = body.value("task", "");
+            AdaptiveOrchestrator orch(*engine);
+            auto plan = orch.analyze(task);
+            std::string sname;
+            switch(plan.strategy) {
+            case OrchestratorStrategy::SIMPLE_DAG: sname="simple_dag"; break;
+            case OrchestratorStrategy::AGENT_LOOP: sname="agent_loop"; break;
+            case OrchestratorStrategy::PARALLEL_RESEARCH: sname="parallel_research"; break;
+            case OrchestratorStrategy::PIPELINE_VERIFY: sname="pipeline_verify"; break;
+            case OrchestratorStrategy::MULTI_AGENT: sname="multi_agent"; break;
+            }
+            res.set_content(json({
+                {"strategy", sname},
+                {"reasoning", plan.reasoning},
+                {"subtasks", plan.subtasks},
+                {"synthesis_prompt", plan.synthesis_prompt},
+                {"max_iterations", plan.max_iterations}
+            }).dump(), "application/json");
+        } catch (const std::exception& e) {
+            res.status = 500;
+            res.set_content(json({{"error", e.what()}}).dump(), "application/json");
+        }
+    });
+
     // ── Health endpoint ───────────────────────────────
     svr.Get("/api/health", [&](const httplib::Request&, httplib::Response& res) {
         json h = {{"status", "ok"}, {"engine", engine != nullptr}, {"port", port}};

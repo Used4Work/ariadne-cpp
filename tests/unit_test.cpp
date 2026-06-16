@@ -1140,6 +1140,60 @@ void test_dynamic_fan_out_types() {
     ASSERT(batch[0] == 20);
 }
 
+// ── Version API ──────────────────────────────────────────
+void test_version_api() {
+    auto v = ariadne::version();
+    ASSERT(!v.empty());
+    ASSERT(v.find('.') != std::string::npos);
+    ASSERT(std::string(ARIADNE_VERSION) == v);
+}
+
+// ── Agent Traces ─────────────────────────────────────────
+void test_agent_result_has_traces() {
+    AgentResult r;
+    r.traces.push_back({"agent_iter_1", "tool", "ok", "", 100, "", 50, 25});
+    r.traces.push_back({"agent_iter_2", "llm", "ok", "", 200, "", 60, 30});
+    ASSERT(r.traces.size() == 2);
+    ASSERT(r.traces[0].input_tokens == 50);
+    ASSERT(r.traces[1].step_id == "agent_iter_2");
+}
+
+// ── Structured Logging ──────────────────────────────────
+void test_logger_null() {
+    NullLogger nl;
+    nl.log(LogLevel::LOG_ERROR, "test", "should not crash");
+}
+
+void test_logger_console() {
+    ConsoleLogger cl(LogLevel::LOG_WARN);
+    cl.log(LogLevel::LOG_DEBUG, "test", "should be filtered");
+    cl.log(LogLevel::LOG_WARN, "test", "should appear");
+}
+
+void test_logger_global() {
+    auto old = global_logger();
+    set_logger(std::make_shared<NullLogger>());
+    log_msg(LogLevel::LOG_INFO, "test", "via global");
+    set_logger(old);
+}
+
+// ── Cost Tracking ───────────────────────────────────────
+void test_model_pricing() {
+    auto p = ModelPricing::gpt4o_mini();
+    ASSERT(p.input_per_1m == 0.15);
+    double cost = p.cost(1000, 500);
+    ASSERT(cost > 0.0);
+    ASSERT(cost < 0.001);  // should be tiny for 1500 tokens
+}
+
+void test_token_usage_cost() {
+    TokenUsage a{100, 50, 150, 0.001};
+    TokenUsage b{200, 100, 300, 0.002};
+    a += b;
+    ASSERT(a.total_tokens == 450);
+    ASSERT(a.cost_usd > 0.0029 && a.cost_usd < 0.0031);
+}
+
 // ── AdaptiveOrchestrator Types ───────────────────────────
 void test_orchestrator_strategy_enum() {
     ASSERT(OrchestratorStrategy::SIMPLE_DAG != OrchestratorStrategy::AGENT_LOOP);
@@ -1287,6 +1341,18 @@ int main() {
     RUN(test_dynamic_parallel); RUN(test_dynamic_map_pure);
     RUN(test_dynamic_pipeline_pure); RUN(test_dynamic_loop_until);
     RUN(test_dynamic_result_struct); RUN(test_dynamic_fan_out_types);
+
+    std::cout<<"\n=== Version API ===\n";
+    RUN(test_version_api);
+
+    std::cout<<"\n=== Agent Traces ===\n";
+    RUN(test_agent_result_has_traces);
+
+    std::cout<<"\n=== Structured Logging ===\n";
+    RUN(test_logger_null); RUN(test_logger_console); RUN(test_logger_global);
+
+    std::cout<<"\n=== Cost Tracking ===\n";
+    RUN(test_model_pricing); RUN(test_token_usage_cost);
 
     std::cout<<"\n=== Adaptive Orchestrator ===\n";
     RUN(test_orchestrator_strategy_enum); RUN(test_orchestrator_plan_struct);

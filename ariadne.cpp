@@ -2525,7 +2525,15 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
         step.duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - step_t0).count();
         result.steps.push_back(step);
-        if (on_step) on_step(step);  // B4: 逐步回调
+        // Agent trace entry
+        std::string trace_type = (action.type == AgentAction::Type::TOOL_CALL) ? "tool" :
+                                 (action.type == AgentAction::Type::LOOP_BACK) ? "loop_back" : "llm";
+        result.traces.push_back({
+            "agent_iter_" + std::to_string(iter+1), trace_type,
+            "ok", "", step.duration_ms, "",
+            g_last_token_usage.input_tokens, g_last_token_usage.output_tokens
+        });
+        if (on_step) on_step(step);
     }
 
     // Max iterations reached without final answer
@@ -2850,11 +2858,11 @@ json McpClient::make_request(const std::string& method, const json& params) {
     return resp.value("result", json::object());
 }
 
-json McpClient::initialize(const std::string& client_name, const std::string& version) {
+json McpClient::initialize(const std::string& client_name, const std::string& ver) {
     auto result = make_request("initialize", {
         {"protocolVersion", "2025-06-18"},
         {"capabilities", json::object()},
-        {"clientInfo", {{"name", client_name}, {"version", version}}}
+        {"clientInfo", {{"name", client_name}, {"version", ver}}}
     });
     // Send required initialized notification
     transport_->send({{"jsonrpc","2.0"},{"method","notifications/initialized"}});

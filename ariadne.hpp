@@ -33,19 +33,38 @@ using json = nlohmann::json;
 
 namespace ariadne {
 
+/** 库版本号 */
+constexpr const char* ARIADNE_VERSION = "0.8.0";
+inline std::string version() { return ARIADNE_VERSION; }
+
 
 // ════════════════════════════════════════════════════════════════
 // Token 用量追踪
 // ════════════════════════════════════════════════════════════════
 
 struct TokenUsage {
-    long input_tokens  = 0;
-    long output_tokens = 0;
-    long total_tokens  = 0;
+    long   input_tokens  = 0;
+    long   output_tokens = 0;
+    long   total_tokens  = 0;
+    double cost_usd      = 0.0;
     TokenUsage& operator+=(const TokenUsage& o) {
         input_tokens += o.input_tokens; output_tokens += o.output_tokens;
-        total_tokens += o.total_tokens; return *this;
+        total_tokens += o.total_tokens; cost_usd += o.cost_usd; return *this;
     }
+};
+
+/** 模型定价（每 1M tokens，USD） */
+struct ModelPricing {
+    double input_per_1m  = 0.0;
+    double output_per_1m = 0.0;
+    double cost(long in_tokens, long out_tokens) const {
+        return (in_tokens * input_per_1m + out_tokens * output_per_1m) / 1e6;
+    }
+    static ModelPricing free() { return {0.0, 0.0}; }
+    static ModelPricing gpt4o_mini() { return {0.15, 0.60}; }
+    static ModelPricing gpt4o() { return {2.50, 10.00}; }
+    static ModelPricing claude_sonnet() { return {3.00, 15.00}; }
+    static ModelPricing claude_opus() { return {15.00, 75.00}; }
 };
 
 inline thread_local TokenUsage g_last_token_usage{};
@@ -133,6 +152,51 @@ class ToolInputError : public ToolError {
 
 /** 流式输出回调：每收到一个文本 chunk 调用一次 */
 using StreamCallback = std::function<void(const std::string& chunk)>;
+
+// ════════════════════════════════════════════════════════════════
+// Structured Logging — 替代散落的 cerr/cout
+// ════════════════════════════════════════════════════════════════
+
+enum class LogLevel { LOG_DEBUG, LOG_INFO, LOG_WARN, LOG_ERROR };
+
+class ILogger {
+public:
+    virtual ~ILogger() = default;
+    virtual void log(LogLevel level, const std::string& component,
+                      const std::string& message) noexcept = 0;
+};
+
+class NullLogger : public ILogger {
+public:
+    void log(LogLevel, const std::string&, const std::string&) noexcept override {}
+};
+
+class ConsoleLogger : public ILogger {
+public:
+    explicit ConsoleLogger(LogLevel min_level = LogLevel::LOG_INFO) : min_(min_level) {}
+    void log(LogLevel level, const std::string& component,
+              const std::string& message) noexcept override {
+        if (level < min_) return;
+        static const char* names[] = {"DEBUG","INFO","WARN","ERR"};
+        try {
+            std::cerr << "[" << names[(int)level] << "] "
+                      << component << ": " << message << "\n";
+        } catch (...) {}
+    }
+private:
+    LogLevel min_;
+};
+
+inline std::shared_ptr<ILogger>& global_logger() {
+    static auto inst = std::shared_ptr<ILogger>(std::make_shared<NullLogger>());
+    return inst;
+}
+inline void set_logger(std::shared_ptr<ILogger> logger) {
+    if (logger) global_logger() = std::move(logger);
+}
+inline void log_msg(LogLevel level, const std::string& component, const std::string& msg) {
+    global_logger()->log(level, component, msg);
+}
 
 // ════════════════════════════════════════════════════════════════
 // 1. CURL 生命周期管理 (B1, B2)
@@ -1102,6 +1166,7 @@ struct AgentResult {
     bool                   success        = false;
     std::string            final_answer;
     std::vector<AgentStep> steps;
+    std::vector<TraceEntry> traces;
     int                    iterations_used = 0;
     int                    max_iterations  = 0;
     std::string            error;
@@ -1188,7 +1253,7 @@ public:
     ~McpClient();
 
     json initialize(const std::string& client_name = "ariadne",
-                     const std::string& version = "0.3.0");
+                     const std::string& ver = ARIADNE_VERSION);
     std::vector<ToolDef> list_tools();
     json call_tool(const std::string& name, const json& arguments);
     void close();
