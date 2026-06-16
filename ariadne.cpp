@@ -452,8 +452,11 @@ std::string GeminiProvider::complete(const std::string& prompt,
     body["generationConfig"] = gen_config;
 
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
-                    + cfg_.model + ":generateContent?key=" + cfg_.api_key;
-    auto resp = http_post(url, {"Content-Type: application/json"}, body.dump());
+                    + cfg_.model + ":generateContent";
+    auto resp = http_post(url,
+        {"Content-Type: application/json",
+         "x-goog-api-key: " + cfg_.api_key},
+        body.dump());
     if (resp.status_code == 429 || resp.status_code == 503) {
         std::string msg = "Gemini: " + std::to_string(resp.status_code) + " rate limited";
         if (!resp.retry_after.empty()) msg += " retry_after=" + resp.retry_after;
