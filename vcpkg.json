@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
   "name": "ariadne",
-  "version": "0.2.0",
-  "description": "C++ LLM workflow orchestration — DAG planning, ReACT agent loops, auto-probe providers",
+  "version": "1.2.0",
+  "description": "C++17 LLM workflow orchestration — DAG planning, ReACT agents, native tool calling, dynamic orchestration, visual editor",
   "homepage": "https://github.com/Used4Work/ariadne-cpp",
   "license": "MIT",
   "dependencies": [

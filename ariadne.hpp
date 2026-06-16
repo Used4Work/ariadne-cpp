@@ -42,7 +42,7 @@ inline long estimate_tokens(const std::string& text) {
 }
 
 /** 库版本号 */
-constexpr const char* ARIADNE_VERSION = "0.8.0";
+constexpr const char* ARIADNE_VERSION = "1.2.0";
 inline std::string version() { return ARIADNE_VERSION; }
 
 
