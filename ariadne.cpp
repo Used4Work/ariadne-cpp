@@ -135,9 +135,11 @@ std::string AnthropicProvider::complete(const std::string& prompt,
     try { j = json::parse(resp.body); }
     catch (...) { throw ProviderError("Anthropic: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
     if (j.contains("error"))
-        throw ProviderError("Anthropic: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("Anthropic: " + j["error"].value("message", j["error"].dump()));
     extract_token_usage(j);
-    return j["content"][0]["text"].get<std::string>();
+    if (!j.contains("content") || !j["content"].is_array() || j["content"].empty())
+        throw ProviderError("Anthropic: empty content in response");
+    return j["content"][0].value("text", "");
 }
 
 // ── AnthropicProvider::complete_chat (native tools) ─────────────
@@ -238,7 +240,7 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
     try { j = json::parse(resp.body); }
     catch (...) { throw ProviderError("Anthropic: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
     if (j.contains("error"))
-        throw ProviderError("Anthropic: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("Anthropic: " + j["error"].value("message", j["error"].dump()));
     extract_token_usage(j);
 
     LLMResponse result;
@@ -299,9 +301,11 @@ std::string OpenAIChatProvider::complete(const std::string& prompt,
     try { j = json::parse(resp.body); }
     catch (...) { throw ProviderError("OpenAI Chat: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
     if (j.contains("error"))
-        throw ProviderError("OpenAI Chat: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("OpenAI Chat: " + j["error"].value("message", j["error"].dump()));
     extract_token_usage(j);
-    return j["choices"][0]["message"]["content"].get<std::string>();
+    if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty())
+        throw ProviderError("OpenAI Chat: empty choices in response");
+    return j["choices"][0]["message"].value("content", "");
 }
 
 // ── OpenAIResponsesProvider ──────────────────────────────────────
@@ -328,9 +332,14 @@ std::string OpenAIResponsesProvider::complete(const std::string& prompt,
     try { j = json::parse(resp.body); }
     catch (...) { throw ProviderError("OpenAI Responses: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
     if (j.contains("error"))
-        throw ProviderError("OpenAI Responses: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("OpenAI Responses: " + j["error"].value("message", j["error"].dump()));
     extract_token_usage(j);
-    return j["output"][0]["content"][0]["text"].get<std::string>();
+    if (!j.contains("output") || !j["output"].is_array() || j["output"].empty())
+        throw ProviderError("OpenAI Responses: empty output in response");
+    const auto& out = j["output"][0];
+    if (out.contains("content") && out["content"].is_array() && !out["content"].empty())
+        return out["content"][0].value("text", "");
+    return out.value("text", "");
 }
 
 // ── ILLMProvider::complete_chat default ──────────────────────────
@@ -413,10 +422,12 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
     try { j = json::parse(resp.body); }
     catch (...) { throw ProviderError("OpenAI Chat: invalid JSON in chat response"); }
     if (j.contains("error"))
-        throw ProviderError("OpenAI Chat: " + j["error"]["message"].get<std::string>());
+        throw ProviderError("OpenAI Chat: " + j["error"].value("message", j["error"].dump()));
     extract_token_usage(j);
 
     LLMResponse result;
+    if (!j.contains("choices") || !j["choices"].is_array() || j["choices"].empty())
+        throw ProviderError("OpenAI Chat: empty choices in chat response");
     const auto& choice = j["choices"][0]["message"];
     result.content = choice.value("content", "");
 
@@ -511,7 +522,12 @@ std::string GeminiProvider::complete(const std::string& prompt,
         g_last_token_usage.output_tokens = u.value("candidatesTokenCount", 0L);
         g_last_token_usage.total_tokens  = u.value("totalTokenCount", 0L);
     }
-    return j["candidates"][0]["content"]["parts"][0]["text"].get<std::string>();
+    if (!j.contains("candidates") || !j["candidates"].is_array() || j["candidates"].empty())
+        throw ProviderError("Gemini: empty candidates in response");
+    const auto& parts = j["candidates"][0]["content"]["parts"];
+    if (!parts.is_array() || parts.empty())
+        throw ProviderError("Gemini: empty parts in response");
+    return parts[0].value("text", "");
 }
 
 LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messages,
@@ -597,7 +613,9 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
     }
 
     LLMResponse result;
-    if (j.contains("candidates") && !j["candidates"].empty()) {
+    if (j.contains("candidates") && j["candidates"].is_array() && !j["candidates"].empty()
+        && j["candidates"][0].contains("content")
+        && j["candidates"][0]["content"].contains("parts")) {
         const auto& parts = j["candidates"][0]["content"]["parts"];
         for (const auto& p : parts) {
             if (p.contains("text")) result.content += p["text"].get<std::string>();
