@@ -156,6 +156,27 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
                 msgs.push_back({{"role","user"},{"content", json::array({
                     {{"type","tool_result"},{"tool_use_id",m.tool_call_id},{"content",m.content}}
                 })}});
+            } else if (m.is_multimodal()) {
+                // Convert OpenAI-style image_url to Anthropic image format
+                json parts = json::array();
+                for (const auto& p : m.content_parts) {
+                    if (p.value("type","") == "text") {
+                        parts.push_back({{"type","text"},{"text",p.value("text","")}});
+                    } else if (p.value("type","") == "image_url") {
+                        std::string url = p["image_url"].value("url","");
+                        if (url.find("data:") == 0) {
+                            auto semi = url.find(';'); auto comma = url.find(',');
+                            std::string mt = (semi != std::string::npos) ? url.substr(5, semi-5) : "image/jpeg";
+                            std::string data = (comma != std::string::npos) ? url.substr(comma+1) : "";
+                            parts.push_back({{"type","image"},{"source",
+                                {{"type","base64"},{"media_type",mt},{"data",data}}}});
+                        } else {
+                            parts.push_back({{"type","image"},{"source",
+                                {{"type","url"},{"url",url}}}});
+                        }
+                    }
+                }
+                msgs.push_back({{"role","user"},{"content",parts}});
             } else {
                 msgs.push_back({{"role","user"},{"content",m.content}});
             }
@@ -303,7 +324,9 @@ std::string OpenAIResponsesProvider::complete(const std::string& prompt,
         throw ProviderError("OpenAI Responses: " + std::to_string(resp.status_code) + " rate limited");
     if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
         throw ProviderError("OpenAI Responses: " + std::to_string(resp.status_code) + " server error (retryable)");
-    auto j = json::parse(resp.body);
+    json j;
+    try { j = json::parse(resp.body); }
+    catch (...) { throw ProviderError("OpenAI Responses: invalid JSON (HTTP " + std::to_string(resp.status_code) + ")"); }
     if (j.contains("error"))
         throw ProviderError("OpenAI Responses: " + j["error"]["message"].get<std::string>());
     extract_token_usage(j);
@@ -337,8 +360,13 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
     json msgs = json::array();
     for (const auto& m : messages) {
         json msg = {{"role", m.role}};
-        if (!m.content.empty()) msg["content"] = m.content;
-        else msg["content"] = nullptr;
+        if (m.is_multimodal()) {
+            msg["content"] = m.content_parts;
+        } else if (!m.content.empty()) {
+            msg["content"] = m.content;
+        } else {
+            msg["content"] = nullptr;
+        }
         if (m.role == "assistant" && !m.tool_calls.is_null() && !m.tool_calls.empty())
             msg["tool_calls"] = m.tool_calls;
         if (m.role == "tool") {
@@ -374,9 +402,16 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
         {"Content-Type: application/json",
          "Authorization: Bearer " + cfg_.api_key},
         body.dump());
-    if (resp.status_code == 429)
-        throw ProviderError("OpenAI Chat: 429 Too Many Requests");
-    auto j = json::parse(resp.body);
+    if (resp.status_code == 429 || resp.status_code == 503) {
+        std::string msg = "OpenAI Chat: " + std::to_string(resp.status_code) + " rate limited";
+        if (!resp.retry_after.empty()) msg += " retry_after=" + resp.retry_after;
+        throw ProviderError(msg);
+    }
+    if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
+        throw ProviderError("OpenAI Chat: " + std::to_string(resp.status_code) + " server error (retryable)");
+    json j;
+    try { j = json::parse(resp.body); }
+    catch (...) { throw ProviderError("OpenAI Chat: invalid JSON in chat response"); }
     if (j.contains("error"))
         throw ProviderError("OpenAI Chat: " + j["error"]["message"].get<std::string>());
     extract_token_usage(j);

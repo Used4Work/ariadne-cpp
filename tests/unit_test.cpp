@@ -1262,6 +1262,31 @@ void test_mock_supports_native() {
     ASSERT(!client.supports_native_tools(ModelTier::ORCHESTRATOR));
 }
 
+// ── Multimodal Messages ─────────────────────────────────
+void test_chat_message_text() {
+    auto m = ChatMessage::text("user", "hello");
+    ASSERT(m.role == "user");
+    ASSERT(m.content == "hello");
+    ASSERT(!m.is_multimodal());
+}
+
+void test_chat_message_with_image() {
+    auto m = ChatMessage::with_image("What's this?", "SGVsbG8=", "image/png");
+    ASSERT(m.role == "user");
+    ASSERT(m.is_multimodal());
+    ASSERT(m.content_parts.size() == 2);
+    ASSERT(m.content_parts[0]["type"] == "text");
+    ASSERT(m.content_parts[1]["type"] == "image_url");
+    std::string url = m.content_parts[1]["image_url"]["url"];
+    ASSERT(url.find("data:image/png;base64,SGVsbG8=") != std::string::npos);
+}
+
+void test_chat_message_with_image_url() {
+    auto m = ChatMessage::with_image_url("Describe", "https://example.com/img.jpg");
+    ASSERT(m.is_multimodal());
+    ASSERT(m.content_parts[1]["image_url"]["url"] == "https://example.com/img.jpg");
+}
+
 // ── Gemini Provider ─────────────────────────────────────
 void test_gemini_config() {
     auto c = ProviderConfig::gemini("test-key");
@@ -1491,6 +1516,10 @@ int main() {
     std::cout<<"\n=== Native Tool Calling ===\n";
     RUN(test_chat_message_struct); RUN(test_llm_tool_call_struct);
     RUN(test_llm_response_with_tools); RUN(test_mock_supports_native);
+
+    std::cout<<"\n=== Multimodal Messages ===\n";
+    RUN(test_chat_message_text); RUN(test_chat_message_with_image);
+    RUN(test_chat_message_with_image_url);
 
     std::cout<<"\n=== Gemini Provider ===\n";
     RUN(test_gemini_config); RUN(test_gemini_pro_pricing); RUN(test_gemini_make_provider);

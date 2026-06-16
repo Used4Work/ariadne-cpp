@@ -346,6 +346,32 @@ struct ChatMessage {
     json        tool_calls;     // assistant 消息的 tool_calls 数组
     std::string tool_call_id;   // tool 结果消息的 call ID
     std::string name;           // tool result 的工具名
+    json        content_parts;  // multimodal: [{type,text},{type,image_url}] — 非空时替代 content
+
+    /** 创建纯文本消息 */
+    static ChatMessage text(const std::string& role, const std::string& text) {
+        return {role, text, {}, "", "", {}};
+    }
+    /** 创建含图片的多模态消息（base64 编码） */
+    static ChatMessage with_image(const std::string& text,
+                                   const std::string& base64_data,
+                                   const std::string& media_type = "image/jpeg") {
+        json parts = json::array();
+        parts.push_back({{"type","text"},{"text",text}});
+        parts.push_back({{"type","image_url"},
+            {"image_url",{{"url","data:" + media_type + ";base64," + base64_data}}}});
+        return {"user", "", {}, "", "", parts};
+    }
+    /** 创建含图片 URL 的多模态消息 */
+    static ChatMessage with_image_url(const std::string& text,
+                                       const std::string& url) {
+        json parts = json::array();
+        parts.push_back({{"type","text"},{"text",text}});
+        parts.push_back({{"type","image_url"},{"image_url",{{"url",url}}}});
+        return {"user", "", {}, "", "", parts};
+    }
+
+    bool is_multimodal() const { return !content_parts.is_null() && !content_parts.empty(); }
 };
 
 struct LLMToolCall {
