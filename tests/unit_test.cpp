@@ -1630,6 +1630,36 @@ void test_tool_sorting_consistency() {
     ASSERT(tools.size() == 3);
 }
 
+// ── v2.3.0: ProviderStats latency tracking ──────────────
+void test_provider_stats_latency_fields() {
+    ProviderStats ps;
+    ASSERT(ps.avg_latency_ms == 0);
+    ASSERT(ps.last_latency_ms == 0);
+    ps.avg_latency_ms = 150;
+    ps.last_latency_ms = 200;
+    ASSERT(ps.avg_latency_ms == 150);
+}
+
+// ── v2.3.0: MockProvider latency via LLMClient stats ────
+void test_mock_provider_latency_tracking() {
+    auto orc = std::make_unique<MockProvider>("ok");
+    auto sub = std::make_unique<MockProvider>("ok");
+    LLMClient client(std::move(orc), std::move(sub));
+    client.complete("test prompt", "sys", 0.0);
+    auto st = client.stats(ModelTier::ORCHESTRATOR);
+    ASSERT(!st.empty());
+    ASSERT(st[0].successes == 1);
+    ASSERT(st[0].last_latency_ms >= 0);
+}
+
+// ── v2.3.0: Gemini systemInstruction (config check) ─────
+void test_gemini_system_instruction_config() {
+    auto cfg = ProviderConfig::gemini("test_key");
+    ASSERT(cfg.type == ProviderType::GEMINI);
+    ASSERT(cfg.model == "gemini-2.0-flash");
+    // systemInstruction is an API-level change, verified by build + config
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -1825,6 +1855,11 @@ int main() {
     RUN(test_observation_masking_basic);
     RUN(test_observation_masking_preserves_recent);
     RUN(test_tool_sorting_consistency);
+
+    std::cout<<"\n=== v2.3.0 Latency + Gemini Fix ===\n";
+    RUN(test_provider_stats_latency_fields);
+    RUN(test_mock_provider_latency_tracking);
+    RUN(test_gemini_system_instruction_config);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

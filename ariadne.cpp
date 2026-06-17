@@ -67,7 +67,9 @@ HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
     curl_easy_setopt(c, CURLOPT_WRITEDATA,     &resp.body);
     curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, +header_cb);
     curl_easy_setopt(c, CURLOPT_HEADERDATA,     &resp_headers);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT,        (long)cfg_.timeout_sec);
+    // Adaptive timeout: scale with max_tokens to prevent premature timeout on long generations
+    double adaptive_timeout = std::max(cfg_.timeout_sec, cfg_.max_tokens / 30.0 + 10.0);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,        (long)adaptive_timeout);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
     CURLcode rc = curl_easy_perform(c);
@@ -639,12 +641,10 @@ std::string GeminiProvider::complete(const std::string& prompt,
                                       bool force_json,
                                       const json& output_schema) const {
     json contents = json::array();
-    if (!sys.empty()) {
-        contents.push_back({{"role","user"},{"parts",{{{"text", sys + "\n\n" + prompt}}}}});
-    } else {
-        contents.push_back({{"role","user"},{"parts",{{{"text", prompt}}}}});
-    }
+    contents.push_back({{"role","user"},{"parts",{{{"text", prompt}}}}});
     json body = {{"contents", contents}};
+    if (!sys.empty())
+        body["systemInstruction"] = {{"parts",{{{"text", sys}}}}};
     json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
     if (!output_schema.is_null() && !output_schema.empty()) {
         gen_config["responseMimeType"] = "application/json";
@@ -797,12 +797,10 @@ void GeminiProvider::complete_stream(const std::string& prompt,
                                       double temp,
                                       StreamCallback on_chunk) const {
     json contents = json::array();
-    if (!sys.empty()) {
-        contents.push_back({{"role","user"},{"parts",{{{"text", sys + "\n\n" + prompt}}}}});
-    } else {
-        contents.push_back({{"role","user"},{"parts",{{{"text", prompt}}}}});
-    }
+    contents.push_back({{"role","user"},{"parts",{{{"text", prompt}}}}});
     json body = {{"contents", contents}};
+    if (!sys.empty())
+        body["systemInstruction"] = {{"parts",{{{"text", sys}}}}};
     json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
     body["generationConfig"] = gen_config;
 
@@ -935,9 +933,17 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
         constexpr int MAX_RATE_RETRIES = 3;
         for (int rate_retry = 0; rate_retry <= MAX_RATE_RETRIES; ++rate_retry) {
             try {
+                auto call_t0 = std::chrono::steady_clock::now();
                 auto res = slot.provider->complete(prompt, system, temperature, force_json, output_schema);
+                auto call_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - call_t0).count();
                 slot.breaker.on_success();
-                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
+                {
+                    std::lock_guard<std::mutex> lk(*slot.stats_mu);
+                    ++slot.successes;
+                    slot.total_latency_ms += call_ms;
+                    slot.last_latency_ms = call_ms;
+                }
                 {
                     std::lock_guard<std::mutex> lk(usage_mu_);
                     cumulative_usage_ += g_last_token_usage;
@@ -1007,7 +1013,9 @@ std::vector<ProviderStats> LLMClient::stats(ModelTier tier) const {
         ps.provider_name = s.provider->provider_name();
         ps.model_name    = s.provider->model_name();
         { std::lock_guard<std::mutex> lk(*s.stats_mu);
-          ps.total_calls = s.calls; ps.successes = s.successes; ps.failures = s.failures; }
+          ps.total_calls = s.calls; ps.successes = s.successes; ps.failures = s.failures;
+          ps.avg_latency_ms = s.successes > 0 ? s.total_latency_ms / s.successes : 0;
+          ps.last_latency_ms = s.last_latency_ms; }
         ps.circuit_state = s.breaker.state();
         ps.secs_to_retry = s.breaker.seconds_until_retry();
         out.push_back(ps);

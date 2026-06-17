@@ -2,6 +2,16 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.3.0] - 2026-06-17
+
+### Added
+- **Provider latency tracking** (D66): `ProviderStats.avg_latency_ms` and `last_latency_ms`. Tracked per-slot in `try_slots()` on success path.
+- **Adaptive timeout** (D67): HTTP timeout now scales with `max_tokens` — `max(base, max_tokens/30 + 10s)`. Prevents premature timeout on long generations.
+- 3 new tests (156 total)
+
+### Fixed
+- **Gemini systemInstruction** (D68): `complete()` and `complete_stream()` now use proper `systemInstruction` API field instead of prepending system prompt to user content. Matches `complete_chat()` behavior.
+
 ## [2.2.0] - 2026-06-17
 
 ### Added

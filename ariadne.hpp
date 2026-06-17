@@ -46,7 +46,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.2.0";
+constexpr const char* ARIADNE_VERSION = "2.3.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -729,6 +729,8 @@ struct ProviderStats {
     long                  failures      = 0;
     CircuitBreaker::State circuit_state = CircuitBreaker::State::CLOSED;
     double                secs_to_retry = 0.0;
+    long                  avg_latency_ms = 0;
+    long                  last_latency_ms = 0;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -791,6 +793,7 @@ private:
         mutable RateLimiter                 rate_limiter;
         mutable std::unique_ptr<std::mutex> stats_mu{std::make_unique<std::mutex>()};
         mutable long calls = 0, successes = 0, failures = 0;
+        mutable long total_latency_ms = 0, last_latency_ms = 0;
     };
     std::vector<Slot> orchestrators_, subagents_;
     mutable std::mutex usage_mu_;
