@@ -2,6 +2,57 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.0] - 2026-06-17
+
+### Added
+- `tool_choice` parameter across all providers (OpenAI/Anthropic/Gemini) — auto/none/required/specific
+- `McpError` exception class for MCP transport/protocol errors
+- Real Gemini SSE streaming via `streamGenerateContent?alt=sse` (was fake word-split)
+- Anthropic `json_schema` structured output (constrained decoding via `response_format`)
+- Gemini `responseSchema` for JSON schema-constrained output
+- 7 new unit tests (147 total)
+
+### Fixed
+- **Version drift**: all 5 version sources (CMake, vcpkg, Doxyfile, hpp, ports) synced to 2.1.0
+- **Exception hierarchy**: 21 `std::runtime_error` → typed exceptions (ProviderError, StepExecutionError, McpError)
+- **D41 violation**: `ConsoleMetrics::record()` used `std::cout` → now uses `log_msg()`
+- **ResponseCache collision**: FNV-1a hash key → full canonical key (zero collision risk)
+- **Silent SSE overflow**: 16MB buffer abort now logs `LOG_ERROR` instead of failing silently
+- SseParser moved before provider implementations (fixes Gemini streaming compilation)
+
+### Changed
+- `ILLMProvider::complete_chat()` signature: added `tool_choice` parameter (default "auto")
+- `AnthropicProvider::complete()`: `output_schema` now used for `json_schema` response format
+- `GeminiProvider::complete()`: `output_schema` now used for `responseSchema` constrained decoding
+
+## [2.0.1] - 2026-06-17
+
+### Fixed
+- MCP HTTP notification crash on empty 202 response body
+- Dead code: unreachable `cosine_similarity()` removed after pre-normalization
+- Vector store: dimension mismatch returns score=0 instead of silent truncation
+
+## [2.0.0] - 2026-06-17
+
+### Added
+- `InMemoryVectorStore` — cosine similarity, pre-normalized, O(N log K) partial_sort query
+- MCP HTTP transport (`HttpTransport`, Streamable HTTP)
+- Doxygen → GitHub Pages CI workflow
+- Convenience constructors: `WorkflowEngine(ProviderConfig)`, `WorkflowEngine(orc, sub)`
+
+## [1.6.0] - 2026-06-16
+
+### Added
+- Full README rewrite, comprehensive Quick Start
+- Integration tests (mock DAG, dynamic parallel, multimodal roundtrip)
+- Version sync test
+
+## [1.5.1] - 2026-06-16
+
+### Fixed
+- All C4244 int64→long truncation warnings (21 occurrences)
+- Doc accuracy (Studio API, file line counts)
+
 ## [1.5.0] - 2026-06-16
 
 ### Added

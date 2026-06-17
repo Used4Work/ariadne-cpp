@@ -46,7 +46,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "1.5.1";
+constexpr const char* ARIADNE_VERSION = "2.1.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -139,6 +139,11 @@ public:
     std::string step_id;
     std::string reason_;
     json state_snapshot;
+};
+
+/** MCP 传输/协议错误 */
+class McpError : public AriadneError {
+    using AriadneError::AriadneError;
 };
 
 /** Guardrail 验证函数：返回 nullopt=通过，或 string=错误原因 */
@@ -451,10 +456,12 @@ public:
     virtual std::string model_name()    const = 0;
 
     /** Native tool calling — 多轮对话 + 结构化工具调用
+     *  tool_choice: "auto"(default), "none", "required", or tool name
      *  默认实现回退到 complete()（仅用于不支持原生工具的 provider） */
     virtual LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                        const std::vector<ToolDef>& tools = {},
-                                       double temperature = 0.0) const;
+                                       double temperature = 0.0,
+                                       const std::string& tool_choice = "auto") const;
 
     /** 是否支持原生工具调用 */
     virtual bool supports_native_tools() const { return false; }
@@ -498,7 +505,8 @@ public:
                           StreamCallback on_chunk) const override;
     LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
-                               double temperature = 0.0) const override;
+                               double temperature = 0.0,
+                               const std::string& tool_choice = "auto") const override;
     bool supports_native_tools() const override { return true; }
     std::string provider_name() const override { return "anthropic"; }
     std::string model_name()    const override { return cfg_.model;   }
@@ -519,7 +527,8 @@ public:
                           StreamCallback on_chunk) const override;
     LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
-                               double temperature = 0.0) const override;
+                               double temperature = 0.0,
+                               const std::string& tool_choice = "auto") const override;
     bool supports_native_tools() const override { return true; }
     std::string provider_name() const override {
         return cfg_.base_url.empty() ? "openai_chat" : "openai_compatible";
@@ -559,7 +568,8 @@ public:
                           StreamCallback on_chunk) const override;
     LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
-                               double temperature = 0.0) const override;
+                               double temperature = 0.0,
+                               const std::string& tool_choice = "auto") const override;
     bool supports_native_tools() const override { return true; }
     std::string provider_name() const override { return "gemini"; }
     std::string model_name()    const override { return cfg_.model; }
@@ -740,11 +750,13 @@ public:
         return complete_as(ModelTier::ORCHESTRATOR, prompt, system, temperature);
     }
 
-    /** Native tool calling — multi-turn chat with structured tool calls */
+    /** Native tool calling — multi-turn chat with structured tool calls
+     *  tool_choice: "auto", "none", "required", or specific tool name */
     LLMResponse complete_chat(ModelTier tier,
                                const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
-                               double temperature = 0.0) const;
+                               double temperature = 0.0,
+                               const std::string& tool_choice = "auto") const;
     bool supports_native_tools(ModelTier tier) const;
 
     std::vector<ProviderStats> stats(ModelTier tier) const;
@@ -1170,7 +1182,7 @@ public:
     void record(const MetricEvent&) noexcept override {}
 };
 
-/** 控制台输出：每条事件一行 JSON */
+/** 控制台输出：每条事件一行 JSON（通过 ILogger 输出） */
 class ConsoleMetrics : public IMetricsCollector {
 public:
     void record(const MetricEvent& e) noexcept override {
@@ -1191,7 +1203,7 @@ public:
             };
             if (!e.provider.empty()) j["provider"] = e.provider;
             if (!e.error.empty())    j["error"]    = e.error;
-            std::cout << "[metrics] " << j.dump() << "\n";
+            log_msg(LogLevel::LOG_INFO, "metrics", j.dump());
         } catch (...) {}
     }
 };

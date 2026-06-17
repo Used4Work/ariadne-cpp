@@ -1,5 +1,5 @@
 PROJECT_NAME           = "Ariadne"
-PROJECT_NUMBER         = 1.5.1
+PROJECT_NUMBER         = 2.1.0
 PROJECT_BRIEF          = "C++17 LLM Workflow Orchestration"
 
 INPUT                  = ariadne.hpp

@@ -73,7 +73,7 @@ HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
     CURLcode rc = curl_easy_perform(c);
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
-        throw std::runtime_error(std::string("curl: ") + curl_easy_strerror(rc));
+        throw ProviderError(std::string("curl: ") + curl_easy_strerror(rc));
     // Parse Retry-After from response headers
     auto ra_pos = resp_headers.find("retry-after:");
     if (ra_pos == std::string::npos) ra_pos = resp_headers.find("Retry-After:");
@@ -105,18 +105,95 @@ static void extract_token_usage(const json& j) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════
+// SSE 解析 + Streaming 实现 (moved before providers for visibility)
+// ════════════════════════════════════════════════════════════════
+
+struct SseParser {
+    StreamCallback callback;
+    std::string    buffer;
+    std::string    provider_type;   // "anthropic" | "openai" | "gemini"
+    bool           done = false;
+
+    void feed(const char* data, size_t len) {
+        if (buffer.size() + len > 16 * 1024 * 1024) {
+            log_msg(LogLevel::LOG_ERROR, "SSE",
+                "buffer exceeds 16MB, aborting stream (possible malformed SSE)");
+            done = true; buffer.clear(); return;
+        }
+        buffer.append(data, len);
+        size_t pos;
+        while ((pos = buffer.find('\n')) != std::string::npos) {
+            std::string line = buffer.substr(0, pos);
+            buffer = buffer.substr(pos + 1);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size() < 6 || line.substr(0,6) != "data: ") continue;
+            std::string payload = line.substr(6);
+            if (payload == "[DONE]") { done = true; continue; }
+            try {
+                auto j = json::parse(payload);
+                std::string chunk;
+                if (provider_type == "anthropic") {
+                    if (j.value("type","") == "content_block_delta")
+                        chunk = j["delta"].value("text","");
+                } else if (provider_type == "gemini") {
+                    if (j.contains("candidates") && !j["candidates"].empty()) {
+                        const auto& parts = j["candidates"][0]["content"]["parts"];
+                        if (parts.is_array() && !parts.empty())
+                            chunk = parts[0].value("text","");
+                    }
+                } else {
+                    if (j.contains("choices") && !j["choices"].empty())
+                        chunk = j["choices"][0]["delta"].value("content","");
+                }
+                if (!chunk.empty()) callback(chunk);
+            } catch (...) {}
+        }
+    }
+};
+
+static size_t sse_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    static_cast<SseParser*>(userdata)->feed(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+static void do_stream_post(const std::string& url,
+                             const std::vector<std::string>& hdrs,
+                             const std::string& body,
+                             SseParser& parser,
+                             double timeout_sec) {
+    CurlHandle curl;
+    CURL* c = curl.get();
+    struct curl_slist* h = nullptr;
+    for (const auto& s : hdrs) h = curl_slist_append(h, s.c_str());
+    curl_easy_setopt(c, CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER,    h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS,    body.c_str());
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sse_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &parser);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,       (long)timeout_sec);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
+    CURLcode rc = curl_easy_perform(c);
+    curl_slist_free_all(h);
+    if (rc != CURLE_OK)
+        throw ProviderError(std::string("curl stream: ") + curl_easy_strerror(rc));
+}
+
 // ── AnthropicProvider ────────────────────────────────────────────
 
 std::string AnthropicProvider::complete(const std::string& prompt,
                                           const std::string& sys,
                                           double temp,
                                           bool force_json,
-                                          const json& /*output_schema*/) const {
+                                          const json& output_schema) const {
     json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
                   {"temperature", temp},
                   {"messages", {{{"role","user"}, {"content", prompt}}}}};
     if (!sys.empty()) body["system"] = sys;
-    if (force_json)
+    if (!output_schema.is_null() && !output_schema.empty())
+        body["response_format"] = {{"type","json_schema"},{"json_schema",output_schema}};
+    else if (force_json)
         body["response_format"] = {{"type", "json_object"}};
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
     auto resp = http_post(base + "/v1/messages",
@@ -146,7 +223,8 @@ std::string AnthropicProvider::complete(const std::string& prompt,
 
 LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                                const std::vector<ToolDef>& tools,
-                                               double temperature) const {
+                                               double temperature,
+                                               const std::string& tool_choice) const {
     // Build messages array (Anthropic format: user/assistant alternating)
     json msgs = json::array();
     std::string system_prompt;
@@ -223,7 +301,11 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
             });
         }
         body["tools"] = tools_arr;
-        body["tool_choice"] = {{"type","auto"}};
+        if (tool_choice == "none") body["tool_choice"] = {{"type","none"}};
+        else if (tool_choice == "required") body["tool_choice"] = {{"type","any"}};
+        else if (tool_choice != "auto" && !tool_choice.empty())
+            body["tool_choice"] = {{"type","tool"},{"name",tool_choice}};
+        else body["tool_choice"] = {{"type","auto"}};
     }
 
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
@@ -409,7 +491,8 @@ void InMemoryVectorStore::clear() {
 
 LLMResponse ILLMProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                           const std::vector<ToolDef>& /*tools*/,
-                                          double temperature) const {
+                                          double temperature,
+                                          const std::string& /*tool_choice*/) const {
     // Default: concatenate messages into a single prompt, call complete()
     std::string system, prompt;
     for (const auto& m : messages) {
@@ -427,7 +510,8 @@ LLMResponse ILLMProvider::complete_chat(const std::vector<ChatMessage>& messages
 
 LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                                 const std::vector<ToolDef>& tools,
-                                                double temperature) const {
+                                                double temperature,
+                                                const std::string& tool_choice) const {
     // Build messages array
     json msgs = json::array();
     for (const auto& m : messages) {
@@ -465,7 +549,11 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
             });
         }
         body["tools"] = tools_array;
-        body["tool_choice"] = "auto";
+        if (tool_choice == "none") body["tool_choice"] = "none";
+        else if (tool_choice == "required") body["tool_choice"] = "required";
+        else if (tool_choice != "auto" && !tool_choice.empty())
+            body["tool_choice"] = {{"type","function"},{"function",{{"name",tool_choice}}}};
+        else body["tool_choice"] = "auto";
     }
 
     std::string base = cfg_.base_url.empty() ? "https://api.openai.com" : rtrim_slash(cfg_.base_url);
@@ -514,7 +602,8 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
 LLMResponse LLMClient::complete_chat(ModelTier tier,
                                        const std::vector<ChatMessage>& messages,
                                        const std::vector<ToolDef>& tools,
-                                       double temperature) const {
+                                       double temperature,
+                                       const std::string& tool_choice) const {
     const auto& slots = (tier == ModelTier::ORCHESTRATOR) ? orchestrators_ : subagents_;
     std::string last_error;
     for (const auto& slot : slots) {
@@ -523,7 +612,7 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
         if (slot.rate_limiter.enabled())
             if (!slot.rate_limiter.acquire(10000)) continue;
         try {
-            auto resp = slot.provider->complete_chat(messages, tools, temperature);
+            auto resp = slot.provider->complete_chat(messages, tools, temperature, tool_choice);
             slot.breaker.on_success();
             { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
             { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
@@ -548,7 +637,7 @@ std::string GeminiProvider::complete(const std::string& prompt,
                                       const std::string& sys,
                                       double temp,
                                       bool force_json,
-                                      const json& /*output_schema*/) const {
+                                      const json& output_schema) const {
     json contents = json::array();
     if (!sys.empty()) {
         contents.push_back({{"role","user"},{"parts",{{{"text", sys + "\n\n" + prompt}}}}});
@@ -557,7 +646,10 @@ std::string GeminiProvider::complete(const std::string& prompt,
     }
     json body = {{"contents", contents}};
     json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
-    if (force_json) gen_config["responseMimeType"] = "application/json";
+    if (!output_schema.is_null() && !output_schema.empty()) {
+        gen_config["responseMimeType"] = "application/json";
+        gen_config["responseSchema"] = output_schema;
+    } else if (force_json) gen_config["responseMimeType"] = "application/json";
     body["generationConfig"] = gen_config;
 
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -595,7 +687,8 @@ std::string GeminiProvider::complete(const std::string& prompt,
 
 LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                            const std::vector<ToolDef>& tools,
-                                           double temperature) const {
+                                           double temperature,
+                                           const std::string& tool_choice) const {
     json contents = json::array();
     std::string system_instruction;
     for (const auto& m : messages) {
@@ -652,6 +745,11 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
             fn_decls.push_back({{"name",t.name},{"description",t.description},
                 {"parameters", t.input_schema.empty() ? json({{"type","object"}}) : t.input_schema}});
         body["tools"] = json::array({{{"functionDeclarations", fn_decls}}});
+        if (tool_choice == "none") body["tool_config"] = {{"function_calling_config",{{"mode","NONE"}}}};
+        else if (tool_choice == "required") body["tool_config"] = {{"function_calling_config",{{"mode","ANY"}}}};
+        else if (tool_choice != "auto" && !tool_choice.empty())
+            body["tool_config"] = {{"function_calling_config",{{"mode","ANY"},{"allowed_function_names",json::array({tool_choice})}}}};
+        else body["tool_config"] = {{"function_calling_config",{{"mode","AUTO"}}}};
     }
 
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -698,10 +796,23 @@ void GeminiProvider::complete_stream(const std::string& prompt,
                                       const std::string& sys,
                                       double temp,
                                       StreamCallback on_chunk) const {
-    auto full = complete(prompt, sys, temp);
-    std::istringstream iss(full);
-    std::string word;
-    while (std::getline(iss, word, ' ')) on_chunk(word + " ");
+    json contents = json::array();
+    if (!sys.empty()) {
+        contents.push_back({{"role","user"},{"parts",{{{"text", sys + "\n\n" + prompt}}}}});
+    } else {
+        contents.push_back({{"role","user"},{"parts",{{{"text", prompt}}}}});
+    }
+    json body = {{"contents", contents}};
+    json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
+    body["generationConfig"] = gen_config;
+
+    std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
+                    + cfg_.model + ":streamGenerateContent?alt=sse";
+    SseParser parser{on_chunk, "", "gemini"};
+    do_stream_post(url,
+        {"Content-Type: application/json",
+         "x-goog-api-key: " + cfg_.api_key},
+        body.dump(), parser, cfg_.timeout_sec);
 }
 
 // ── make_provider ────────────────────────────────────────────────
@@ -1442,9 +1553,9 @@ json WorkflowExecutor::run_step(const Step& step, const WorkflowState& state,
             double elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - t0).count();
             if (elapsed >= step.timeout_sec)
-                throw std::runtime_error("Step '" + step.id + "' timed out after "
-                    + std::to_string((int)elapsed) + "s (limit: "
-                    + std::to_string((int)step.timeout_sec) + "s)");
+                throw StepExecutionError(step.id, step.description,
+                    "timed out after " + std::to_string((int)elapsed)
+                    + "s (limit: " + std::to_string((int)step.timeout_sec) + "s)");
             if (i < step.retry) {
                 std::uniform_int_distribution<int> jitter(0, 200);
                 int delay_ms = 500 * (1 << i) + jitter(rng);
@@ -1470,7 +1581,7 @@ json WorkflowExecutor::dispatch(const Step& step, const json& inputs) const {
         auto v = inputs.value("value", json(nullptr));
         return !v.is_null() && v != false && v != 0 && v != "";
     }
-    default: throw std::runtime_error("Unknown step type");
+    default: throw StepExecutionError(step.id, step.description, "unknown step type");
     }
 }
 
@@ -1562,7 +1673,7 @@ json WorkflowExecutor::exec_transform(const Step& s, const json& in) const {
         const std::string text = in.value("text", std::string{});
         try { return json::parse(text); }
         catch (const std::exception& e) {
-            throw std::runtime_error("parse_json: invalid JSON input — " + std::string(e.what()));
+            throw StepExecutionError("", "parse_json", "invalid JSON input — " + std::string(e.what()));
         }
     }
     if (s.action == "head") {
@@ -2135,7 +2246,7 @@ void FileCheckpointStore::save(const std::string& workflow_id, const json& state
 
 json FileCheckpointStore::load(const std::string& workflow_id) {
     std::ifstream f(dir_ + "/" + workflow_id + ".checkpoint.json");
-    if (!f) throw std::runtime_error("Checkpoint not found: " + workflow_id);
+    if (!f) throw AriadneError("Checkpoint not found: " + workflow_id);
     return json::parse(f);
 }
 
@@ -2174,20 +2285,12 @@ std::string WorkflowResult::summary() const {
 // ResponseCache — LLM 响应缓存
 // ════════════════════════════════════════════════════════════════
 
-static size_t simple_hash(const std::string& s) {
-    // FNV-1a hash — 快速、低碰撞
-    size_t h = 14695981039346656037ULL;
-    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
-    return h;
-}
-
 std::string ResponseCache::make_key(const std::string& model, const std::string& system,
                                       const std::string& prompt, double temperature,
                                       bool force_json) {
-    std::string canonical = model + "\x00" + system + "\x00" + prompt + "\x00"
-                          + std::to_string(temperature) + "\x00"
-                          + (force_json ? "1" : "0");
-    return std::to_string(simple_hash(canonical));
+    return model + "\x00" + system + "\x00" + prompt + "\x00"
+         + std::to_string(temperature) + "\x00"
+         + (force_json ? "1" : "0");
 }
 
 bool ResponseCache::has(const std::string& key) const {
@@ -2222,6 +2325,12 @@ void ResponseCache::put(const std::string& key, const std::string& response) {
 // PlanCache
 // ════════════════════════════════════════════════════════════════
 
+static size_t fnv1a_hash(const std::string& s) {
+    size_t h = 14695981039346656037ULL;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+}
+
 std::string PlanCache::normalize_key(const std::string& task,
                                       const std::vector<ToolDef>& tools,
                                       const std::string& context) {
@@ -2244,7 +2353,7 @@ std::string PlanCache::normalize_key(const std::string& task,
     while (!norm.empty() && norm.back() == ' ') norm.pop_back();
     key += norm;
     if (!context.empty()) {
-        key += "|ctx:" + std::to_string(simple_hash(context));
+        key += "|ctx:" + std::to_string(fnv1a_hash(context));
     }
     return key;
 }
@@ -2406,74 +2515,6 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
 }
 
 
-
-// ════════════════════════════════════════════════════════════════
-// SSE 解析 + Streaming 实现
-// ════════════════════════════════════════════════════════════════
-
-struct SseParser {
-    StreamCallback callback;
-    std::string    buffer;
-    std::string    provider_type;   // "anthropic" | "openai"
-    bool           done = false;
-
-    void feed(const char* data, size_t len) {
-        if (buffer.size() + len > 16 * 1024 * 1024) {
-            // L1: Malformed SSE: buffer exceeds 16MB — abort streaming
-            done = true; buffer.clear(); return;
-        }
-        buffer.append(data, len);
-        size_t pos;
-        while ((pos = buffer.find('\n')) != std::string::npos) {
-            std::string line = buffer.substr(0, pos);
-            buffer = buffer.substr(pos + 1);
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.size() < 6 || line.substr(0,6) != "data: ") continue;
-            std::string payload = line.substr(6);
-            if (payload == "[DONE]") { done = true; continue; }
-            try {
-                auto j = json::parse(payload);
-                std::string chunk;
-                if (provider_type == "anthropic") {
-                    if (j.value("type","") == "content_block_delta")
-                        chunk = j["delta"].value("text","");
-                } else {
-                    if (j.contains("choices") && !j["choices"].empty())
-                        chunk = j["choices"][0]["delta"].value("content","");
-                }
-                if (!chunk.empty()) callback(chunk);
-            } catch (...) {}
-        }
-    }
-};
-
-static size_t sse_write_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    static_cast<SseParser*>(userdata)->feed(ptr, size * nmemb);
-    return size * nmemb;
-}
-
-static void do_stream_post(const std::string& url,
-                             const std::vector<std::string>& hdrs,
-                             const std::string& body,
-                             SseParser& parser,
-                             double timeout_sec) {
-    CurlHandle curl;  // 每次流式请求独立 handle
-    CURL* c = curl.get();
-    struct curl_slist* h = nullptr;
-    for (const auto& s : hdrs) h = curl_slist_append(h, s.c_str());
-    curl_easy_setopt(c, CURLOPT_URL,           url.c_str());
-    curl_easy_setopt(c, CURLOPT_HTTPHEADER,    h);
-    curl_easy_setopt(c, CURLOPT_POSTFIELDS,    body.c_str());
-    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE, (long)body.size());
-    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, sse_write_cb);
-    curl_easy_setopt(c, CURLOPT_WRITEDATA,     &parser);
-    curl_easy_setopt(c, CURLOPT_TIMEOUT,       (long)timeout_sec);
-    curl_easy_setopt(c, CURLOPT_NOSIGNAL,      1L);
-    CURLcode rc = curl_easy_perform(c);
-    curl_slist_free_all(h);
-    if (rc != CURLE_OK)
-        throw std::runtime_error(std::string("curl stream: ") + curl_easy_strerror(rc));
-}
 
 void AnthropicProvider::complete_stream(const std::string& prompt,
                                           const std::string& sys,
@@ -3460,7 +3501,7 @@ void HttpTransport::send(const json& message) {
     CURLcode rc = curl_easy_perform(c);
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
-        throw std::runtime_error(std::string("MCP HTTP: ") + curl_easy_strerror(rc));
+        throw McpError(std::string("MCP HTTP: ") + curl_easy_strerror(rc));
     if (resp_body.empty()) {
         pending_response_ = json::object();
         has_pending_ = true;
@@ -3469,13 +3510,13 @@ void HttpTransport::send(const json& message) {
             pending_response_ = json::parse(resp_body);
             has_pending_ = true;
         } catch (...) {
-            throw std::runtime_error("MCP HTTP: invalid JSON response");
+            throw McpError("MCP HTTP: invalid JSON response");
         }
     }
 }
 
 json HttpTransport::receive() {
-    if (!has_pending_) throw std::runtime_error("MCP HTTP: no pending response");
+    if (!has_pending_) throw McpError("MCP HTTP: no pending response");
     has_pending_ = false;
     return pending_response_;
 }
@@ -3508,7 +3549,7 @@ StdioTransport::StdioTransport(const std::string& command, const std::vector<std
     PROCESS_INFORMATION pi{};
     if (!CreateProcessA(nullptr, const_cast<char*>(cmdline.c_str()),
                         nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
-        throw std::runtime_error("MCP: failed to spawn: " + command);
+        throw McpError("MCP: failed to spawn: " + command);
     CloseHandle(child_stdin_rd);
     CloseHandle(child_stdout_wr);
     CloseHandle(pi.hThread);
@@ -3521,14 +3562,14 @@ StdioTransport::StdioTransport(const std::string& command, const std::vector<std
 StdioTransport::~StdioTransport() { close(); }
 
 void StdioTransport::send(const json& message) {
-    if (closed_) throw std::runtime_error("MCP: transport closed");
+    if (closed_) throw McpError("MCP: transport closed");
     std::string line = message.dump() + "\n";
     DWORD written;
     WriteFile(stdin_write_, line.c_str(), (DWORD)line.size(), &written, nullptr);
 }
 
 json StdioTransport::receive() {
-    if (closed_) throw std::runtime_error("MCP: transport closed");
+    if (closed_) throw McpError("MCP: transport closed");
     std::string line;
     char ch;
     DWORD rd;
@@ -3536,7 +3577,7 @@ json StdioTransport::receive() {
         if (ch == '\n') break;
         if (ch != '\r') line += ch;
     }
-    if (line.empty()) throw std::runtime_error("MCP: empty response");
+    if (line.empty()) throw McpError("MCP: empty response");
     return json::parse(line);
 }
 
@@ -3558,9 +3599,9 @@ void StdioTransport::close() {
 StdioTransport::StdioTransport(const std::string& command, const std::vector<std::string>& args) {
     int stdin_pipe[2], stdout_pipe[2];
     if (pipe(stdin_pipe) != 0 || pipe(stdout_pipe) != 0)
-        throw std::runtime_error("MCP: pipe failed");
+        throw McpError("MCP: pipe failed");
     pid_t pid = fork();
-    if (pid < 0) throw std::runtime_error("MCP: fork failed");
+    if (pid < 0) throw McpError("MCP: fork failed");
     if (pid == 0) {
         ::close(stdin_pipe[1]); dup2(stdin_pipe[0], STDIN_FILENO); ::close(stdin_pipe[0]);
         ::close(stdout_pipe[0]); dup2(stdout_pipe[1], STDOUT_FILENO); ::close(stdout_pipe[1]);
@@ -3581,20 +3622,20 @@ StdioTransport::StdioTransport(const std::string& command, const std::vector<std
 StdioTransport::~StdioTransport() { close(); }
 
 void StdioTransport::send(const json& message) {
-    if (closed_) throw std::runtime_error("MCP: transport closed");
+    if (closed_) throw McpError("MCP: transport closed");
     std::string line = message.dump() + "\n";
     ::write(stdin_fd_, line.c_str(), line.size());
 }
 
 json StdioTransport::receive() {
-    if (closed_) throw std::runtime_error("MCP: transport closed");
+    if (closed_) throw McpError("MCP: transport closed");
     std::string line;
     char ch;
     while (::read(stdout_fd_, &ch, 1) == 1) {
         if (ch == '\n') break;
         if (ch != '\r') line += ch;
     }
-    if (line.empty()) throw std::runtime_error("MCP: empty response");
+    if (line.empty()) throw McpError("MCP: empty response");
     return json::parse(line);
 }
 
@@ -3625,7 +3666,7 @@ json McpClient::make_request(const std::string& method, const json& params) {
     transport_->send(req);
     auto resp = transport_->receive();
     if (resp.contains("error"))
-        throw std::runtime_error("MCP error: " + resp["error"].value("message", "unknown"));
+        throw McpError("MCP error: " + resp["error"].value("message", "unknown"));
     return resp.value("result", json::object());
 }
 
@@ -3642,7 +3683,7 @@ json McpClient::initialize(const std::string& client_name, const std::string& ve
 }
 
 std::vector<ToolDef> McpClient::list_tools() {
-    if (!initialized_) throw std::runtime_error("MCP: not initialized");
+    if (!initialized_) throw McpError("MCP: not initialized");
     auto result = make_request("tools/list");
     discovered_tools_.clear();
     if (result.contains("tools")) {
@@ -3659,7 +3700,7 @@ std::vector<ToolDef> McpClient::list_tools() {
 }
 
 json McpClient::call_tool(const std::string& name, const json& arguments) {
-    if (!initialized_) throw std::runtime_error("MCP: not initialized");
+    if (!initialized_) throw McpError("MCP: not initialized");
     auto result = make_request("tools/call", {{"name", name}, {"arguments", arguments}});
     if (result.value("isError", false)) {
         std::string err;
