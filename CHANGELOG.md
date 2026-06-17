@@ -2,6 +2,17 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.2.0] - 2026-06-17
+
+### Added
+- **Observation masking** (D64): replaces simple truncation in agent history. Old tool results → `[masked, N chars]`, keeps last 6 verbatim. Based on JetBrains/NeurIPS research (+2.6% solve rate, -50% cost). Applied to `run_agent()`, `run_multi_agent()`, and `run_agent_native()`
+- **Sorted tool definitions** (D65): tools sorted alphabetically before prompt construction for stable provider cache prefix. Applied to both `build_agent_prompt()` and `run_agent_native()` tool list
+- 3 new tests (153 total)
+
+### Changed
+- `build_agent_prompt()` takes tools by value for in-place sorting
+- Native agent history eviction upgraded from message deletion to content masking (preserves conversation structure)
+
 ## [2.1.1] - 2026-06-17
 
 ### Added

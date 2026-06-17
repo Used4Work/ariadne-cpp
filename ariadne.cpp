@@ -2999,11 +2999,36 @@ struct LoopDetector {
     }
 };
 
+static std::string mask_old_observations(const std::string& history, int keep_recent = 6) {
+    size_t result_count = 0;
+    size_t tmp = 0;
+    while ((tmp = history.find("Result: ", tmp)) != std::string::npos) { ++result_count; tmp += 8; }
+    if (result_count <= (size_t)keep_recent) return history;
+    size_t mask_count = result_count - keep_recent;
+    size_t seen = 0;
+    std::string out;
+    std::istringstream iss(history);
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (line.find("Result: ") == 0 && seen < mask_count) {
+            out += "Result: [masked, " + std::to_string(line.size()) + " chars]\n";
+            ++seen;
+        } else {
+            out += line + "\n";
+            if (line.find("Result: ") == 0) ++seen;
+        }
+    }
+    return out;
+}
+
 static std::string build_agent_prompt(const std::string& task,
-                                       const std::vector<ToolDef>& tools,
+                                       std::vector<ToolDef> tools,
                                        const std::string& history,
                                        int iteration,
                                        int max_iterations) {
+    // Sort tools alphabetically for stable cache-friendly ordering
+    std::sort(tools.begin(), tools.end(),
+        [](const ToolDef& a, const ToolDef& b) { return a.name < b.name; });
     json tool_list = json::array();
     for (const auto& t : tools)
         tool_list.push_back({{"name",t.name},{"description",t.description},{"inputs",t.input_schema}});
@@ -3055,6 +3080,9 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
     }
 
     auto tools = tools_->list_tools();
+    // Sort tools alphabetically for stable cache-friendly ordering
+    std::sort(tools.begin(), tools.end(),
+        [](const ToolDef& a, const ToolDef& b) { return a.name < b.name; });
     LoopDetector loop_detector;
 
     std::vector<ChatMessage> messages;
@@ -3153,15 +3181,25 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         });
         if (on_step) on_step(step);
 
-        // History eviction: trim old messages when token estimate exceeds threshold
+        // Observation masking: mask old tool result content to save tokens
         long total_msg_tokens = 0;
         for (const auto& m : messages) total_msg_tokens += estimate_tokens(m.content);
-        if (total_msg_tokens > 8000 && messages.size() > 4) {
-            // Keep system (index 0), first user (index 1), and recent 2/3
-            size_t keep_from = 2 + (messages.size() - 2) / 3;
-            messages.erase(messages.begin() + 2, messages.begin() + (long)keep_from);
-            log_msg(LogLevel::LOG_DEBUG, "Agent",
-                "native agent history trimmed to " + std::to_string(messages.size()) + " messages");
+        if (total_msg_tokens > 8000) {
+            // Count tool result messages, mask all but last 6
+            int tool_count = 0;
+            for (const auto& m : messages) if (m.role == "tool") ++tool_count;
+            int keep_recent = std::min(tool_count, 6);
+            int mask_target = tool_count - keep_recent;
+            int masked = 0;
+            for (auto& m : messages) {
+                if (m.role == "tool" && masked < mask_target) {
+                    m.content = "[masked, " + std::to_string(m.content.size()) + " chars]";
+                    ++masked;
+                }
+            }
+            if (masked > 0)
+                log_msg(LogLevel::LOG_DEBUG, "Agent",
+                    "masked " + std::to_string(masked) + " old tool results");
         }
     }
 
@@ -3263,19 +3301,14 @@ AgentResult WorkflowEngine::run_agent(const std::string& task, int max_iteration
             }
             step.observation = obs;
 
-            // Append to history
-            // L2: Truncate large observations to avoid context window overflow
             std::string obs_str = obs.dump();
             if (obs_str.size() > 800) obs_str = obs_str.substr(0, 800) + "...[truncated]";
             history += "[iter " + std::to_string(iter+1) + "]\n"
                     +  "Thought: " + action.thought + "\n"
                     +  "Called: " + action.tool_name + "(" + action.tool_args.dump() + ")\n"
                     +  "Result: " + obs_str + "\n\n";
-            // L2: Trim history if it exceeds 4000 chars (keep last 2/3)
-            if (estimate_tokens(history) > 2000) {
-                auto cut = history.find("\n[iter ", history.size() / 3);
-                if (cut != std::string::npos) history = history.substr(cut);
-            }
+            if (estimate_tokens(history) > 2000)
+                history = mask_old_observations(history);
 
             // 收敛检测：记录指纹，检测循环
             loop_detector.record(action.tool_name, action.tool_args, obs);
@@ -3458,10 +3491,8 @@ AgentResult WorkflowEngine::run_multi_agent(const std::string& task,
                     +  "Thought: " + action.thought + "\n"
                     +  "Called: " + action.tool_name + "(" + action.tool_args.dump() + ")\n"
                     +  "Result: " + obs_str + "\n\n";
-            if (estimate_tokens(history) > 2000) {
-                auto cut = history.find("\n[iter ", history.size() / 3);
-                if (cut != std::string::npos) history = history.substr(cut);
-            }
+            if (estimate_tokens(history) > 2000)
+                history = mask_old_observations(history);
         }
 
         step.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
