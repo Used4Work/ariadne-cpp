@@ -2,6 +2,18 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.1.1] - 2026-06-17
+
+### Added
+- MockProvider now supports native tool calling (`complete_chat()`, `supports_native_tools()`, `set_tool_calls()`)
+- Native agent history eviction: `run_agent_native()` trims messages when token estimate > 8000 (D60)
+- Explicit `= delete` for copy/move on WorkflowEngine and DynamicWorkflow
+- 3 new tests (150 total)
+
+### Fixed
+- **StdioTransport Windows pipe leak**: 4 handles leaked if `CreateProcessA` failed — now cleaned up before throw
+- `test_mock_supports_native` updated to match new MockProvider behavior
+
 ## [2.1.0] - 2026-06-17
 
 ### Added

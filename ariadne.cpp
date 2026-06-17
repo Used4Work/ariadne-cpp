@@ -3152,6 +3152,17 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
             g_last_token_usage.input_tokens, g_last_token_usage.output_tokens
         });
         if (on_step) on_step(step);
+
+        // History eviction: trim old messages when token estimate exceeds threshold
+        long total_msg_tokens = 0;
+        for (const auto& m : messages) total_msg_tokens += estimate_tokens(m.content);
+        if (total_msg_tokens > 8000 && messages.size() > 4) {
+            // Keep system (index 0), first user (index 1), and recent 2/3
+            size_t keep_from = 2 + (messages.size() - 2) / 3;
+            messages.erase(messages.begin() + 2, messages.begin() + (long)keep_from);
+            log_msg(LogLevel::LOG_DEBUG, "Agent",
+                "native agent history trimmed to " + std::to_string(messages.size()) + " messages");
+        }
     }
 
     if (!result.success && result.error.empty()) {
@@ -3548,8 +3559,11 @@ StdioTransport::StdioTransport(const std::string& command, const std::vector<std
     si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
     PROCESS_INFORMATION pi{};
     if (!CreateProcessA(nullptr, const_cast<char*>(cmdline.c_str()),
-                        nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+                        nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(child_stdin_rd); CloseHandle(child_stdin_wr);
+        CloseHandle(child_stdout_rd); CloseHandle(child_stdout_wr);
         throw McpError("MCP: failed to spawn: " + command);
+    }
     CloseHandle(child_stdin_rd);
     CloseHandle(child_stdout_wr);
     CloseHandle(pi.hThread);

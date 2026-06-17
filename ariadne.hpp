@@ -577,7 +577,7 @@ public:
 
 std::unique_ptr<ILLMProvider> make_provider(const ProviderConfig& cfg);
 
-/** 测试用 Mock Provider — 返回预设响应 */
+/** 测试用 Mock Provider — 返回预设响应，支持原生工具调用模拟 */
 class MockProvider : public ILLMProvider {
 public:
     explicit MockProvider(std::string response, std::string name = "mock", std::string model = "mock-1")
@@ -589,12 +589,28 @@ public:
                           double, StreamCallback on_chunk) const override {
         on_chunk(response_);
     }
+    LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
+                               const std::vector<ToolDef>& tools = {},
+                               double temperature = 0.0,
+                               const std::string& tool_choice = "auto") const override {
+        LLMResponse r;
+        if (!mock_tool_calls_.empty()) {
+            r.tool_calls = mock_tool_calls_;
+            mock_tool_calls_.clear();
+        } else {
+            r.content = response_;
+        }
+        return r;
+    }
+    bool supports_native_tools() const override { return true; }
     std::string provider_name() const override { return name_; }
     std::string model_name()    const override { return model_; }
 
     void set_response(const std::string& r) { response_ = r; }
+    void set_tool_calls(const std::vector<LLMToolCall>& calls) { mock_tool_calls_ = calls; }
 private:
     std::string response_, name_, model_;
+    mutable std::vector<LLMToolCall> mock_tool_calls_;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -1488,6 +1504,9 @@ public:
     WorkflowEngine(const ProviderConfig& orchestrator, const ProviderConfig& subagent)
         : WorkflowEngine(EngineConfig::from_two(orchestrator, subagent)) {}
 
+    WorkflowEngine(const WorkflowEngine&)            = delete;
+    WorkflowEngine& operator=(const WorkflowEngine&) = delete;
+
     void           register_tool(const ToolDef& def, ToolFn fn);
 
     /** 单次运行，无记忆 */
@@ -1698,6 +1717,8 @@ class DynamicWorkflow {
 public:
     explicit DynamicWorkflow(WorkflowEngine& engine, size_t max_concurrency = 0);
     ~DynamicWorkflow();
+    DynamicWorkflow(const DynamicWorkflow&)            = delete;
+    DynamicWorkflow& operator=(const DynamicWorkflow&) = delete;
 
     // ── 核心原语 ────────────────────────────────────────
 

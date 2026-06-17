@@ -8,7 +8,7 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-147%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-150%20passed-brightgreen)](#tests)
 
 </div>
 
@@ -119,7 +119,7 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 147 tests
+./build/unit_tests          # 150 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
@@ -181,7 +181,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 147 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 150 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 
