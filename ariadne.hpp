@@ -384,8 +384,6 @@ public:
 private:
     mutable std::shared_mutex mu_;
     std::vector<VectorEntry> entries_;
-
-    static float cosine_similarity(const std::vector<float>& a, const std::vector<float>& b);
 };
 
 // ── Native Tool Calling 数据类型 ─────────────────────────

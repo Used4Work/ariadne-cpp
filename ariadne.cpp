@@ -346,18 +346,6 @@ std::string OpenAIResponsesProvider::complete(const std::string& prompt,
 // InMemoryVectorStore — cosine similarity search
 // ════════════════════════════════════════════════════════════════
 
-float InMemoryVectorStore::cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
-    if (a.size() != b.size() || a.empty()) return 0.0f;
-    float dot = 0.0f, na = 0.0f, nb = 0.0f;
-    for (size_t i = 0; i < a.size(); ++i) {
-        dot += a[i] * b[i];
-        na  += a[i] * a[i];
-        nb  += b[i] * b[i];
-    }
-    float denom = std::sqrt(na) * std::sqrt(nb);
-    return (denom > 1e-9f) ? (dot / denom) : 0.0f;
-}
-
 static std::vector<float> normalize_vec(const std::vector<float>& v) {
     float norm = 0.0f;
     for (float x : v) norm += x * x;
@@ -385,8 +373,12 @@ std::vector<VectorResult> InMemoryVectorStore::query(const std::vector<float>& e
     std::vector<VectorResult> scored;
     scored.reserve(entries_.size());
     for (const auto& e : entries_) {
+        if (q.size() != e.embedding.size()) {
+            scored.push_back({e.id, 0.0f, e.metadata});
+            continue;
+        }
         float dot = 0.0f;
-        for (size_t i = 0; i < q.size() && i < e.embedding.size(); ++i)
+        for (size_t i = 0; i < q.size(); ++i)
             dot += q[i] * e.embedding[i];
         scored.push_back({e.id, dot, e.metadata});
     }
@@ -3469,11 +3461,16 @@ void HttpTransport::send(const json& message) {
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
         throw std::runtime_error(std::string("MCP HTTP: ") + curl_easy_strerror(rc));
-    try {
-        pending_response_ = json::parse(resp_body);
+    if (resp_body.empty()) {
+        pending_response_ = json::object();
         has_pending_ = true;
-    } catch (...) {
-        throw std::runtime_error("MCP HTTP: invalid JSON response");
+    } else {
+        try {
+            pending_response_ = json::parse(resp_body);
+            has_pending_ = true;
+        } catch (...) {
+            throw std::runtime_error("MCP HTTP: invalid JSON response");
+        }
     }
 }
 
