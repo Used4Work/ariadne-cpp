@@ -606,23 +606,65 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
                                        const std::vector<ToolDef>& tools,
                                        double temperature,
                                        const std::string& tool_choice) const {
+    // Token budget check (parity with try_slots)
+    if (token_budget_ > 0 && cumulative_usage_.total_tokens >= token_budget_)
+        throw TokenBudgetError("Token budget exceeded: " +
+            std::to_string(cumulative_usage_.total_tokens) + "/" +
+            std::to_string(token_budget_));
+
     const auto& slots = (tier == ModelTier::ORCHESTRATOR) ? orchestrators_ : subagents_;
     std::string last_error;
     for (const auto& slot : slots) {
-        if (!slot.breaker.try_allow()) continue;
+        if (!slot.breaker.try_allow()) {
+            last_error = slot.provider->provider_name() + " [OPEN]";
+            continue;
+        }
         { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.calls; }
         if (slot.rate_limiter.enabled())
-            if (!slot.rate_limiter.acquire(10000)) continue;
-        try {
-            auto resp = slot.provider->complete_chat(messages, tools, temperature, tool_choice);
-            slot.breaker.on_success();
-            { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.successes; }
-            { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
-            return resp;
-        } catch (const std::exception& e) {
-            slot.breaker.on_failure();
-            { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
-            last_error = e.what();
+            if (!slot.rate_limiter.acquire(10000)) {
+                last_error = slot.provider->provider_name() + " [RATE_LIMIT_TIMEOUT]";
+                continue;
+            }
+        // 429/503 retry with backoff (parity with try_slots)
+        constexpr int MAX_RATE_RETRIES = 3;
+        for (int rate_retry = 0; rate_retry <= MAX_RATE_RETRIES; ++rate_retry) {
+            try {
+                auto call_t0 = std::chrono::steady_clock::now();
+                auto resp = slot.provider->complete_chat(messages, tools, temperature, tool_choice);
+                auto call_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - call_t0).count();
+                slot.breaker.on_success();
+                {
+                    std::lock_guard<std::mutex> lk(*slot.stats_mu);
+                    ++slot.successes;
+                    slot.total_latency_ms += call_ms;
+                    slot.last_latency_ms = call_ms;
+                }
+                { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
+                return resp;
+            } catch (const std::exception& e) {
+                std::string emsg = e.what();
+                bool is_rate_limit = emsg.find("429") != std::string::npos
+                                  || emsg.find("503") != std::string::npos;
+                if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
+                    int backoff_sec = 3 * (1 << rate_retry);
+                    auto ra_pos = emsg.find("retry_after=");
+                    if (ra_pos != std::string::npos) {
+                        try { backoff_sec = std::stoi(emsg.substr(ra_pos + 12)); }
+                        catch (...) {}
+                    }
+                    if (backoff_sec > 120) backoff_sec = 120;
+                    log_msg(LogLevel::LOG_WARN, "LLMClient",
+                        slot.provider->provider_name() + " chat rate limited, retry "
+                        + std::to_string(rate_retry+1) + "/" + std::to_string(MAX_RATE_RETRIES));
+                    std::this_thread::sleep_for(std::chrono::seconds(backoff_sec));
+                    continue;
+                }
+                if (!is_rate_limit) slot.breaker.on_failure();
+                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                last_error = emsg;
+                break;
+            }
         }
     }
     throw AllProvidersExhaustedError("Chat providers exhausted. Last: " + last_error);

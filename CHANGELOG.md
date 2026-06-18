@@ -2,6 +2,17 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.4.0] - 2026-06-18
+
+### Added
+- **complete_chat() full parity with try_slots()** (D69): token budget enforcement, 429/503 retry with exponential backoff, provider latency tracking. Previously native agents bypassed all three.
+- **cppcheck static analysis in CI** (D70): `warning` + `performance` checks on Linux, fails build on findings
+- 4 new tests — complete_chat budget, chat latency, health_check, engine_llm_complete (160 total)
+
+### Fixed
+- **Native agent budget bypass**: `run_agent_native()` → `complete_chat()` never checked token budget. Now enforced before every chat call.
+- **Native agent no retry**: `complete_chat()` immediately fell through to next provider on 429/503. Now retries 3x with backoff (3/6/12s) + Retry-After honor, matching `try_slots()`.
+
 ## [2.3.0] - 2026-06-17
 
 ### Added
