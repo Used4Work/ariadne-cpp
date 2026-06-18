@@ -646,7 +646,14 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
                 std::string emsg = e.what();
                 bool is_rate_limit = emsg.find("429") != std::string::npos
                                   || emsg.find("503") != std::string::npos;
-                if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
+                bool is_fatal = emsg.find("401") != std::string::npos
+                             || emsg.find("403") != std::string::npos
+                             || emsg.find("invalid_api_key") != std::string::npos;
+                if (is_fatal) {
+                    { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                    throw AllProvidersExhaustedError(
+                        slot.provider->provider_name() + ": fatal error — " + emsg);
+                } else if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
                     int backoff_sec = 3 * (1 << rate_retry);
                     auto ra_pos = emsg.find("retry_after=");
                     if (ra_pos != std::string::npos) {
@@ -659,11 +666,16 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
                         + std::to_string(rate_retry+1) + "/" + std::to_string(MAX_RATE_RETRIES));
                     std::this_thread::sleep_for(std::chrono::seconds(backoff_sec));
                     continue;
+                } else {
+                    if (is_rate_limit) {
+                        last_error = slot.provider->provider_name() + " [RATE_LIMITED, exhausted retries]";
+                    } else {
+                        slot.breaker.on_failure();
+                        last_error = emsg;
+                    }
+                    { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                    break;
                 }
-                if (!is_rate_limit) slot.breaker.on_failure();
-                { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
-                last_error = emsg;
-                break;
             }
         }
     }
