@@ -329,7 +329,7 @@ struct ProviderConfig {
     }
     /** Google Gemini (free tier: 15 RPM for Flash models) */
     static ProviderConfig gemini(const std::string& key,
-                                  const std::string& model = "gemini-2.0-flash") {
+                                  const std::string& model = "gemini-2.5-flash") {
         ProviderConfig c;
         c.type     = ProviderType::GEMINI;
         c.api_key  = key;

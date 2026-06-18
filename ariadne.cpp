@@ -316,8 +316,11 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
          "x-api-key: " + cfg_.api_key,
          "anthropic-version: 2024-10-22"},
         body.dump());
-    if (resp.status_code == 429 || resp.status_code == 503)
-        throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 429 || resp.status_code == 503) {
+        std::string msg = "Anthropic: " + std::to_string(resp.status_code) + " rate limited";
+        if (!resp.retry_after.empty()) msg += " retry_after=" + resp.retry_after;
+        throw ProviderError(msg);
+    }
     if (resp.status_code == 500 || resp.status_code == 502 || resp.status_code == 504)
         throw ProviderError("Anthropic: " + std::to_string(resp.status_code) + " server error (retryable)");
     json j;
@@ -811,8 +814,11 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
     auto resp = http_post(url,
         {"Content-Type: application/json", "x-goog-api-key: " + cfg_.api_key},
         body.dump());
-    if (resp.status_code == 429 || resp.status_code == 503)
-        throw ProviderError("Gemini: " + std::to_string(resp.status_code) + " rate limited");
+    if (resp.status_code == 429 || resp.status_code == 503) {
+        std::string msg = "Gemini: " + std::to_string(resp.status_code) + " rate limited";
+        if (!resp.retry_after.empty()) msg += " retry_after=" + resp.retry_after;
+        throw ProviderError(msg);
+    }
     if (resp.status_code >= 500)
         throw ProviderError("Gemini: " + std::to_string(resp.status_code) + " server error");
     json j;

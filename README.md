@@ -154,7 +154,7 @@ All 9 providers support native tool calling via `complete_chat()`.
 |---|---|---|---|---|
 | `github_models(token)` | openai/gpt-4o-mini | Yes | 6 RPM | Yes |
 | `llm7()` | deepseek-v3-0324 | Yes (no signup) | 30 RPM | Yes |
-| `gemini(key)` | gemini-2.0-flash | Yes (15 RPM) | 15 RPM | Yes |
+| `gemini(key)` | gemini-2.5-flash | Yes (15 RPM) | 15 RPM | Yes |
 | `cerebras(key)` | llama-3.3-70b | Yes (1M tok/day) | 30 RPM | Yes |
 | `sambanova(key)` | Meta-Llama-3.3-70B | Yes | 30 RPM | Yes |
 | `groq(key)` | llama-3.3-70b | Yes | 30 RPM | Yes |

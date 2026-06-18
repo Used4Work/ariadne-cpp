@@ -1291,7 +1291,7 @@ void test_chat_message_with_image_url() {
 void test_gemini_config() {
     auto c = ProviderConfig::gemini("test-key");
     ASSERT(c.type == ProviderType::GEMINI);
-    ASSERT(c.model == "gemini-2.0-flash");
+    ASSERT(c.model == "gemini-2.5-flash");
     ASSERT(c.max_rps == 0.25);
     ASSERT(c.pricing.input_per_1m == 0.075);
 }
@@ -1304,7 +1304,7 @@ void test_gemini_pro_pricing() {
 void test_gemini_make_provider() {
     auto p = make_provider(ProviderConfig::gemini("key"));
     ASSERT(p->provider_name() == "gemini");
-    ASSERT(p->model_name() == "gemini-2.0-flash");
+    ASSERT(p->model_name() == "gemini-2.5-flash");
     ASSERT(p->supports_native_tools());
 }
 
@@ -1543,7 +1543,7 @@ void test_sse_parser_gemini() {
     std::string captured;
     // SseParser is internal, but we can test its format handling indirectly
     // through Gemini config validation
-    auto cfg = ProviderConfig::gemini("test_key", "gemini-2.0-flash");
+    auto cfg = ProviderConfig::gemini("test_key", "gemini-2.5-flash");
     ASSERT(cfg.type == ProviderType::GEMINI);
     ASSERT(cfg.max_rps == 0.25);
 }
@@ -1656,7 +1656,7 @@ void test_mock_provider_latency_tracking() {
 void test_gemini_system_instruction_config() {
     auto cfg = ProviderConfig::gemini("test_key");
     ASSERT(cfg.type == ProviderType::GEMINI);
-    ASSERT(cfg.model == "gemini-2.0-flash");
+    ASSERT(cfg.model == "gemini-2.5-flash");
     // systemInstruction is an API-level change, verified by build + config
 }
 
