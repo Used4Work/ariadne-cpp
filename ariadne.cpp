@@ -3136,12 +3136,14 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         [](const ToolDef& a, const ToolDef& b) { return a.name < b.name; });
     LoopDetector loop_detector;
 
-    std::vector<ChatMessage> messages;
-    messages.push_back({"system",
+    static const char* NATIVE_AGENT_SYS =
         "You are a helpful AI agent. Use the provided tools to gather information. "
         "When you have enough data, respond with a text message containing your final answer. "
-        "You may call multiple tools in parallel when appropriate.",
-        {}, "", ""});
+        "You may call multiple tools in parallel when appropriate.";
+    std::string sys_prompt = custom_agent_prompt_.empty() ? NATIVE_AGENT_SYS : custom_agent_prompt_;
+
+    std::vector<ChatMessage> messages;
+    messages.push_back({"system", sys_prompt, {}, "", ""});
     messages.push_back({"user", task, {}, "", ""});
 
     for (int iter = 0; iter < max_iterations; ++iter) {
@@ -3236,21 +3238,28 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         long total_msg_tokens = 0;
         for (const auto& m : messages) total_msg_tokens += estimate_tokens(m.content);
         if (total_msg_tokens > 8000) {
-            // Count tool result messages, mask all but last 6
-            int tool_count = 0;
-            for (const auto& m : messages) if (m.role == "tool") ++tool_count;
-            int keep_recent = std::min(tool_count, 6);
-            int mask_target = tool_count - keep_recent;
-            int masked = 0;
+            // Mask old tool results AND assistant reasoning (keep last 6 of each)
+            int tool_count = 0, asst_count = 0;
+            for (const auto& m : messages) {
+                if (m.role == "tool") ++tool_count;
+                else if (m.role == "assistant") ++asst_count;
+            }
+            int tool_mask = std::max(0, tool_count - 6);
+            int asst_mask = std::max(0, asst_count - 6);
+            int t_seen = 0, a_seen = 0, masked = 0;
             for (auto& m : messages) {
-                if (m.role == "tool" && masked < mask_target) {
+                if (m.role == "tool" && t_seen++ < tool_mask) {
                     m.content = "[masked, " + std::to_string(m.content.size()) + " chars]";
+                    ++masked;
+                } else if (m.role == "assistant" && a_seen++ < asst_mask && !m.content.empty()) {
+                    m.content = m.content.substr(0, std::min(m.content.size(), (size_t)100))
+                              + "... [masked]";
                     ++masked;
                 }
             }
             if (masked > 0)
                 log_msg(LogLevel::LOG_DEBUG, "Agent",
-                    "masked " + std::to_string(masked) + " old tool results");
+                    "masked " + std::to_string(masked) + " old messages");
         }
     }
 
