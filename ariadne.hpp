@@ -37,7 +37,10 @@ namespace ariadne {
 /** 粗略 token 估算（英文 ~4 chars/token, 中文 ~2 chars/token） */
 inline long estimate_tokens(const std::string& text) {
     long ascii = 0, non_ascii = 0;
-    for (unsigned char c : text) { if (c < 128) ++ascii; else ++non_ascii; }
+    for (unsigned char c : text) {
+        if (c < 128) ++ascii;
+        else if ((c & 0xC0) != 0x80) ++non_ascii; // skip UTF-8 continuation bytes
+    }
     return ascii / 4 + non_ascii / 2 + 1;
 }
 

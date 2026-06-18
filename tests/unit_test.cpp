@@ -1815,6 +1815,23 @@ void test_engine_health_check_exists() {
     ASSERT(engine.has_tool("nonexistent") == false);
 }
 
+// ── v2.5.0: CJK token estimation fix ────────────────────
+void test_estimate_tokens_cjk() {
+    // "你好" is 2 CJK chars = 6 UTF-8 bytes (3 each)
+    // Should estimate ~1-2 tokens, NOT 3 (old bug counted continuation bytes)
+    std::string cjk = "\xe4\xbd\xa0\xe5\xa5\xbd"; // "你好" in UTF-8
+    long tokens = estimate_tokens(cjk);
+    ASSERT(tokens <= 3); // 2 non-ascii chars / 2 + 1 = 2
+    ASSERT(tokens >= 1);
+}
+
+void test_estimate_tokens_mixed_cjk_ascii() {
+    // "hello你好" = 5 ASCII + 2 CJK = 5/4 + 2/2 + 1 = ~3
+    std::string mixed = "hello\xe4\xbd\xa0\xe5\xa5\xbd";
+    long tokens = estimate_tokens(mixed);
+    ASSERT(tokens >= 2 && tokens <= 5);
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -2034,6 +2051,8 @@ int main() {
     RUN(test_prompt_template_json_vars);
     RUN(test_prompt_registry);
     RUN(test_engine_prompt_registry);
+    RUN(test_estimate_tokens_cjk);
+    RUN(test_estimate_tokens_mixed_cjk_ascii);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";
