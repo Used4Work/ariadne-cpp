@@ -1750,6 +1750,31 @@ void test_chat_fatal_error_detection() {
     ASSERT(ps.failures == 1);
 }
 
+// ── v2.5.0: Dynamic workflow composer ────────────────────
+void test_dynamic_compose_strategy_enum() {
+    OrchestratorStrategy s = OrchestratorStrategy::DYNAMIC_COMPOSE;
+    ASSERT(s == OrchestratorStrategy::DYNAMIC_COMPOSE);
+}
+
+void test_dynamic_compose_plan_struct() {
+    OrchestratorPlan plan;
+    plan.strategy = OrchestratorStrategy::DYNAMIC_COMPOSE;
+    plan.workflow_steps = json::array({
+        {{"type","agent"},{"task","research X"},{"max_iterations",5}},
+        {{"type","llm_call"},{"prompt","summarize $prev"}}
+    });
+    ASSERT(plan.workflow_steps.size() == 2);
+    ASSERT(plan.workflow_steps[0]["type"] == "agent");
+}
+
+void test_dynamic_compose_result_struct() {
+    OrchestratorResult r;
+    r.strategy_used = "dynamic_compose";
+    r.success = true;
+    r.output = "composed result";
+    ASSERT(r.strategy_used == "dynamic_compose");
+}
+
 // ── v2.4.1: WorkflowEngine health_check (no network) ───
 void test_engine_health_check_exists() {
     auto cfg = ProviderConfig::openai_compatible("k", "http://localhost:1", "m");
@@ -1970,6 +1995,9 @@ int main() {
     RUN(test_native_masking_covers_assistant);
     RUN(test_chat_fatal_error_detection);
     RUN(test_engine_health_check_exists);
+    RUN(test_dynamic_compose_strategy_enum);
+    RUN(test_dynamic_compose_plan_struct);
+    RUN(test_dynamic_compose_result_struct);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

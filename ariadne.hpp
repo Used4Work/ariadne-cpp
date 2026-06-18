@@ -1795,7 +1795,8 @@ enum class OrchestratorStrategy {
     AGENT_LOOP,         // 单 agent 循环
     PARALLEL_RESEARCH,  // 并行扇出 + 综合
     PIPELINE_VERIFY,    // 流水线：研究 → 分析 → 验证
-    MULTI_AGENT         // 多 agent 协作
+    MULTI_AGENT,        // 多 agent 协作
+    DYNAMIC_COMPOSE     // LLM 直接编写自定义工作流
 };
 
 struct OrchestratorPlan {
@@ -1804,6 +1805,7 @@ struct OrchestratorPlan {
     std::vector<std::string>     subtasks;
     std::string                  synthesis_prompt;
     int                          max_iterations = 8;
+    json                         workflow_steps; // DYNAMIC_COMPOSE: LLM 编排的步骤
 };
 
 struct OrchestratorResult {
@@ -1823,6 +1825,12 @@ public:
 
     /** 自动分析任务 → 选择策略 → 编排执行 → 返回结果 */
     OrchestratorResult run(const std::string& task);
+
+    /** LLM 直接编写自定义工作流 → 动态执行
+     *  不从预设策略中选择，而是让 ORCHESTRATOR LLM 根据任务
+     *  自由组合 primitives (agent/parallel/pipeline/verify/llm_call)
+     *  生成一个完全定制的执行计划 */
+    OrchestratorResult run_dynamic(const std::string& task);
 
     /** 仅分析任务并返回推荐策略（不执行） */
     OrchestratorPlan analyze(const std::string& task);

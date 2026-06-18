@@ -2004,6 +2004,7 @@ std::string AdaptiveOrchestrator::strategy_name(OrchestratorStrategy s) {
     case OrchestratorStrategy::PARALLEL_RESEARCH: return "parallel_research";
     case OrchestratorStrategy::PIPELINE_VERIFY:   return "pipeline_verify";
     case OrchestratorStrategy::MULTI_AGENT:       return "multi_agent";
+    case OrchestratorStrategy::DYNAMIC_COMPOSE:  return "dynamic_compose";
     default: return "unknown";
     }
 }
@@ -2030,6 +2031,7 @@ OrchestratorPlan AdaptiveOrchestrator::plan_strategy(const std::string& task) {
                         (s == "parallel_research")  ? OrchestratorStrategy::PARALLEL_RESEARCH :
                         (s == "pipeline_verify")    ? OrchestratorStrategy::PIPELINE_VERIFY :
                         (s == "multi_agent")        ? OrchestratorStrategy::MULTI_AGENT :
+                        (s == "dynamic_compose")    ? OrchestratorStrategy::DYNAMIC_COMPOSE :
                                                      OrchestratorStrategy::AGENT_LOOP;
         plan.reasoning = j.value("reasoning", "");
         plan.subtasks  = j.value("subtasks", std::vector<std::string>{});
@@ -2196,6 +2198,17 @@ OrchestratorResult AdaptiveOrchestrator::execute_plan(const std::string& task,
             result.token_usage = ar.token_usage;
             break;
         }
+
+        case OrchestratorStrategy::DYNAMIC_COMPOSE: {
+            emit("Delegating to dynamic workflow composer...");
+            auto dr = run_dynamic(task);
+            result.success = dr.success;
+            result.output  = dr.output;
+            result.error   = dr.error;
+            result.token_usage = dr.token_usage;
+            for (const auto& l : dr.log) result.log.push_back(l);
+            break;
+        }
         }
     } catch (const std::exception& e) {
         result.success = false;
@@ -2222,6 +2235,183 @@ OrchestratorResult AdaptiveOrchestrator::run_with_strategy(const std::string& ta
     plan.reasoning = "User-specified strategy";
     plan.max_iterations = 10;
     return execute_plan(task, plan);
+}
+
+// ── run_dynamic: LLM 直接编写自定义工作流 ─────────────────────
+
+static const char* DYNAMIC_COMPOSE_SYS = R"(
+You are an expert workflow composer. Given a task and available tools,
+design an optimal multi-step execution plan by composing these primitives:
+
+Step types:
+- "agent": Run a ReACT agent to research/solve a subtask.
+  Required: "task" (string), "max_iterations" (int, 3-15)
+- "parallel_agents": Fan out multiple agents in parallel.
+  Required: "tasks" (string array), "max_iterations" (int)
+- "llm_call": Direct LLM call for synthesis/analysis/writing.
+  Required: "prompt" (string). Use $prev to reference previous step output.
+  Optional: "system" (string) for role/persona.
+- "verify": Adversarial verification of a claim (3-voter majority).
+  Required: "claim" (string). Use $prev.field to reference.
+- "parallel_calls": Multiple LLM calls in parallel.
+  Required: "prompts" (string array)
+
+Rules:
+- Steps execute sequentially. Each step's output is available as $step_N (0-indexed).
+- $prev refers to the immediately previous step's output.
+- Use "parallel_agents" when multiple independent research tasks exist.
+- Use "llm_call" for synthesis, analysis, summarization, writing.
+- Use "verify" after claims that need fact-checking.
+- Keep it minimal: 2-5 steps for most tasks, never more than 8.
+- Respond with ONLY a JSON object, no markdown:
+
+{"reasoning": "...", "steps": [...]}
+)";
+
+OrchestratorResult AdaptiveOrchestrator::run_dynamic(const std::string& task) {
+    OrchestratorResult result;
+    result.strategy_used = "dynamic_compose";
+    auto t0 = std::chrono::steady_clock::now();
+
+    auto emit = [&](const std::string& msg) {
+        result.log.push_back(msg);
+        if (progress_fn_) progress_fn_("dynamic", msg);
+    };
+
+    // Phase 1: LLM writes the workflow
+    auto tools = engine_.list_tools();
+    std::string tool_desc;
+    for (const auto& t : tools) tool_desc += "- " + t.name + ": " + t.description + "\n";
+
+    std::string compose_prompt = "Task: " + task + "\n";
+    if (!tool_desc.empty()) compose_prompt += "\nAvailable tools:\n" + tool_desc;
+    compose_prompt += "\nDesign the optimal workflow:";
+
+    emit("Composing dynamic workflow...");
+    json workflow;
+    try {
+        auto raw = engine_.llm_complete(compose_prompt, DYNAMIC_COMPOSE_SYS,
+                                         ModelTier::ORCHESTRATOR, 0.0);
+        workflow = WorkflowPlanner::extract_json(raw);
+    } catch (const std::exception& e) {
+        emit("Workflow composition failed, falling back to agent loop: " + std::string(e.what()));
+        return run_with_strategy(task, OrchestratorStrategy::AGENT_LOOP);
+    }
+
+    result.reasoning = workflow.value("reasoning", "");
+    emit("Plan: " + result.reasoning);
+
+    auto steps = workflow.value("steps", json::array());
+    if (steps.empty()) {
+        emit("Empty workflow, falling back to agent loop");
+        return run_with_strategy(task, OrchestratorStrategy::AGENT_LOOP);
+    }
+
+    // Phase 2: Execute each step
+    DynamicWorkflow dw(engine_);
+    dw.on_progress([&](auto&, auto& msg) { emit(msg); });
+
+    std::vector<json> step_outputs;
+    json prev_output;
+
+    auto resolve_refs = [&](std::string s) -> std::string {
+        // Replace $prev with previous step output
+        if (!prev_output.is_null()) {
+            auto pos = s.find("$prev");
+            while (pos != std::string::npos) {
+                std::string replacement = prev_output.is_string()
+                    ? prev_output.get<std::string>() : prev_output.dump();
+                s.replace(pos, 5, replacement);
+                pos = s.find("$prev", pos + replacement.size());
+            }
+        }
+        // Replace $step_N references
+        for (size_t i = 0; i < step_outputs.size(); ++i) {
+            std::string ref = "$step_" + std::to_string(i);
+            auto pos = s.find(ref);
+            while (pos != std::string::npos) {
+                std::string replacement = step_outputs[i].is_string()
+                    ? step_outputs[i].get<std::string>() : step_outputs[i].dump();
+                s.replace(pos, ref.size(), replacement);
+                pos = s.find(ref, pos + replacement.size());
+            }
+        }
+        return s;
+    };
+
+    try {
+        for (size_t i = 0; i < steps.size() && i < 8; ++i) {
+            const auto& step = steps[i];
+            std::string type = step.value("type", "");
+            emit("[step " + std::to_string(i) + "] " + type);
+            dw.phase("step_" + std::to_string(i));
+
+            json output;
+
+            if (type == "agent") {
+                std::string t = resolve_refs(step.value("task", task));
+                int max_iter = step.value("max_iterations", 8);
+                auto ar = engine_.run_agent_native(t, max_iter);
+                output = ar.final_answer;
+                emit("[step " + std::to_string(i) + "] agent → " +
+                     (ar.success ? "done" : "failed: " + ar.error));
+
+            } else if (type == "parallel_agents") {
+                auto tasks = step.value("tasks", std::vector<std::string>{});
+                for (auto& t : tasks) t = resolve_refs(t);
+                int max_iter = step.value("max_iterations", 8);
+                auto results = dw.fan_out_agents(tasks, max_iter);
+                output = results;
+                emit("[step " + std::to_string(i) + "] parallel_agents → " +
+                     std::to_string(results.size()) + " results");
+
+            } else if (type == "llm_call") {
+                std::string prompt = resolve_refs(step.value("prompt", ""));
+                std::string sys = step.value("system", "");
+                auto text = engine_.llm_complete(prompt, sys, ModelTier::ORCHESTRATOR, 0.0);
+                output = text;
+                emit("[step " + std::to_string(i) + "] llm_call → " +
+                     std::to_string(text.size()) + " chars");
+
+            } else if (type == "verify") {
+                std::string claim = resolve_refs(step.value("claim", ""));
+                int voters = step.value("voters", 3);
+                output = dw.adversarial_verify(claim, voters);
+                emit("[step " + std::to_string(i) + "] verify → " +
+                     std::string(output.value("verified", false) ? "VERIFIED" : "REFUTED"));
+
+            } else if (type == "parallel_calls") {
+                auto prompts = step.value("prompts", std::vector<std::string>{});
+                std::vector<DynTask> tasks;
+                for (auto& p : prompts) {
+                    p = resolve_refs(p);
+                    tasks.push_back([this, p]() -> json {
+                        return engine_.llm_complete(p, "", ModelTier::SUBAGENT, 0.0);
+                    });
+                }
+                output = dw.parallel(tasks);
+                emit("[step " + std::to_string(i) + "] parallel_calls → " +
+                     std::to_string(prompts.size()) + " results");
+
+            } else {
+                emit("[step " + std::to_string(i) + "] unknown type '" + type + "', skipping");
+                output = nullptr;
+            }
+
+            step_outputs.push_back(output);
+            prev_output = output;
+        }
+
+        result.success = true;
+        result.output = prev_output; // Final step output is the result
+    } catch (const std::exception& e) {
+        result.error = std::string("Dynamic workflow failed at execution: ") + e.what();
+        if (!step_outputs.empty()) result.output = step_outputs.back();
+    }
+
+    result.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    return result;
 }
 
 // ════════════════════════════════════════════════════════════════
