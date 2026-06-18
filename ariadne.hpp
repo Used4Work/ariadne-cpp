@@ -936,6 +936,55 @@ private:
 // 8. ToolRegistry
 // ════════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════════
+// PromptTemplate — {{variable}} 替换 + 注册表
+// ════════════════════════════════════════════════════════════════
+
+class PromptTemplate {
+public:
+    PromptTemplate() = default;
+    PromptTemplate(std::string name, std::string tmpl, std::string desc = "")
+        : name_(std::move(name)), template_(std::move(tmpl)), description_(std::move(desc)) {}
+
+    std::string render(const json& vars) const {
+        std::string out = template_;
+        for (auto it = vars.begin(); it != vars.end(); ++it) {
+            std::string key = "{{" + it.key() + "}}";
+            std::string val = it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+            size_t pos;
+            while ((pos = out.find(key)) != std::string::npos)
+                out.replace(pos, key.size(), val);
+        }
+        return out;
+    }
+
+    const std::string& name() const { return name_; }
+    const std::string& get_template() const { return template_; }
+    const std::string& description() const { return description_; }
+
+private:
+    std::string name_, template_, description_;
+};
+
+class PromptRegistry {
+public:
+    void add(const PromptTemplate& t) { templates_[t.name()] = t; }
+    bool has(const std::string& name) const { return templates_.count(name) > 0; }
+    std::string render(const std::string& name, const json& vars) const {
+        auto it = templates_.find(name);
+        if (it == templates_.end()) return "";
+        return it->second.render(vars);
+    }
+    const PromptTemplate& get(const std::string& name) const { return templates_.at(name); }
+    std::vector<std::string> list() const {
+        std::vector<std::string> names;
+        for (const auto& [k, v] : templates_) names.push_back(k);
+        return names;
+    }
+private:
+    std::map<std::string, PromptTemplate> templates_;
+};
+
 using ToolFn = std::function<json(const json& params)>;
 
 struct ToolDef {
@@ -1640,6 +1689,10 @@ public:
     void set_memory_store(std::shared_ptr<IMemoryStore> store) { memory_store_ = std::move(store); }
     std::shared_ptr<IMemoryStore> memory_store() const { return memory_store_; }
 
+    /** Prompt template registry — {{variable}} 替换，prompt 版本管理基础 */
+    PromptRegistry& prompts() { return prompt_registry_; }
+    const PromptRegistry& prompts() const { return prompt_registry_; }
+
     /** Human-in-the-loop 中断回调 — 在每个步骤执行前调用
      *  返回 nullopt=继续, string=暂停原因 (抛出 InterruptError) */
     using InterruptFn = std::function<std::optional<std::string>(const Step& step, const WorkflowState& state)>;
@@ -1666,6 +1719,7 @@ private:
     std::map<std::string, std::vector<GuardrailFn>> tool_guardrails_;
     std::shared_ptr<ICheckpointStore> checkpoint_store_;
     std::shared_ptr<IMemoryStore> memory_store_;
+    PromptRegistry prompt_registry_;
     InterruptFn interrupt_hook_;
 
     WorkflowResult run_internal(const std::string& task, WorkflowContext* ctx);

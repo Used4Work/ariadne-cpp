@@ -89,6 +89,19 @@ int main(int argc,char* argv[]) {
             "Compare based on:\n" + combined, "", ModelTier::ORCHESTRATOR);
         std::cout<<"\nSynthesis: "<<synthesis<<"\n";
 
+    } else if(mode=="compose"){
+        // LLM directly writes a custom workflow — no template selection
+        AdaptiveOrchestrator orch(engine);
+        orch.on_progress([](const std::string& phase, const std::string& msg){
+            std::cout<<"["<<phase<<"] "<<msg<<"\n";
+        });
+        auto r=orch.run_dynamic("Compare Tesla and BYD Q4 2025 sales, verify the winner's numbers");
+        std::cout<<"\nStrategy: "<<r.strategy_used<<"\n";
+        if(r.success) std::cout<<"Output: "<<(r.output.is_string() ? r.output.get<std::string>()
+                                             : r.output.dump(2)).substr(0,500)<<"\n";
+        else          std::cerr<<"Failed: "<<r.error<<"\n";
+        std::cout<<"Duration: "<<r.duration_ms<<"ms\n";
+
     } else if(mode=="probe"){
         ProviderAutoPlanner p;
         p.add_candidate("gpt-4o-mini",ProviderConfig::github_models(key,"openai/gpt-4o-mini"),"fast",1);

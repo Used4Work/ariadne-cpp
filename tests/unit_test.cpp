@@ -1775,6 +1775,38 @@ void test_dynamic_compose_result_struct() {
     ASSERT(r.strategy_used == "dynamic_compose");
 }
 
+// ── v2.5.0: PromptTemplate ───────────────────────────────
+void test_prompt_template_render() {
+    PromptTemplate t("summarize", "Summarize {{topic}} in {{style}} style");
+    auto result = t.render({{"topic","quantum computing"},{"style","ELI5"}});
+    ASSERT(result == "Summarize quantum computing in ELI5 style");
+}
+
+void test_prompt_template_json_vars() {
+    PromptTemplate t("test", "Items: {{items}}, Count: {{count}}");
+    auto result = t.render({{"items", json::array({"a","b"})}, {"count", 2}});
+    ASSERT(result.find("[\"a\",\"b\"]") != std::string::npos);
+    ASSERT(result.find("2") != std::string::npos);
+}
+
+void test_prompt_registry() {
+    PromptRegistry reg;
+    reg.add(PromptTemplate("greet", "Hello {{name}}!", "Greeting template"));
+    ASSERT(reg.has("greet"));
+    ASSERT(!reg.has("missing"));
+    ASSERT(reg.render("greet", {{"name","World"}}) == "Hello World!");
+    ASSERT(reg.list().size() == 1);
+}
+
+void test_engine_prompt_registry() {
+    auto cfg = ProviderConfig::openai_compatible("k", "http://localhost:1", "m");
+    WorkflowEngine engine(cfg);
+    engine.prompts().add(PromptTemplate("qa", "Q: {{question}}\nA:"));
+    ASSERT(engine.prompts().has("qa"));
+    auto rendered = engine.prompts().render("qa", {{"question","What is AI?"}});
+    ASSERT(rendered.find("What is AI?") != std::string::npos);
+}
+
 // ── v2.4.1: WorkflowEngine health_check (no network) ───
 void test_engine_health_check_exists() {
     auto cfg = ProviderConfig::openai_compatible("k", "http://localhost:1", "m");
@@ -1998,6 +2030,10 @@ int main() {
     RUN(test_dynamic_compose_strategy_enum);
     RUN(test_dynamic_compose_plan_struct);
     RUN(test_dynamic_compose_result_struct);
+    RUN(test_prompt_template_render);
+    RUN(test_prompt_template_json_vars);
+    RUN(test_prompt_registry);
+    RUN(test_engine_prompt_registry);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";
