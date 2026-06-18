@@ -255,7 +255,7 @@ struct ProviderConfig {
     std::string  api_key;
     std::string  model;
     std::string  base_url;
-    int          max_tokens       = 4096;
+    int          max_tokens       = 8192;
     double       timeout_sec      = 60.0;
     std::string  completions_path = "";   // 空 = /v1/chat/completions
     double       max_rps          = 0.0;  // 每秒最大请求数；0=不限速

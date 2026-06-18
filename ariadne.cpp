@@ -2598,7 +2598,7 @@ void AnthropicProvider::complete_stream(const std::string& prompt,
     do_stream_post(base + "/v1/messages",
         {"Content-Type: application/json",
          "x-api-key: " + cfg_.api_key,
-         "anthropic-version: 2023-06-01"},
+         "anthropic-version: 2024-10-22"},
         body.dump(), parser, cfg_.timeout_sec);
 }
 
