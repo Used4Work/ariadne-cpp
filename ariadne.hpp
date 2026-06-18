@@ -947,13 +947,23 @@ public:
         : name_(std::move(name)), template_(std::move(tmpl)), description_(std::move(desc)) {}
 
     std::string render(const json& vars) const {
-        std::string out = template_;
-        for (auto it = vars.begin(); it != vars.end(); ++it) {
-            std::string key = "{{" + it.key() + "}}";
-            std::string val = it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
-            size_t pos;
-            while ((pos = out.find(key)) != std::string::npos)
-                out.replace(pos, key.size(), val);
+        std::string out;
+        out.reserve(template_.size());
+        size_t i = 0;
+        while (i < template_.size()) {
+            auto open = template_.find("{{", i);
+            if (open == std::string::npos) { out.append(template_, i, std::string::npos); break; }
+            out.append(template_, i, open - i);
+            auto close = template_.find("}}", open + 2);
+            if (close == std::string::npos) { out.append(template_, open, std::string::npos); break; }
+            std::string key(template_, open + 2, close - open - 2);
+            if (vars.contains(key)) {
+                const auto& v = vars[key];
+                out += v.is_string() ? v.get<std::string>() : v.dump();
+            } else {
+                out.append(template_, open, close + 2 - open);
+            }
+            i = close + 2;
         }
         return out;
     }
