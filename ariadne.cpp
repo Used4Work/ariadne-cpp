@@ -2440,12 +2440,13 @@ void PlanCache::put(const std::string& key, const WorkflowPlan& plan) {
 // WorkflowEngine
 // ════════════════════════════════════════════════════════════════
 
-WorkflowEngine::WorkflowEngine(const EngineConfig& cfg) : config_(cfg) {
-    llm_      = std::make_unique<LLMClient>(cfg.orchestrator, cfg.subagent);
-    tools_    = std::make_unique<ToolRegistry>();
-    planner_  = std::make_unique<WorkflowPlanner>(*llm_);
-    executor_ = std::make_unique<WorkflowExecutor>(*llm_, *tools_, cfg.max_concurrency, metrics_);
-}
+WorkflowEngine::WorkflowEngine(const EngineConfig& cfg)
+    : config_(cfg)
+    , llm_(std::make_unique<LLMClient>(cfg.orchestrator, cfg.subagent))
+    , tools_(std::make_unique<ToolRegistry>())
+    , planner_(std::make_unique<WorkflowPlanner>(*llm_))
+    , executor_(std::make_unique<WorkflowExecutor>(*llm_, *tools_, cfg.max_concurrency, metrics_))
+{}
 
 void WorkflowEngine::register_tool(const ToolDef& def, ToolFn fn) {
     tools_->register_tool(def, std::move(fn));

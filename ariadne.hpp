@@ -1307,7 +1307,7 @@ public:
                        int priority = 100);
 
     struct PlanResult {
-        EngineConfig             config;
+        EngineConfig             config{};
         std::vector<ProbeResult> probe_results;
         std::vector<std::string> alive_strong;
         std::vector<std::string> alive_fast;
@@ -1647,13 +1647,13 @@ public:
 
 private:
     EngineConfig                      config_;
+    std::shared_ptr<IMetricsCollector> metrics_{std::make_shared<NoOpMetrics>()};
     std::unique_ptr<LLMClient>        llm_;
     std::unique_ptr<ToolRegistry>     tools_;
     std::unique_ptr<WorkflowPlanner>  planner_;
     std::unique_ptr<WorkflowExecutor> executor_;
     std::string                       custom_planner_prompt_;
     std::string                       custom_agent_prompt_;
-    std::shared_ptr<IMetricsCollector> metrics_{std::make_shared<NoOpMetrics>()};
     CancelToken                       cancel_{std::make_shared<std::atomic<bool>>(false)};
     std::chrono::steady_clock::time_point deadline_{};
     bool                              has_deadline_ = false;

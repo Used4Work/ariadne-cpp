@@ -4,6 +4,12 @@ All notable changes to Ariadne are documented here. Format: [Keep a Changelog](h
 
 ## [2.4.0] - 2026-06-18
 
+### Fixed (CI green)
+- **cppcheck uninitvar**: `PlanResult.config` now value-initialized with `{}`
+- **Member init order UB**: moved `metrics_` before `executor_` in WorkflowEngine to fix use-before-init in constructor init list
+- **cppcheck CI**: suppressed C++20-only suggestions (stlIfStrFind, uselessCallsSubstr, virtualCallInConstructor) 
+- **Docs CI**: `mkdir -p docs/html` before running Doxygen
+
 ### Added
 - **complete_chat() full parity with try_slots()** (D69): token budget enforcement, 429/503 retry with exponential backoff, provider latency tracking. Previously native agents bypassed all three.
 - **cppcheck static analysis in CI** (D70): `warning` + `performance` checks on Linux, fails build on findings

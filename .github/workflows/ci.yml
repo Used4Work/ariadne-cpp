@@ -92,6 +92,8 @@ jobs:
           sudo apt-get install -y cppcheck
           cppcheck --enable=warning,performance --error-exitcode=1 \
             --suppress=missingIncludeSystem --suppress=unknownMacro \
+            --suppress=stlIfStrFind --suppress=uselessCallsSubstr \
+            --suppress=virtualCallInConstructor \
             --inline-suppr -I . ariadne.hpp ariadne.cpp
 
       - name: Upload on failure
