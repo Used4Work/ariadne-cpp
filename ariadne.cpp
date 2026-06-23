@@ -196,8 +196,9 @@ std::string AnthropicProvider::complete(const std::string& prompt,
                   {"temperature", temp},
                   {"messages", {{{"role","user"}, {"content", prompt}}}}};
     if (!sys.empty()) body["system"] = sys;
+    // 结构化输出：GA output_config.format（替代旧 response_format）(D85)
     if (!output_schema.is_null() && !output_schema.empty())
-        body["response_format"] = {{"type","json_schema"},{"json_schema",output_schema}};
+        body["output_config"] = anthropic_output_config(output_schema);
     else if (force_json)
         body["response_format"] = {{"type", "json_object"}};
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
@@ -300,11 +301,13 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
     if (!tools.empty()) {
         json tools_arr = json::array();
         for (const auto& t : tools) {
-            tools_arr.push_back({
+            json td = {
                 {"name", t.name},
                 {"description", t.description},
                 {"input_schema", t.input_schema.empty() ? json({{"type","object"}}) : t.input_schema}
-            });
+            };
+            if (cfg_.strict_tools) td["strict"] = true;  // GA 严格工具校验 (D85)
+            tools_arr.push_back(std::move(td));
         }
         body["tools"] = tools_arr;
         if (tool_choice == "none") body["tool_choice"] = {{"type","none"}};
@@ -314,9 +317,9 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
         else body["tool_choice"] = {{"type","auto"}};
     }
 
-    // Structured output via response_format
+    // 结构化输出：GA output_config.format (D85)
     if (!output_schema.is_null() && !output_schema.empty())
-        body["response_format"] = {{"type","json_schema"},{"json_schema",output_schema}};
+        body["output_config"] = anthropic_output_config(output_schema);
 
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
     auto resp = http_post(base + "/v1/messages",
@@ -363,6 +366,19 @@ static std::string rtrim_slash(const std::string& s) {
     return s;
 }
 
+/** GPT-5 系列参数适配 + reasoning_effort/verbosity 注入 (D84)。
+ *  GPT-5 reasoning 模型要求 max_completion_tokens 且只接受默认 temperature。 */
+static void apply_openai_params(json& body, const ProviderConfig& cfg, double temp) {
+    if (is_gpt5_family(cfg.model)) {
+        body["max_completion_tokens"] = cfg.max_tokens;
+    } else {
+        body["max_tokens"]  = cfg.max_tokens;
+        body["temperature"] = temp;
+    }
+    if (!cfg.reasoning_effort.empty()) body["reasoning_effort"] = cfg.reasoning_effort;
+    if (!cfg.verbosity.empty())        body["verbosity"]        = cfg.verbosity;
+}
+
 std::string OpenAIChatProvider::complete(const std::string& prompt,
                                            const std::string& sys,
                                            double temp,
@@ -371,8 +387,8 @@ std::string OpenAIChatProvider::complete(const std::string& prompt,
     json msgs = json::array();
     if (!sys.empty()) msgs.push_back({{"role","system"}, {"content", sys}});
     msgs.push_back({{"role","user"}, {"content", prompt}});
-    json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
-                  {"temperature", temp}, {"messages", msgs}};
+    json body = {{"model", cfg_.model}, {"messages", msgs}};
+    apply_openai_params(body, cfg_, temp);  // GPT-5 token/temperature + reasoning/verbosity (D84)
     if (!output_schema.empty()) {
         body["response_format"] = {{"type","json_schema"},
             {"json_schema", {{"name","response"},{"strict",true},{"schema",output_schema}}}};
@@ -567,21 +583,20 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
         msgs.push_back(msg);
     }
 
-    json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
-                  {"temperature", temperature}, {"messages", msgs}};
+    json body = {{"model", cfg_.model}, {"messages", msgs}};
+    apply_openai_params(body, cfg_, temperature);  // GPT-5 token/temperature + reasoning/verbosity (D84)
 
     // Add tools if provided
     if (!tools.empty()) {
         json tools_array = json::array();
         for (const auto& t : tools) {
-            tools_array.push_back({
-                {"type", "function"},
-                {"function", {
-                    {"name", t.name},
-                    {"description", t.description},
-                    {"parameters", t.input_schema.empty() ? json({{"type","object"}}) : t.input_schema}
-                }}
-            });
+            json fn = {
+                {"name", t.name},
+                {"description", t.description},
+                {"parameters", t.input_schema.empty() ? json({{"type","object"}}) : t.input_schema}
+            };
+            if (cfg_.strict_tools) fn["strict"] = true;  // 严格工具校验 (D84)
+            tools_array.push_back({{"type","function"},{"function", fn}});
         }
         body["tools"] = tools_array;
         if (tool_choice == "none") body["tool_choice"] = "none";
@@ -684,6 +699,16 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
                     slot.last_latency_ms = call_ms;
                 }
                 { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
+                {   // OTel GenAI span (D87)
+                    GenAiSpan span;
+                    span.provider_name = slot.provider->provider_name();
+                    span.request_model = slot.provider->model_name();
+                    span.input_tokens  = g_last_token_usage.input_tokens;
+                    span.output_tokens = g_last_token_usage.output_tokens;
+                    span.duration_ms   = call_ms;
+                    span.finish_reason = resp.has_tool_calls() ? "tool_calls" : "stop";
+                    emit_span(span);
+                }
                 return resp;
             } catch (const std::exception& e) {
                 std::string emsg = e.what();
@@ -749,6 +774,8 @@ std::string GeminiProvider::complete(const std::string& prompt,
     if (!sys.empty())
         body["systemInstruction"] = {{"parts",{{{"text", sys}}}}};
     json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
+    { auto tl = gemini_thinking_level(cfg_.reasoning_effort);
+      if (!tl.empty()) gen_config["thinking_level"] = tl; }  // Gemini 3 推理深度 (D83)
     if (!output_schema.is_null() && !output_schema.empty()) {
         gen_config["responseMimeType"] = "application/json";
         gen_config["responseSchema"] = output_schema;
@@ -839,6 +866,8 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
 
     json body = {{"contents", contents}};
     json gen_config = {{"temperature", temperature}, {"maxOutputTokens", cfg_.max_tokens}};
+    { auto tl = gemini_thinking_level(cfg_.reasoning_effort);
+      if (!tl.empty()) gen_config["thinking_level"] = tl; }  // Gemini 3 推理深度 (D83)
     // Structured output via responseSchema
     if (!output_schema.is_null() && !output_schema.empty()) {
         gen_config["responseMimeType"] = "application/json";
@@ -914,6 +943,8 @@ void GeminiProvider::complete_stream(const std::string& prompt,
     if (!sys.empty())
         body["systemInstruction"] = {{"parts",{{{"text", sys}}}}};
     json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
+    { auto tl = gemini_thinking_level(cfg_.reasoning_effort);
+      if (!tl.empty()) gen_config["thinking_level"] = tl; }  // Gemini 3 推理深度 (D83)
     body["generationConfig"] = gen_config;
 
     std::string url = "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -1103,6 +1134,15 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                 {
                     std::lock_guard<std::mutex> lk(usage_mu_);
                     cumulative_usage_ += g_last_token_usage;
+                }
+                {   // OTel GenAI span (D87)
+                    GenAiSpan span;
+                    span.provider_name = slot.provider->provider_name();
+                    span.request_model = slot.provider->model_name();
+                    span.input_tokens  = g_last_token_usage.input_tokens;
+                    span.output_tokens = g_last_token_usage.output_tokens;
+                    span.duration_ms   = call_ms;
+                    emit_span(span);
                 }
                 if (resp_cache_enabled_ && response_cache_ && !cache_key.empty())
                     response_cache_->put(cache_key, res);

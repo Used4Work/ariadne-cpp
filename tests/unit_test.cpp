@@ -1292,7 +1292,7 @@ void test_chat_message_with_image_url() {
 void test_gemini_config() {
     auto c = ProviderConfig::gemini("test-key");
     ASSERT(c.type == ProviderType::GEMINI);
-    ASSERT(c.model == "gemini-2.5-flash");
+    ASSERT(c.model == "gemini-3.5-flash");
     ASSERT(c.max_rps == 0.25);
     ASSERT(c.pricing.input_per_1m == 0.075);
 }
@@ -1305,7 +1305,7 @@ void test_gemini_pro_pricing() {
 void test_gemini_make_provider() {
     auto p = make_provider(ProviderConfig::gemini("key"));
     ASSERT(p->provider_name() == "gemini");
-    ASSERT(p->model_name() == "gemini-2.5-flash");
+    ASSERT(p->model_name() == "gemini-3.5-flash");
     ASSERT(p->supports_native_tools());
 }
 
@@ -1657,7 +1657,7 @@ void test_mock_provider_latency_tracking() {
 void test_gemini_system_instruction_config() {
     auto cfg = ProviderConfig::gemini("test_key");
     ASSERT(cfg.type == ProviderType::GEMINI);
-    ASSERT(cfg.model == "gemini-2.5-flash");
+    ASSERT(cfg.model == "gemini-3.5-flash");
     // systemInstruction is an API-level change, verified by build + config
 }
 
@@ -2014,8 +2014,110 @@ void test_planner_tool_sorting() {
     ASSERT(tools[2].name == "zebra");
 }
 
-void test_version_is_2_6_0() {
-    ASSERT(version().find("2.6.0") != std::string::npos);
+// ── v2.7.0: Latest Provider APIs + Observability ─────────
+void test_is_gpt5_family() {
+    ASSERT(is_gpt5_family("gpt-5.5"));
+    ASSERT(is_gpt5_family("gpt-5-mini"));
+    ASSERT(is_gpt5_family("gpt-5"));
+    ASSERT(!is_gpt5_family("gpt-4o"));
+    ASSERT(!is_gpt5_family("claude-opus-4-8"));
+}
+
+void test_gemini_thinking_level() {
+    ASSERT(gemini_thinking_level("") == "");           // 空=不设置
+    ASSERT(gemini_thinking_level("low") == "low");
+    ASSERT(gemini_thinking_level("medium") == "medium");
+    ASSERT(gemini_thinking_level("high") == "high");
+    ASSERT(gemini_thinking_level("minimal") == "minimal");
+    ASSERT(gemini_thinking_level("xhigh") == "high");  // 归一
+    ASSERT(gemini_thinking_level("bogus") == "");      // 未知值忽略
+}
+
+void test_anthropic_output_config() {
+    json schema = {{"type","object"},{"properties",{{"x",{{"type","integer"}}}}}};
+    json oc = anthropic_output_config(schema);
+    ASSERT(oc["format"]["type"] == "json_schema");
+    ASSERT(oc["format"]["schema"] == schema);
+}
+
+void test_provider_reasoning_config() {
+    auto c = ProviderConfig::openai_chat("k", "gpt-5.5");
+    ASSERT(c.reasoning_effort.empty());   // 默认未设置
+    ASSERT(c.verbosity.empty());
+    ASSERT(c.strict_tools == false);
+    c.reasoning_effort = "high";
+    c.verbosity = "low";
+    c.strict_tools = true;
+    ASSERT(c.reasoning_effort == "high");
+    ASSERT(c.strict_tools == true);
+}
+
+void test_gemini_default_model_v3() {
+    auto c = ProviderConfig::gemini("k");
+    ASSERT(c.model.find("gemini-3") != std::string::npos);  // 默认升级到 Gemini 3.x
+    ASSERT(c.pricing.input_per_1m == 0.075);                // flash 定价
+}
+
+void test_gemini_pricing_presets() {
+    ASSERT(ModelPricing::gemini_flash().input_per_1m == 0.075);
+    ASSERT(ModelPricing::gemini_flash().output_per_1m == 0.30);
+    ASSERT(ModelPricing::gemini_pro().input_per_1m == 1.25);
+    ASSERT(ModelPricing::gemini_pro().output_per_1m == 5.00);
+}
+
+void test_redact_secrets() {
+    std::string in = "key=sk-abc123XYZ tok ghp_deadbeef99 hdr Authorization: Bearer s3cr3tTOK goog AIzaSyABCDEF";
+    std::string out = redact_secrets(in);
+    ASSERT(out.find("sk-abc123XYZ") == std::string::npos);
+    ASSERT(out.find("ghp_deadbeef99") == std::string::npos);
+    ASSERT(out.find("s3cr3tTOK") == std::string::npos);
+    ASSERT(out.find("AIzaSyABCDEF") == std::string::npos);
+    ASSERT(out.find("***") != std::string::npos);
+    // 非密钥文本保留
+    ASSERT(out.find("hdr") != std::string::npos);
+}
+
+void test_genai_span_otel_json() {
+    GenAiSpan s;
+    s.provider_name = "anthropic";
+    s.request_model = "claude-opus-4-8";
+    s.input_tokens = 100;
+    s.output_tokens = 50;
+    s.duration_ms = 1234;
+    s.finish_reason = "stop";
+    json j = s.to_otel_json();
+    ASSERT(j["attributes"]["gen_ai.operation.name"] == "chat");
+    ASSERT(j["attributes"]["gen_ai.provider.name"] == "anthropic");
+    ASSERT(j["attributes"]["gen_ai.request.model"] == "claude-opus-4-8");
+    ASSERT(j["attributes"]["gen_ai.usage.input_tokens"] == 100);
+    ASSERT(j["attributes"]["gen_ai.usage.output_tokens"] == 50);
+    ASSERT(j["attributes"]["gen_ai.response.finish_reasons"].is_array());
+    ASSERT(j["attributes"]["gen_ai.response.finish_reasons"][0] == "stop");
+    ASSERT(j["duration_ms"] == 1234);
+    ASSERT(j["name"] == "chat claude-opus-4-8");
+}
+
+void test_span_exporter_capture() {
+    struct CapExporter : ISpanExporter {
+        std::vector<GenAiSpan>* sink;
+        explicit CapExporter(std::vector<GenAiSpan>* s) : sink(s) {}
+        void export_span(const GenAiSpan& s) noexcept override { sink->push_back(s); }
+    };
+    std::vector<GenAiSpan> captured;
+    set_span_exporter(std::make_shared<CapExporter>(&captured));
+    GenAiSpan s;
+    s.provider_name = "openai_chat";
+    s.request_model = "gpt-5.5";
+    s.input_tokens = 7;
+    emit_span(s);
+    ASSERT(captured.size() == 1);
+    ASSERT(captured[0].request_model == "gpt-5.5");
+    ASSERT(captured[0].input_tokens == 7);
+    set_span_exporter(std::make_shared<NullSpanExporter>());  // 复位，避免影响其他测试
+}
+
+void test_version_is_2_7_0() {
+    ASSERT(version().find("2.7.0") != std::string::npos);
 }
 
 int main() {
@@ -2256,7 +2358,18 @@ int main() {
     RUN(test_vector_store_load_json_empty);
     RUN(test_complete_chat_output_schema_param);
     RUN(test_planner_tool_sorting);
-    RUN(test_version_is_2_6_0);
+
+    std::cout<<"\n=== v2.7.0 Latest Provider APIs + Observability ===\n";
+    RUN(test_is_gpt5_family);
+    RUN(test_gemini_thinking_level);
+    RUN(test_anthropic_output_config);
+    RUN(test_provider_reasoning_config);
+    RUN(test_gemini_default_model_v3);
+    RUN(test_gemini_pricing_presets);
+    RUN(test_redact_secrets);
+    RUN(test_genai_span_otel_json);
+    RUN(test_span_exporter_capture);
+    RUN(test_version_is_2_7_0);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

@@ -35,6 +35,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Multi-agent handoffs** -- agents transfer control while sharing history
 - **AdaptiveOrchestrator** -- LLM auto-selects optimal strategy per task
 - **Multimodal vision** -- image input via base64 or URL (OpenAI + Anthropic + Gemini)
+- **Reasoning control** -- `reasoning_effort`/`verbosity` → Gemini 3 `thinking_level`, GPT-5.x params (`max_completion_tokens`), Anthropic `output_config` GA structured output
 
 ### Dynamic Workflow (Ultracode-level)
 - `parallel()` -- fan-out N tasks, barrier wait
@@ -54,6 +55,8 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 
 ### Observability
 - **Structured logging** -- `ILogger` interface, zero stdout/stderr by default
+- **OTel GenAI traces** -- `gen_ai.*` semantic conventions, pluggable `ISpanExporter` / `OtelJsonSpanExporter`, auto-emitted per LLM call
+- **Secret redaction** -- `redact_secrets()` masks API keys / bearer tokens in logs & traces
 - **Cost tracking** -- `ModelPricing` with auto-pricing per provider
 - **Metrics** -- pluggable `IMetricsCollector`, 10 event kinds
 - **Token estimation** -- `estimate_tokens()` heuristic
@@ -154,7 +157,7 @@ All 9 providers support native tool calling via `complete_chat()`.
 |---|---|---|---|---|
 | `github_models(token)` | openai/gpt-4o-mini | Yes | 6 RPM | Yes |
 | `llm7()` | deepseek-v3-0324 | Yes (no signup) | 30 RPM | Yes |
-| `gemini(key)` | gemini-2.5-flash | Yes (15 RPM) | 15 RPM | Yes |
+| `gemini(key)` | gemini-3.5-flash | Yes (15 RPM) | 15 RPM | Yes |
 | `cerebras(key)` | llama-3.3-70b | Yes (1M tok/day) | 30 RPM | Yes |
 | `sambanova(key)` | Meta-Llama-3.3-70B | Yes | 30 RPM | Yes |
 | `groq(key)` | llama-3.3-70b | Yes | 30 RPM | Yes |

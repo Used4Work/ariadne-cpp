@@ -49,7 +49,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.6.0";
+constexpr const char* ARIADNE_VERSION = "2.7.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -81,6 +81,8 @@ struct ModelPricing {
     static ModelPricing gpt4o() { return {2.50, 10.00}; }
     static ModelPricing claude_sonnet() { return {3.00, 15.00}; }
     static ModelPricing claude_opus() { return {15.00, 75.00}; }
+    static ModelPricing gemini_flash() { return {0.075, 0.30}; }
+    static ModelPricing gemini_pro()   { return {1.25, 5.00};  }
 };
 
 inline thread_local TokenUsage g_last_token_usage{};
@@ -222,6 +224,119 @@ inline void log_msg(LogLevel level, const std::string& component, const std::str
 }
 
 // ════════════════════════════════════════════════════════════════
+// Secret 脱敏 — 屏蔽日志/追踪中的 API key、Bearer token (D88)
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * 屏蔽字符串中常见的密钥格式，避免泄露到日志/追踪/span 中。
+ * 覆盖：Bearer/x-api-key/x-goog-api-key 头，sk-/sk-ant-/ghp_/gho_/
+ * ghs_/github_pat_/AIza/xai-/gsk_ 前缀。保留前缀作为上下文，密钥主体替换为 ***。
+ */
+inline std::string redact_secrets(const std::string& in) {
+    std::string s = in;
+    auto is_secret_char = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+               (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+    };
+    auto mask_after = [&](const std::string& marker) {
+        size_t pos = 0;
+        while ((pos = s.find(marker, pos)) != std::string::npos) {
+            size_t start = pos + marker.size();
+            size_t end = start;
+            while (end < s.size() && is_secret_char(s[end])) ++end;
+            if (end > start) {
+                std::string repl = marker + "***";
+                s.replace(pos, end - pos, repl);
+                pos += repl.size();
+            } else {
+                pos = start;
+            }
+        }
+    };
+    // 头部形式先处理（吞掉整段 token）
+    mask_after("Bearer ");
+    mask_after("x-api-key: ");
+    mask_after("x-goog-api-key: ");
+    // 裸密钥前缀（sk- 同时覆盖 sk-ant-）
+    for (const char* p : {"sk-", "ghp_", "gho_", "ghs_", "github_pat_", "AIza", "xai-", "gsk_"})
+        mask_after(p);
+    return s;
+}
+
+// ════════════════════════════════════════════════════════════════
+// OpenTelemetry GenAI 追踪导出 (D87)
+// 遵循 OTel GenAI semantic conventions（gen_ai.* 属性）。
+// 无外部依赖：导出为 OTLP-JSON 形态的 span，由用户接入采集器。
+// ════════════════════════════════════════════════════════════════
+
+/** 一次 GenAI 操作的 span（LLM 调用 / 工具执行 / agent 调用） */
+struct GenAiSpan {
+    std::string operation_name = "chat";   ///< gen_ai.operation.name: chat|execute_tool|invoke_agent|invoke_workflow
+    std::string provider_name;             ///< gen_ai.provider.name
+    std::string request_model;             ///< gen_ai.request.model
+    long        input_tokens   = 0;        ///< gen_ai.usage.input_tokens
+    long        output_tokens  = 0;        ///< gen_ai.usage.output_tokens
+    long        duration_ms    = 0;
+    std::string finish_reason;             ///< gen_ai.response.finish_reasons[0]
+    std::string error;                     ///< error.type（出错时）
+
+    /** 转为 OTLP-JSON 形态：{name, attributes:{gen_ai.*}, duration_ms} */
+    json to_otel_json() const {
+        json attrs;
+        attrs["gen_ai.operation.name"] = operation_name;
+        if (!provider_name.empty()) attrs["gen_ai.provider.name"] = provider_name;
+        if (!request_model.empty()) attrs["gen_ai.request.model"] = request_model;
+        if (input_tokens  > 0) attrs["gen_ai.usage.input_tokens"]  = input_tokens;
+        if (output_tokens > 0) attrs["gen_ai.usage.output_tokens"] = output_tokens;
+        if (!finish_reason.empty())
+            attrs["gen_ai.response.finish_reasons"] = json::array({finish_reason});
+        if (!error.empty()) attrs["error.type"] = error;
+        std::string name = operation_name;
+        if (!request_model.empty()) name += " " + request_model;
+        return {{"name", name}, {"attributes", attrs}, {"duration_ms", duration_ms}};
+    }
+};
+
+/** Span 导出器接口 */
+class ISpanExporter {
+public:
+    virtual ~ISpanExporter() = default;
+    virtual void export_span(const GenAiSpan& span) noexcept = 0;
+};
+
+/** 默认零开销导出器 */
+class NullSpanExporter : public ISpanExporter {
+public:
+    void export_span(const GenAiSpan&) noexcept override {}
+};
+
+/** 将 span 以 OTLP-JSON 单行形式写入流（默认 stderr），自动脱敏 */
+class OtelJsonSpanExporter : public ISpanExporter {
+public:
+    explicit OtelJsonSpanExporter(std::ostream& os = std::cerr) : os_(os) {}
+    void export_span(const GenAiSpan& span) noexcept override {
+        try {
+            std::lock_guard<std::mutex> lk(mu_);
+            os_ << redact_secrets(span.to_otel_json().dump()) << "\n";
+        } catch (...) {}
+    }
+private:
+    std::ostream& os_;
+    std::mutex    mu_;
+};
+
+inline std::shared_ptr<ISpanExporter>& global_span_exporter() {
+    static auto inst = std::shared_ptr<ISpanExporter>(std::make_shared<NullSpanExporter>());
+    return inst;
+}
+inline void set_span_exporter(std::shared_ptr<ISpanExporter> e) {
+    if (e) global_span_exporter() = std::move(e);
+}
+inline void emit_span(const GenAiSpan& span) {
+    global_span_exporter()->export_span(span);
+}
+
+// ════════════════════════════════════════════════════════════════
 // 1. CURL 生命周期管理 (B1, B2)
 // ════════════════════════════════════════════════════════════════
 
@@ -265,6 +380,9 @@ struct ProviderConfig {
     std::string  completions_path = "";   // 空 = /v1/chat/completions
     double       max_rps          = 0.0;  // 每秒最大请求数；0=不限速
     ModelPricing pricing;                 // 自动成本追踪
+    std::string  reasoning_effort = "";   // ""|minimal|low|medium|high|xhigh (D83/D84)
+    std::string  verbosity        = "";   // OpenAI GPT-5: low|medium|high (D84)
+    bool         strict_tools     = false;// provider 端严格工具 schema 校验 (D84/D85)
 
     static ProviderConfig anthropic(const std::string& key,
                                      const std::string& model = "claude-opus-4-8") {
@@ -332,19 +450,42 @@ struct ProviderConfig {
                                    const std::string& model = "mistral-small-latest") {
         return openai_compatible(key, "https://api.mistral.ai/v1", model, 1.0);
     }
-    /** Google Gemini (free tier: 15 RPM for Flash models) */
+    /** Google Gemini (free tier: 15 RPM for Flash models)
+     *  默认升级到 Gemini 3.5 Flash（gemini-2.5-flash 于 2026 年起逐步下线）。 */
     static ProviderConfig gemini(const std::string& key,
-                                  const std::string& model = "gemini-2.5-flash") {
+                                  const std::string& model = "gemini-3.5-flash") {
         ProviderConfig c;
         c.type     = ProviderType::GEMINI;
         c.api_key  = key;
         c.model    = model;
         c.max_rps  = 0.25;
         c.pricing  = (model.find("flash") != std::string::npos)
-                     ? ModelPricing{0.075, 0.30} : ModelPricing{1.25, 5.00};
+                     ? ModelPricing::gemini_flash() : ModelPricing::gemini_pro();
         return c;
     }
 };
+
+// ════════════════════════════════════════════════════════════════
+// Provider 能力辅助函数（v2.7.0：最新模型 API 适配）
+// ════════════════════════════════════════════════════════════════
+
+/** GPT-5 系列检测：需用 max_completion_tokens 且省略 temperature (D84) */
+inline bool is_gpt5_family(const std::string& model) {
+    return model.find("gpt-5") != std::string::npos;
+}
+
+/** reasoning effort → Gemini 3 thinking_level（空串=不设置；xhigh 归一为 high）(D83) */
+inline std::string gemini_thinking_level(const std::string& effort) {
+    if (effort == "xhigh") return "high";
+    if (effort == "minimal" || effort == "low" || effort == "medium" || effort == "high")
+        return effort;
+    return "";  // 空串或未知值：不设置
+}
+
+/** Anthropic GA 结构化输出体：output_config.format（替代旧 response_format）(D85) */
+inline json anthropic_output_config(const json& schema) {
+    return {{"format", {{"type", "json_schema"}, {"schema", schema}}}};
+}
 
 struct ToolDef;  // forward declaration
 

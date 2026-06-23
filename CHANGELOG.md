@@ -2,6 +2,22 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.7.0] - 2026-06-23
+
+Theme: **Latest provider APIs + OpenTelemetry observability.** Researched against live June 2026 docs (Gemini 3, GPT-5.5, Claude structured-output GA, OTel GenAI semconv 1.40).
+
+### Added
+- **Unified reasoning effort** (D83): `ProviderConfig::reasoning_effort` (`minimal`/`low`/`medium`/`high`/`xhigh`) + `verbosity`. Gemini maps to `generationConfig.thinking_level` (Gemini 3 reasoning depth) across `complete()`/`complete_chat()`/`complete_stream()`; OpenAI passes `reasoning_effort`/`verbosity` through.
+- **GPT-5.x parameter compatibility** (D84): `gpt-5*` models use `max_completion_tokens` and omit `temperature` (reasoning models reject non-default temperature). New `is_gpt5_family()` helper. Opt-in `strict_tools` adds `strict:true` to OpenAI function defs.
+- **Anthropic structured output GA migration** (D85): `response_format`→`output_config.format` in `complete()` + `complete_chat()` (no beta header). Opt-in `strict_tools` adds `strict:true` per tool. New `anthropic_output_config()` helper.
+- **Gemini 3.5 default** (D86): default model `gemini-2.5-flash`→`gemini-3.5-flash` (2.5 deprecated/shutting down 2026). `ModelPricing::gemini_flash()`/`gemini_pro()` presets.
+- **OpenTelemetry GenAI trace export** (D87): `GenAiSpan` emits `gen_ai.*` semconv attributes (operation.name, provider.name, request.model, usage.input/output_tokens, response.finish_reasons). `ISpanExporter`/`NullSpanExporter`/`OtelJsonSpanExporter` + `set_span_exporter()`/`emit_span()`. Auto-emitted on every `try_slots()` and `complete_chat()` success.
+- **Secret redaction** (D88): `redact_secrets()` masks `sk-`/`ghp_`/`AIza`/`Bearer`/`x-api-key` etc. in trace/log output. Applied in `OtelJsonSpanExporter`.
+- 9 new tests (196 total)
+
+### Changed
+- Gemini default model is now `gemini-3.5-flash` (was `gemini-2.5-flash`). Pass an explicit model to override.
+
 ## [2.6.0] - 2026-06-23
 
 ### Added

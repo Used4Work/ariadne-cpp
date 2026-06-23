@@ -1,6 +1,6 @@
 {
   "name": "ariadne",
-  "version": "2.6.0",
+  "version": "2.7.0",
   "description": "C++17 LLM workflow orchestration — DAG planning, ReACT agents, native tool calling, dynamic orchestration, visual editor",
   "homepage": "https://github.com/Used4Work/ariadne-cpp",
   "license": "MIT",
