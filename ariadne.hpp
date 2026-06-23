@@ -49,7 +49,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.4.0";
+constexpr const char* ARIADNE_VERSION = "2.5.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -200,12 +200,14 @@ public:
         if (level < min_) return;
         static const char* names[] = {"DEBUG","INFO","WARN","ERR"};
         try {
+            std::lock_guard<std::mutex> lk(mu_);
             std::cerr << "[" << names[(int)level] << "] "
                       << component << ": " << message << "\n";
         } catch (...) {}
     }
 private:
     LogLevel min_;
+    std::mutex mu_;
 };
 
 inline std::shared_ptr<ILogger>& global_logger() {
@@ -789,6 +791,10 @@ public:
     void set_token_budget(long max_tokens) { token_budget_ = max_tokens; }
     void clear_token_budget() { token_budget_ = 0; }
 
+    /** 启用对冲请求 — 同时发送到 2 个 provider，取先返回的结果
+     *  用更高 cost 换取更低 latency。需要 tier 中至少有 2 个 slot */
+    void enable_hedging(bool on = true) { hedging_enabled_ = on; }
+
 private:
     struct Slot {
         std::unique_ptr<ILLMProvider>       provider;
@@ -804,6 +810,7 @@ private:
     mutable std::unique_ptr<ResponseCache> response_cache_;
     std::atomic<bool> resp_cache_enabled_{false};
     std::atomic<long> token_budget_{0};
+    std::atomic<bool> hedging_enabled_{false};
 
     static std::vector<Slot> build_slots(const TierConfig& cfg);
     std::string try_slots(const std::vector<Slot>& slots,

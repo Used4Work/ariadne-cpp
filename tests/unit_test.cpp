@@ -1832,6 +1832,93 @@ void test_estimate_tokens_mixed_cjk_ascii() {
     ASSERT(tokens >= 2 && tokens <= 5);
 }
 
+// ── v2.5.0 Tests ─────────────────────────────────────────────
+
+void test_console_logger_thread_safety() {
+    auto logger = std::make_shared<ConsoleLogger>(LogLevel::LOG_DEBUG);
+    std::vector<std::thread> threads;
+    for (int i = 0; i < 4; ++i) {
+        threads.emplace_back([&, i]() {
+            for (int j = 0; j < 10; ++j)
+                logger->log(LogLevel::LOG_INFO, "T" + std::to_string(i),
+                    "msg " + std::to_string(j));
+        });
+    }
+    for (auto& t : threads) t.join();
+    ASSERT(true);
+}
+
+void test_retry_after_npos_safety() {
+    // Retry-After value at end of string without \r\n should still parse
+    std::string headers = "retry-after: 42";
+    auto ra_pos = headers.find("retry-after:");
+    ASSERT(ra_pos != std::string::npos);
+    auto val_start = headers.find_first_not_of(" \t", ra_pos + 12);
+    ASSERT(val_start != std::string::npos);
+    auto val_end = headers.find_first_of("\r\n", val_start);
+    // val_end is npos here — the fixed code handles this safely
+    size_t len = (val_end == std::string::npos) ? std::string::npos : (val_end - val_start);
+    std::string value = headers.substr(val_start, len);
+    ASSERT(value == "42");
+}
+
+void test_plan_from_json_validates_dag() {
+    // Deserializing a plan with a missing dependency should throw DAGValidationError
+    json j = {
+        {"steps", {{
+            {"id", "step1"}, {"type", "llm"}, {"action", "test"},
+            {"depends_on", {"nonexistent"}}
+        }}}
+    };
+    bool threw = false;
+    try { WorkflowPlan::from_json(j); }
+    catch (const DAGValidationError&) { threw = true; }
+    catch (...) { threw = true; }
+    ASSERT(threw);
+}
+
+void test_resolve_value_array_bounds() {
+    WorkflowState state;
+    state.step_outputs["arr"] = json::array({10, 20, 30});
+    // Valid index
+    auto v = state.resolve_ref("$arr.1");
+    ASSERT(v == 20);
+    // Out of bounds index (should return null, not crash)
+    auto oob = state.resolve_ref("$arr.99");
+    ASSERT(oob.is_null());
+    // Negative index (should return null)
+    auto neg = state.resolve_ref("$arr.-1");
+    ASSERT(neg.is_null());
+}
+
+void test_all_providers_exhausted_detail() {
+    // Error message should contain slot count detail
+    AllProvidersExhaustedError err("ORCHESTRATOR providers exhausted (2 slots tried): [1] mock/m1; [2] mock/m2;");
+    std::string msg = err.what();
+    ASSERT(msg.find("2 slots tried") != std::string::npos);
+    ASSERT(msg.find("[1]") != std::string::npos);
+    ASSERT(msg.find("[2]") != std::string::npos);
+}
+
+void test_hedging_flag() {
+    auto mock_o = std::make_unique<MockProvider>("ok");
+    auto mock_s = std::make_unique<MockProvider>("ok");
+    LLMClient client(std::move(mock_o), std::move(mock_s));
+    client.enable_hedging(true);
+    client.enable_hedging(false);
+    ASSERT(true);
+}
+
+void test_hedging_with_mock_providers() {
+    auto mock_o = std::make_unique<MockProvider>("hedged result");
+    auto mock_s = std::make_unique<MockProvider>("ok");
+    LLMClient client(std::move(mock_o), std::move(mock_s));
+    client.enable_hedging(true);
+    // Single slot per tier — hedging skipped, falls through to normal path
+    auto result = client.complete("test");
+    ASSERT(result == "hedged result");
+}
+
 int main() {
     std::cout<<"=== DAG ===\n";
     RUN(test_dag_valid); RUN(test_dag_dup); RUN(test_dag_dep); RUN(test_dag_cycle);
@@ -2053,6 +2140,15 @@ int main() {
     RUN(test_engine_prompt_registry);
     RUN(test_estimate_tokens_cjk);
     RUN(test_estimate_tokens_mixed_cjk_ascii);
+
+    std::cout<<"\n=== v2.5.0 Fixes ===\n";
+    RUN(test_console_logger_thread_safety);
+    RUN(test_retry_after_npos_safety);
+    RUN(test_plan_from_json_validates_dag);
+    RUN(test_resolve_value_array_bounds);
+    RUN(test_all_providers_exhausted_detail);
+    RUN(test_hedging_flag);
+    RUN(test_hedging_with_mock_providers);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

@@ -81,9 +81,12 @@ HttpProvider::HttpResponse HttpProvider::http_post(const std::string& url,
     if (ra_pos == std::string::npos) ra_pos = resp_headers.find("Retry-After:");
     if (ra_pos != std::string::npos) {
         auto val_start = resp_headers.find_first_not_of(" \t", ra_pos + 12);
-        auto val_end = resp_headers.find_first_of("\r\n", val_start);
-        if (val_start != std::string::npos)
-            resp.retry_after = resp_headers.substr(val_start, val_end - val_start);
+        if (val_start != std::string::npos) {
+            auto val_end = resp_headers.find_first_of("\r\n", val_start);
+            size_t len = (val_end == std::string::npos)
+                       ? std::string::npos : (val_end - val_start);
+            resp.retry_after = resp_headers.substr(val_start, len);
+        }
     }
     curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &resp.status_code);
     return resp;
@@ -617,15 +620,19 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
 
     const auto& slots = (tier == ModelTier::ORCHESTRATOR) ? orchestrators_ : subagents_;
     std::string last_error;
+    std::vector<std::string> slot_errors;
     for (const auto& slot : slots) {
+        std::string slot_name = slot.provider->provider_name() + "/" + slot.provider->model_name();
         if (!slot.breaker.try_allow()) {
-            last_error = slot.provider->provider_name() + " [OPEN]";
+            last_error = slot_name + " [OPEN]";
+            slot_errors.push_back(last_error);
             continue;
         }
         { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.calls; }
         if (slot.rate_limiter.enabled())
             if (!slot.rate_limiter.acquire(10000)) {
-                last_error = slot.provider->provider_name() + " [RATE_LIMIT_TIMEOUT]";
+                last_error = slot_name + " [RATE_LIMIT_TIMEOUT]";
+                slot_errors.push_back(last_error);
                 continue;
             }
         // 429/503 retry with backoff (parity with try_slots)
@@ -655,7 +662,7 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
                 if (is_fatal) {
                     { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
                     throw AllProvidersExhaustedError(
-                        slot.provider->provider_name() + ": fatal error — " + emsg);
+                        slot_name + ": fatal error — " + emsg);
                 } else if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
                     int backoff_sec = 3 * (1 << rate_retry);
                     auto ra_pos = emsg.find("retry_after=");
@@ -665,24 +672,30 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
                     }
                     if (backoff_sec > 120) backoff_sec = 120;
                     log_msg(LogLevel::LOG_WARN, "LLMClient",
-                        slot.provider->provider_name() + " chat rate limited, retry "
+                        slot_name + " chat rate limited, retry "
                         + std::to_string(rate_retry+1) + "/" + std::to_string(MAX_RATE_RETRIES));
                     std::this_thread::sleep_for(std::chrono::seconds(backoff_sec));
                     continue;
                 } else {
                     if (is_rate_limit) {
-                        last_error = slot.provider->provider_name() + " [RATE_LIMITED, exhausted retries]";
+                        last_error = slot_name + " [RATE_LIMITED, exhausted retries]";
                     } else {
                         slot.breaker.on_failure();
-                        last_error = emsg;
+                        last_error = slot_name + ": " + emsg;
                     }
                     { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                    slot_errors.push_back(last_error);
                     break;
                 }
             }
         }
     }
-    throw AllProvidersExhaustedError("Chat providers exhausted. Last: " + last_error);
+    std::string tier_name = (tier == ModelTier::ORCHESTRATOR) ? "ORCHESTRATOR" : "SUBAGENT";
+    std::string detail = tier_name + " chat providers exhausted (" +
+        std::to_string(slot_errors.size()) + " slots tried):";
+    for (size_t i = 0; i < slot_errors.size(); ++i)
+        detail += " [" + std::to_string(i+1) + "] " + slot_errors[i] + ";";
+    throw AllProvidersExhaustedError(detail);
 }
 
 bool LLMClient::supports_native_tools(ModelTier tier) const {
@@ -975,18 +988,62 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
             std::to_string(cumulative_usage_.total_tokens) + "/" +
             std::to_string(token_budget_));
 
+    // Hedged requests: race 2 providers, return first success
+    if (hedging_enabled_ && slots.size() >= 2) {
+        std::atomic<bool> got_result{false};
+        std::string results[2];
+        std::string errors[2];
+        std::future<void> futs[2];
+        for (int h = 0; h < 2; ++h) {
+            const auto& slot = slots[h];
+            if (!slot.breaker.try_allow()) { errors[h] = "circuit open"; continue; }
+            futs[h] = std::async(std::launch::async, [&, h]() {
+                try {
+                    auto call_t0 = std::chrono::steady_clock::now();
+                    auto res = slots[h].provider->complete(prompt, system, temperature, force_json, output_schema);
+                    auto call_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - call_t0).count();
+                    results[h] = res;
+                    got_result = true;
+                    slots[h].breaker.on_success();
+                    { std::lock_guard<std::mutex> lk(*slots[h].stats_mu);
+                      ++slots[h].successes; slots[h].total_latency_ms += call_ms;
+                      slots[h].last_latency_ms = call_ms; }
+                } catch (const std::exception& e) {
+                    errors[h] = e.what();
+                    slots[h].breaker.on_failure();
+                    { std::lock_guard<std::mutex> lk(*slots[h].stats_mu); ++slots[h].failures; }
+                }
+            });
+        }
+        for (int h = 0; h < 2; ++h)
+            if (futs[h].valid()) futs[h].wait();
+        // Return first successful result (prefer lower-index slot)
+        for (int h = 0; h < 2; ++h) {
+            if (!results[h].empty()) {
+                { std::lock_guard<std::mutex> lk(usage_mu_); cumulative_usage_ += g_last_token_usage; }
+                if (resp_cache_enabled_ && response_cache_ && !cache_key.empty())
+                    response_cache_->put(cache_key, results[h]);
+                return results[h];
+            }
+        }
+        throw AllProvidersExhaustedError("Hedged requests failed: [1] " + errors[0] + "; [2] " + errors[1]);
+    }
+
     std::string last_error;
+    std::vector<std::string> slot_errors;
     for (const auto& slot : slots) {
+        std::string slot_name = slot.provider->provider_name() + "/" + slot.provider->model_name();
         if (!slot.breaker.try_allow()) {
-            last_error = slot.provider->provider_name() + "/" + slot.provider->model_name()
-                       + " [OPEN, " + std::to_string((int)slot.breaker.seconds_until_retry()) + "s]";
+            last_error = slot_name + " [OPEN, " + std::to_string((int)slot.breaker.seconds_until_retry()) + "s]";
+            slot_errors.push_back(last_error);
             continue;
         }
         { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.calls; }
         if (slot.rate_limiter.enabled())
             if (!slot.rate_limiter.acquire(10000)) {
-                last_error = slot.provider->provider_name() + "/" +
-                             slot.provider->model_name() + " [RATE_LIMIT_TIMEOUT]";
+                last_error = slot_name + " [RATE_LIMIT_TIMEOUT]";
+                slot_errors.push_back(last_error);
                 continue;
             }
         // 429/503: retry same slot with exponential backoff (up to 3 times)
@@ -1022,10 +1079,9 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                 if (is_fatal) {
                     { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
                     throw AllProvidersExhaustedError(
-                        slot.provider->provider_name() + ": fatal error — " + emsg);
+                        slot_name + ": fatal error — " + emsg);
                 } else if (is_rate_limit && rate_retry < MAX_RATE_RETRIES) {
                     int backoff_sec = 3 * (1 << rate_retry);  // default: 3s, 6s, 12s
-                    // Honor Retry-After header if present in error message
                     auto ra_pos = emsg.find("retry_after=");
                     if (ra_pos != std::string::npos) {
                         try { backoff_sec = std::stoi(emsg.substr(ra_pos + 12)); }
@@ -1033,29 +1089,31 @@ std::string LLMClient::try_slots(const std::vector<Slot>& slots,
                     }
                     if (backoff_sec > 120) backoff_sec = 120;
                     log_msg(LogLevel::LOG_WARN, "LLMClient",
-                        slot.provider->provider_name() + " rate limited, retry "
+                        slot_name + " rate limited, retry "
                         + std::to_string(rate_retry+1) + "/" + std::to_string(MAX_RATE_RETRIES)
                         + ", backoff " + std::to_string(backoff_sec) + "s");
                     std::this_thread::sleep_for(std::chrono::seconds(backoff_sec));
                     continue;
                 } else {
                     if (is_rate_limit) {
-                        last_error = slot.provider->provider_name() + "/" +
-                                     slot.provider->model_name() + " [RATE_LIMITED, exhausted retries]";
+                        last_error = slot_name + " [RATE_LIMITED, exhausted retries]";
                     } else {
                         slot.breaker.on_failure();
-                        last_error = slot.provider->provider_name() + "/" + slot.provider->model_name()
-                                   + ": " + emsg;
+                        last_error = slot_name + ": " + emsg;
                     }
                     { std::lock_guard<std::mutex> lk(*slot.stats_mu); ++slot.failures; }
+                    slot_errors.push_back(last_error);
                     break;
                 }
             }
         }
     }
-    throw AllProvidersExhaustedError(
-        std::string(tier == ModelTier::ORCHESTRATOR ? "ORCHESTRATOR" : "SUBAGENT") +
-        " providers exhausted. Last: " + last_error);
+    std::string tier_name = (tier == ModelTier::ORCHESTRATOR) ? "ORCHESTRATOR" : "SUBAGENT";
+    std::string detail = tier_name + " providers exhausted (" +
+        std::to_string(slot_errors.size()) + " slots tried):";
+    for (size_t i = 0; i < slot_errors.size(); ++i)
+        detail += " [" + std::to_string(i+1) + "] " + slot_errors[i] + ";";
+    throw AllProvidersExhaustedError(detail);
 }
 
 std::string LLMClient::complete_as(ModelTier tier, const std::string& prompt,
@@ -1309,6 +1367,7 @@ WorkflowPlan WorkflowPlan::from_json(const json& j) {
     auto plan = WorkflowPlanner::parse_plan(j, j.value("metadata", json::object()).value("task", ""));
     if (j.contains("id")) plan.id = j["id"].get<std::string>();
     if (j.contains("metadata")) plan.metadata = j["metadata"];
+    validate_dag(plan);
     return plan;
 }
 
@@ -1327,7 +1386,13 @@ json WorkflowState::resolve_ref(const std::string& ref) const {
     for (size_t i = 1; i < parts.size(); ++i) {
         if (obj.is_null()) break;
         if (obj.is_object() && obj.contains(parts[i])) obj = obj[parts[i]];
-        else if (obj.is_array()) { try { obj = obj[std::stoi(parts[i])]; } catch (...) { obj = nullptr; } }
+        else if (obj.is_array()) {
+            try {
+                int idx = std::stoi(parts[i]);
+                if (idx >= 0 && idx < (int)obj.size()) obj = obj[idx];
+                else obj = nullptr;
+            } catch (...) { obj = nullptr; }
+        }
         else obj = nullptr;
     }
     return obj;
