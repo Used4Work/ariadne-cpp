@@ -229,7 +229,8 @@ std::string AnthropicProvider::complete(const std::string& prompt,
 LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                                const std::vector<ToolDef>& tools,
                                                double temperature,
-                                               const std::string& tool_choice) const {
+                                               const std::string& tool_choice,
+                                               const json& output_schema) const {
     // Build messages array (Anthropic format: user/assistant alternating)
     json msgs = json::array();
     std::string system_prompt;
@@ -312,6 +313,10 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
             body["tool_choice"] = {{"type","tool"},{"name",tool_choice}};
         else body["tool_choice"] = {{"type","auto"}};
     }
+
+    // Structured output via response_format
+    if (!output_schema.is_null() && !output_schema.empty())
+        body["response_format"] = {{"type","json_schema"},{"json_schema",output_schema}};
 
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
     auto resp = http_post(base + "/v1/messages",
@@ -495,12 +500,33 @@ void InMemoryVectorStore::clear() {
     entries_.clear();
 }
 
+json InMemoryVectorStore::to_json() const {
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    json arr = json::array();
+    for (const auto& e : entries_) {
+        arr.push_back({{"id", e.id}, {"embedding", e.embedding}, {"metadata", e.metadata}});
+    }
+    return arr;
+}
+
+void InMemoryVectorStore::load_json(const json& j) {
+    clear();
+    if (!j.is_array()) return;
+    for (const auto& item : j) {
+        std::string id = item.value("id", "");
+        auto emb = item.value("embedding", std::vector<float>{});
+        json meta = item.value("metadata", json::object());
+        add(id, emb, meta);
+    }
+}
+
 // ── ILLMProvider::complete_chat default ──────────────────────────
 
 LLMResponse ILLMProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                           const std::vector<ToolDef>& /*tools*/,
                                           double temperature,
-                                          const std::string& /*tool_choice*/) const {
+                                          const std::string& /*tool_choice*/,
+                                          const json& /*output_schema*/) const {
     // Default: concatenate messages into a single prompt, call complete()
     std::string system, prompt;
     for (const auto& m : messages) {
@@ -519,7 +545,8 @@ LLMResponse ILLMProvider::complete_chat(const std::vector<ChatMessage>& messages
 LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                                 const std::vector<ToolDef>& tools,
                                                 double temperature,
-                                                const std::string& tool_choice) const {
+                                                const std::string& tool_choice,
+                                                const json& output_schema) const {
     // Build messages array
     json msgs = json::array();
     for (const auto& m : messages) {
@@ -563,6 +590,11 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
             body["tool_choice"] = {{"type","function"},{"function",{{"name",tool_choice}}}};
         else body["tool_choice"] = "auto";
     }
+
+    // Structured output via response_format
+    if (!output_schema.is_null() && !output_schema.empty())
+        body["response_format"] = {{"type","json_schema"},
+            {"json_schema",{{"name","response"},{"strict",true},{"schema",output_schema}}}};
 
     std::string base = cfg_.base_url.empty() ? "https://api.openai.com" : rtrim_slash(cfg_.base_url);
     std::string path = cfg_.completions_path.empty() ? "/v1/chat/completions" : cfg_.completions_path;
@@ -611,7 +643,8 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
                                        const std::vector<ChatMessage>& messages,
                                        const std::vector<ToolDef>& tools,
                                        double temperature,
-                                       const std::string& tool_choice) const {
+                                       const std::string& tool_choice,
+                                       const json& output_schema) const {
     // Token budget check (parity with try_slots)
     if (token_budget_ > 0 && cumulative_usage_.total_tokens >= token_budget_)
         throw TokenBudgetError("Token budget exceeded: " +
@@ -640,7 +673,7 @@ LLMResponse LLMClient::complete_chat(ModelTier tier,
         for (int rate_retry = 0; rate_retry <= MAX_RATE_RETRIES; ++rate_retry) {
             try {
                 auto call_t0 = std::chrono::steady_clock::now();
-                auto resp = slot.provider->complete_chat(messages, tools, temperature, tool_choice);
+                auto resp = slot.provider->complete_chat(messages, tools, temperature, tool_choice, output_schema);
                 auto call_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - call_t0).count();
                 slot.breaker.on_success();
@@ -758,7 +791,8 @@ std::string GeminiProvider::complete(const std::string& prompt,
 LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messages,
                                            const std::vector<ToolDef>& tools,
                                            double temperature,
-                                           const std::string& tool_choice) const {
+                                           const std::string& tool_choice,
+                                           const json& output_schema) const {
     json contents = json::array();
     std::string system_instruction;
     for (const auto& m : messages) {
@@ -805,6 +839,11 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
 
     json body = {{"contents", contents}};
     json gen_config = {{"temperature", temperature}, {"maxOutputTokens", cfg_.max_tokens}};
+    // Structured output via responseSchema
+    if (!output_schema.is_null() && !output_schema.empty()) {
+        gen_config["responseMimeType"] = "application/json";
+        gen_config["responseSchema"] = output_schema;
+    }
     body["generationConfig"] = gen_config;
     if (!system_instruction.empty())
         body["systemInstruction"] = {{"parts",{{{"text",system_instruction}}}}};
@@ -1518,8 +1557,12 @@ WorkflowPlan WorkflowPlanner::plan(const std::string& task,
                                     const std::vector<ToolDef>& tools,
                                     const WorkflowContext& ctx,
                                     int max_attempts) const {
+    // Sort tools alphabetically for stable cache-friendly prompt prefix (D65 parity)
+    auto sorted_tools = tools;
+    std::sort(sorted_tools.begin(), sorted_tools.end(),
+        [](const ToolDef& a, const ToolDef& b) { return a.name < b.name; });
     json tj = json::array();
-    for (const auto& t : tools)
+    for (const auto& t : sorted_tools)
         tj.push_back({{"name", t.name}, {"description", t.description},
                       {"inputs", t.input_schema}});
 
@@ -2559,18 +2602,28 @@ WorkflowState WorkflowState::from_json(const json& j) {
 // ════════════════════════════════════════════════════════════════
 
 FileCheckpointStore::FileCheckpointStore(const std::string& directory) : dir_(directory) {
-    std::filesystem::create_directories(dir_);
+    try { std::filesystem::create_directories(dir_); }
+    catch (const std::filesystem::filesystem_error& e) {
+        throw AriadneError("Checkpoint directory creation failed: " + std::string(e.what()));
+    }
 }
 
 void FileCheckpointStore::save(const std::string& workflow_id, const json& state) {
-    std::ofstream f(dir_ + "/" + workflow_id + ".checkpoint.json");
-    if (f) f << state.dump(2);
+    auto path = dir_ + "/" + workflow_id + ".checkpoint.json";
+    std::ofstream f(path);
+    if (!f) throw AriadneError("Checkpoint save failed (cannot open): " + path);
+    f << state.dump(2);
+    if (!f.good()) throw AriadneError("Checkpoint save failed (write error): " + path);
 }
 
 json FileCheckpointStore::load(const std::string& workflow_id) {
-    std::ifstream f(dir_ + "/" + workflow_id + ".checkpoint.json");
+    auto path = dir_ + "/" + workflow_id + ".checkpoint.json";
+    std::ifstream f(path);
     if (!f) throw AriadneError("Checkpoint not found: " + workflow_id);
-    return json::parse(f);
+    try { return json::parse(f); }
+    catch (const json::parse_error& e) {
+        throw AriadneError("Checkpoint corrupted (" + workflow_id + "): " + std::string(e.what()));
+    }
 }
 
 bool FileCheckpointStore::exists(const std::string& workflow_id) {
@@ -3943,7 +3996,9 @@ void StdioTransport::send(const json& message) {
     if (closed_) throw McpError("MCP: transport closed");
     std::string line = message.dump() + "\n";
     DWORD written;
-    WriteFile(stdin_write_, line.c_str(), (DWORD)line.size(), &written, nullptr);
+    if (!WriteFile(stdin_write_, line.c_str(), (DWORD)line.size(), &written, nullptr)
+        || written != (DWORD)line.size())
+        throw McpError("MCP: write to subprocess stdin failed");
 }
 
 json StdioTransport::receive() {
@@ -4002,7 +4057,9 @@ StdioTransport::~StdioTransport() { close(); }
 void StdioTransport::send(const json& message) {
     if (closed_) throw McpError("MCP: transport closed");
     std::string line = message.dump() + "\n";
-    ::write(stdin_fd_, line.c_str(), line.size());
+    auto written = ::write(stdin_fd_, line.c_str(), line.size());
+    if (written < 0 || (size_t)written != line.size())
+        throw McpError("MCP: write to subprocess stdin failed");
 }
 
 json StdioTransport::receive() {

@@ -49,7 +49,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.5.0";
+constexpr const char* ARIADNE_VERSION = "2.6.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -391,6 +391,12 @@ public:
     void remove(const std::string& id) override;
     size_t size() const override;
     void clear() override;
+
+    /** 序列化为 JSON（用于持久化 / 导出） */
+    json to_json() const;
+    /** 从 JSON 恢复所有条目（清空当前内容后加载） */
+    void load_json(const json& j);
+
 private:
     mutable std::shared_mutex mu_;
     std::vector<VectorEntry> entries_;
@@ -466,7 +472,8 @@ public:
     virtual LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                        const std::vector<ToolDef>& tools = {},
                                        double temperature = 0.0,
-                                       const std::string& tool_choice = "auto") const;
+                                       const std::string& tool_choice = "auto",
+                                       const json& output_schema = json()) const;
 
     /** 是否支持原生工具调用 */
     virtual bool supports_native_tools() const { return false; }
@@ -511,7 +518,8 @@ public:
     LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
                                double temperature = 0.0,
-                               const std::string& tool_choice = "auto") const override;
+                               const std::string& tool_choice = "auto",
+                               const json& output_schema = json()) const override;
     bool supports_native_tools() const override { return true; }
     std::string provider_name() const override { return "anthropic"; }
     std::string model_name()    const override { return cfg_.model;   }
@@ -533,7 +541,8 @@ public:
     LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
                                double temperature = 0.0,
-                               const std::string& tool_choice = "auto") const override;
+                               const std::string& tool_choice = "auto",
+                               const json& output_schema = json()) const override;
     bool supports_native_tools() const override { return true; }
     std::string provider_name() const override {
         return cfg_.base_url.empty() ? "openai_chat" : "openai_compatible";
@@ -574,7 +583,8 @@ public:
     LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
                                double temperature = 0.0,
-                               const std::string& tool_choice = "auto") const override;
+                               const std::string& tool_choice = "auto",
+                               const json& output_schema = json()) const override;
     bool supports_native_tools() const override { return true; }
     std::string provider_name() const override { return "gemini"; }
     std::string model_name()    const override { return cfg_.model; }
@@ -597,7 +607,8 @@ public:
     LLMResponse complete_chat(const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
                                double temperature = 0.0,
-                               const std::string& tool_choice = "auto") const override {
+                               const std::string& tool_choice = "auto",
+                               const json& output_schema = json()) const override {
         LLMResponse r;
         if (!mock_tool_calls_.empty()) {
             r.tool_calls = mock_tool_calls_;
@@ -779,7 +790,8 @@ public:
                                const std::vector<ChatMessage>& messages,
                                const std::vector<ToolDef>& tools = {},
                                double temperature = 0.0,
-                               const std::string& tool_choice = "auto") const;
+                               const std::string& tool_choice = "auto",
+                               const json& output_schema = json()) const;
     bool supports_native_tools(ModelTier tier) const;
 
     std::vector<ProviderStats> stats(ModelTier tier) const;
