@@ -2,6 +2,31 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.6.0] - 2026-06-23
+
+### Added
+- **FileCheckpointStore robustness** (D77): constructor wraps `create_directories()` in try/catch, `save()` checks ofstream open + good(), `load()` catches parse_error — all throw `AriadneError` with descriptive messages
+- **StdioTransport send() validation** (D78): Windows checks `WriteFile` return + written count, POSIX checks `::write` for negative/short write — both throw `McpError` on failure
+- **InMemoryVectorStore serialization** (D80): `to_json()` serializes entries under shared lock, `load_json()` clears and repopulates from JSON array. Uses void method (not static factory) because `shared_mutex` is non-movable in MSVC
+- **complete_chat() output_schema** (D81): optional `output_schema` parameter wired through all providers (OpenAI json_schema, Anthropic json_schema, Gemini responseSchema) and LLMClient — native agent structured output parity
+- **Planner tool sorting** (D82): `WorkflowPlanner::plan()` sorts tools alphabetically, matching agent paths (D65) for consistent prefix cache hits
+- 7 new tests (187 total)
+
+### Fixed
+- FileCheckpointStore silent failures on directory creation, file write, and corrupted JSON
+- StdioTransport silently ignoring failed writes causing hung MCP sessions
+
+## [2.5.0] - 2026-06-23
+
+### Added
+- **Hedged requests** (D76): `enable_hedging(bool)` races 2 providers, returns first success. Trades cost for latency (P50 = min of both)
+- **ConsoleLogger thread safety** (D71): mutex on `std::cerr` output
+- **Retry-After substr safety** (D72): guards against `npos` subtraction
+- **from_json DAG validation** (D73): `WorkflowPlan::from_json()` calls `validate_dag()`
+- **resolve_value array bounds** (D74): validates index before access
+- **AllProvidersExhaustedError diagnostics** (D75): collects all slot errors into message
+- 7 new tests (180 total)
+
 ## [2.4.0] - 2026-06-18
 
 ### Fixed (CI green)
