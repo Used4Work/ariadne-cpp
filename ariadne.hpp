@@ -27,6 +27,10 @@
 #include <chrono>
 #include <stdexcept>
 #include <optional>
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <set>
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 
@@ -49,7 +53,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.7.0";
+constexpr const char* ARIADNE_VERSION = "2.8.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -148,6 +152,11 @@ public:
 
 /** MCP 传输/协议错误 */
 class McpError : public AriadneError {
+    using AriadneError::AriadneError;
+};
+
+/** A2A (Agent2Agent) 传输/协议错误 */
+class A2AError : public AriadneError {
     using AriadneError::AriadneError;
 };
 
@@ -511,6 +520,19 @@ struct VectorResult {
     json        metadata;
 };
 
+/** 检索过滤/重排选项 (D90 — memory scoping + temporal)
+ *  scope_prefix: 仅匹配 metadata["scope"] 以此前缀开头的条目（空=全部）。
+ *               典型作用域: "user:alice" / "session:42" / "agent:researcher"。
+ *  recency_half_life_sec: >0 时按时间衰减重排 score *= 0.5^(age/half_life)，
+ *                         age = now_ts - metadata["ts"]（秒）。
+ *  now_ts: recency 计算的"现在"(unix 秒)；为 0 且启用 recency 时回退到系统时钟。 */
+struct MemoryQuery {
+    int         top_k                 = 5;
+    std::string scope_prefix          = "";
+    double      recency_half_life_sec = 0.0;
+    long long   now_ts                = 0;
+};
+
 class IMemoryStore {
 public:
     virtual ~IMemoryStore() = default;
@@ -533,6 +555,16 @@ public:
     size_t size() const override;
     void clear() override;
 
+    /** 便捷写入：把 scope + ts 合并进 metadata（D90）。ts 为 0 时用系统时钟。 */
+    void add_scoped(const std::string& id, const std::vector<float>& embedding,
+                    const std::string& scope, long long ts = 0,
+                    const json& metadata = {});
+
+    /** 作用域 + 时间衰减检索（D90）。先按 scope_prefix 过滤，
+     *  再按 cosine（可选 recency 衰减）排序返回 top_k。 */
+    std::vector<VectorResult> query(const std::vector<float>& embedding,
+                                     const MemoryQuery& opts) const;
+
     /** 序列化为 JSON（用于持久化 / 导出） */
     json to_json() const;
     /** 从 JSON 恢复所有条目（清空当前内容后加载） */
@@ -541,6 +573,184 @@ public:
 private:
     mutable std::shared_mutex mu_;
     std::vector<VectorEntry> entries_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// D89 — BM25 词法检索 + Reciprocal Rank Fusion（混合检索）
+//   稀疏检索 (BM25) 擅长精确匹配（产品码、专名、罕见术语），
+//   与稠密向量检索 (cosine) 的语义召回互补。2026 业界 RAG 标准做法：
+//   BM25 + 向量 → RRF 融合排序（rag-engine / InfoQ / Elastic）。
+// ════════════════════════════════════════════════════════════════
+
+/** 单条排序结果（id + 分数） */
+struct RankedDoc {
+    std::string id;
+    double      score = 0.0;
+};
+
+/** Okapi BM25 词法索引（k1=1.2, b=0.75, Lucene 恒正 IDF 变体）。
+ *  纯内存倒排索引，线程安全 (shared_mutex)。 */
+class Bm25Index {
+public:
+    explicit Bm25Index(double k1 = 1.2, double b = 0.75) : k1_(k1), b_(b) {}
+
+    /** 添加/更新文档（id 已存在则覆盖）。text 自动分词。 */
+    void add(const std::string& id, const std::string& text) {
+        auto toks = tokenize(text);
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        remove_locked(id);
+        Doc d; d.len = toks.size();
+        for (const auto& t : toks) d.tf[t]++;
+        for (const auto& kv : d.tf) postings_[kv.first].insert(id);
+        total_len_ += (double)d.len;
+        docs_[id] = std::move(d);
+    }
+
+    void remove(const std::string& id) {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        remove_locked(id);
+    }
+
+    size_t size() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return docs_.size();
+    }
+
+    void clear() {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        docs_.clear(); postings_.clear(); total_len_ = 0.0;
+    }
+
+    /** 查询：返回按 BM25 分数降序的 top_k 文档。 */
+    std::vector<RankedDoc> query(const std::string& query_text, int top_k = 5) const {
+        auto q_toks = tokenize(query_text);
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        if (docs_.empty() || q_toks.empty()) return {};
+        const double N = (double)docs_.size();
+        const double avgdl = total_len_ / N;
+        std::unordered_map<std::string, double> scores;
+        for (const auto& qt : q_toks) {
+            auto pit = postings_.find(qt);
+            if (pit == postings_.end()) continue;
+            const double n = (double)pit->second.size();
+            // Lucene IDF: log(1 + (N - n + 0.5)/(n + 0.5))，恒为正
+            const double idf = std::log(1.0 + (N - n + 0.5) / (n + 0.5));
+            for (const auto& id : pit->second) {
+                const Doc& d = docs_.at(id);
+                auto tfit = d.tf.find(qt);
+                if (tfit == d.tf.end()) continue;
+                const double f = (double)tfit->second;
+                const double denom = f + k1_ * (1.0 - b_ + b_ * ((double)d.len / avgdl));
+                scores[id] += idf * (f * (k1_ + 1.0)) / denom;
+            }
+        }
+        std::vector<RankedDoc> out;
+        out.reserve(scores.size());
+        for (const auto& kv : scores) out.push_back({kv.first, kv.second});
+        const size_t k = std::min((size_t)std::max(0, top_k), out.size());
+        std::partial_sort(out.begin(), out.begin() + k, out.end(),
+            [](const RankedDoc& a, const RankedDoc& b) { return a.score > b.score; });
+        out.resize(k);
+        return out;
+    }
+
+    /** 公开分词器（静态）：小写 + 按非字母数字切分。 */
+    static std::vector<std::string> tokenize(const std::string& text) {
+        std::vector<std::string> toks;
+        std::string cur;
+        for (unsigned char ch : text) {
+            if (std::isalnum(ch)) {
+                cur += (char)std::tolower(ch);
+            } else if (!cur.empty()) {
+                toks.push_back(cur); cur.clear();
+            }
+        }
+        if (!cur.empty()) toks.push_back(cur);
+        return toks;
+    }
+
+private:
+    struct Doc {
+        size_t len = 0;
+        std::unordered_map<std::string, int> tf;
+    };
+    void remove_locked(const std::string& id) {
+        auto it = docs_.find(id);
+        if (it == docs_.end()) return;
+        for (const auto& kv : it->second.tf) {
+            auto pit = postings_.find(kv.first);
+            if (pit != postings_.end()) {
+                pit->second.erase(id);
+                if (pit->second.empty()) postings_.erase(pit);
+            }
+        }
+        total_len_ -= (double)it->second.len;
+        docs_.erase(it);
+    }
+    double k1_, b_;
+    mutable std::shared_mutex mu_;
+    std::unordered_map<std::string, Doc> docs_;
+    std::unordered_map<std::string, std::set<std::string>> postings_;
+    double total_len_ = 0.0;
+};
+
+/** Reciprocal Rank Fusion：按"排名"（而非分数）融合多个排序列表，
+ *  score(d) = Σ 1/(k + rank(d))，k 默认 60（业界标准）。
+ *  对各路分数尺度不敏感，是混合检索的鲁棒融合法。rank 从 1 开始。 */
+inline std::vector<RankedDoc> reciprocal_rank_fusion(
+        const std::vector<std::vector<RankedDoc>>& ranked_lists,
+        int top_k = 5, double k = 60.0) {
+    std::unordered_map<std::string, double> fused;
+    for (const auto& list : ranked_lists) {
+        for (size_t rank = 0; rank < list.size(); ++rank) {
+            fused[list[rank].id] += 1.0 / (k + (double)(rank + 1));
+        }
+    }
+    std::vector<RankedDoc> out;
+    out.reserve(fused.size());
+    for (const auto& kv : fused) out.push_back({kv.first, kv.second});
+    const size_t kk = std::min((size_t)std::max(0, top_k), out.size());
+    std::partial_sort(out.begin(), out.begin() + kk, out.end(),
+        [](const RankedDoc& a, const RankedDoc& b) { return a.score > b.score; });
+    out.resize(kk);
+    return out;
+}
+
+/** 混合检索器：向量 (cosine) + BM25 (词法)，RRF 融合（D89）。
+ *  add() 同时写入两个索引；query() 用 embedding + text 双路召回并融合。 */
+class HybridRetriever {
+public:
+    HybridRetriever() = default;
+
+    void add(const std::string& id, const std::vector<float>& embedding,
+             const std::string& text, const json& metadata = {}) {
+        vec_.add(id, embedding, metadata);
+        bm25_.add(id, text);
+    }
+    void remove(const std::string& id) { vec_.remove(id); bm25_.remove(id); }
+    size_t size() const { return bm25_.size(); }
+    void clear() { vec_.clear(); bm25_.clear(); }
+
+    /** RRF 融合后的 top_k（id + 融合分数）。
+     *  每路召回深度 = max(top_k*4, top_k)，再融合截断到 top_k。 */
+    std::vector<RankedDoc> query(const std::vector<float>& embedding,
+                                 const std::string& text,
+                                 int top_k = 5, double rrf_k = 60.0) const {
+        const int cand = std::max(top_k * 4, top_k);
+        auto vr = vec_.query(embedding, cand);
+        std::vector<RankedDoc> dense;
+        dense.reserve(vr.size());
+        for (const auto& r : vr) dense.push_back({r.id, (double)r.score});
+        auto sparse = bm25_.query(text, cand);
+        return reciprocal_rank_fusion({dense, sparse}, top_k, rrf_k);
+    }
+
+    InMemoryVectorStore& vectors() { return vec_; }
+    Bm25Index&           lexical() { return bm25_; }
+
+private:
+    InMemoryVectorStore vec_;
+    Bm25Index           bm25_;
 };
 
 // ── Native Tool Calling 数据类型 ─────────────────────────
@@ -589,6 +799,74 @@ struct LLMResponse {
     std::string             content;
     std::vector<LLMToolCall> tool_calls;
     bool has_tool_calls() const { return !tool_calls.empty(); }
+};
+
+// ════════════════════════════════════════════════════════════════
+// D91 — 上下文压缩（LLM 摘要）
+//   长程 agent 的对话历史增长会推高成本/延迟、并因无关旧错误干扰推理
+//   ("context bloat")。相比 D64 观察遮蔽（按工具结果级遮蔽），本压缩把
+//   最老的若干轮整段送 LLM 摘要，替换成一条 system 摘要消息，保留关键
+//   事实/决策/工具结果。2026 主流做法（arXiv 2601.07190、JetBrains）。
+// ════════════════════════════════════════════════════════════════
+
+/** 摘要函数：输入待压缩文本，返回浓缩摘要。 */
+using SummarizerFn = std::function<std::string(const std::string&)>;
+
+struct CompactionConfig {
+    size_t trigger_tokens = 4000; // 历史 token 估算超过此值才触发压缩
+    size_t keep_recent    = 4;    // 末尾保留 N 条消息不压缩
+};
+
+/** 上下文压缩器：触发时把最老的消息压成一条 system 摘要消息。
+ *  summarizer 可注入任意实现（LLM、本地摘要、测试桩）。 */
+class ContextCompactor {
+public:
+    explicit ContextCompactor(SummarizerFn summarizer, CompactionConfig cfg = {})
+        : summarize_(std::move(summarizer)), cfg_(cfg) {}
+
+    /** 估算 messages 总 token；未超阈值则原样返回。超阈值则：
+     *  保留首条 system（若有）+ 末尾 keep_recent 条，中间整段送 summarizer，
+     *  替换为一条 {role:"system", content:"[Conversation summary] ..."}。 */
+    std::vector<ChatMessage> compact(const std::vector<ChatMessage>& messages) const {
+        long total = 0;
+        for (const auto& m : messages) total += estimate_tokens(m.content);
+        if ((size_t)total <= cfg_.trigger_tokens ||
+            messages.size() <= cfg_.keep_recent + 1)
+            return messages;
+
+        std::vector<ChatMessage> out;
+        size_t start = 0;
+        const bool has_sys = !messages.empty() && messages.front().role == "system";
+        if (has_sys) { out.push_back(messages.front()); start = 1; }
+
+        size_t keep_from = messages.size() > cfg_.keep_recent
+                           ? messages.size() - cfg_.keep_recent : start;
+        if (keep_from < start) keep_from = start;
+
+        std::string blob;
+        for (size_t i = start; i < keep_from; ++i)
+            blob += messages[i].role + ": " + messages[i].content + "\n";
+        if (!blob.empty()) {
+            std::string summary = summarize_ ? summarize_(blob) : blob;
+            out.push_back(ChatMessage::text(
+                "system", "[Conversation summary] " + summary));
+        }
+        for (size_t i = keep_from; i < messages.size(); ++i)
+            out.push_back(messages[i]);
+        return out;
+    }
+
+    /** 是否会触发压缩（不执行摘要，便于上层决策）。 */
+    bool should_compact(const std::vector<ChatMessage>& messages) const {
+        long total = 0;
+        for (const auto& m : messages) total += estimate_tokens(m.content);
+        return (size_t)total > cfg_.trigger_tokens &&
+               messages.size() > cfg_.keep_recent + 1;
+    }
+
+private:
+    SummarizerFn     summarize_;
+    CompactionConfig cfg_;
 };
 
 /** 所有 Provider 的公共接口 */
@@ -1715,6 +1993,223 @@ private:
     std::vector<ToolDef> discovered_tools_;
 
     json make_request(const std::string& method, const json& params = json::object());
+};
+
+// ════════════════════════════════════════════════════════════════
+// D92 — A2A (Agent2Agent) Client — Linux Foundation A2A v1.0
+//   跨框架 agent 互操作（150+ 组织、3 大云）：AgentCard 发现 +
+//   JSON-RPC 2.0 over HTTP（message/send）。规范数据模型：
+//   AgentCard / AgentSkill / Message / Part / Task。
+//   实现 JSON-RPC over HTTP 绑定（小写 role/state、kebab task state）。
+// ════════════════════════════════════════════════════════════════
+
+/** A2A 消息部件（text / file / data 三选一）。 */
+struct A2APart {
+    std::string kind = "text";   // "text" | "file" | "data"
+    std::string text;            // kind==text
+    json        data;            // kind==data（任意 JSON）
+    std::string file_uri;        // kind==file
+    std::string file_bytes;      // kind==file（base64）
+    std::string media_type;      // kind==file 可选 MIME
+
+    static A2APart from_text(const std::string& t) { A2APart p; p.kind = "text"; p.text = t; return p; }
+    static A2APart from_data(const json& d) { A2APart p; p.kind = "data"; p.data = d; return p; }
+
+    json to_json() const {
+        json j; j["kind"] = kind;
+        if (kind == "text") j["text"] = text;
+        else if (kind == "data") j["data"] = data;
+        else if (kind == "file") {
+            json f;
+            if (!file_uri.empty())   f["uri"]      = file_uri;
+            if (!file_bytes.empty()) f["bytes"]    = file_bytes;
+            if (!media_type.empty()) f["mimeType"] = media_type;
+            j["file"] = f;
+        }
+        return j;
+    }
+    static A2APart from_json(const json& j) {
+        A2APart p;
+        p.kind = j.value("kind", "text");
+        if (p.kind == "text") p.text = j.value("text", "");
+        else if (p.kind == "data") p.data = j.value("data", json());
+        else if (p.kind == "file") {
+            json f = j.value("file", json::object());
+            p.file_uri   = f.value("uri", "");
+            p.file_bytes = f.value("bytes", "");
+            p.media_type = f.value("mimeType", "");
+        }
+        return p;
+    }
+};
+
+/** A2A 消息（role: "user" | "agent"）。 */
+struct A2AMessage {
+    std::string          role = "user";
+    std::vector<A2APart> parts;
+    std::string          message_id;
+    std::string          task_id;
+    std::string          context_id;
+
+    static A2AMessage user_text(const std::string& text, const std::string& msg_id = "") {
+        A2AMessage m; m.role = "user";
+        m.parts.push_back(A2APart::from_text(text));
+        m.message_id = msg_id;
+        return m;
+    }
+    /** 拼接所有 text part。 */
+    std::string text() const {
+        std::string s;
+        for (const auto& p : parts)
+            if (p.kind == "text") { if (!s.empty()) s += "\n"; s += p.text; }
+        return s;
+    }
+    json to_json() const {
+        json j; j["role"] = role;
+        json ps = json::array();
+        for (const auto& p : parts) ps.push_back(p.to_json());
+        j["parts"] = ps;
+        if (!message_id.empty()) j["messageId"] = message_id;
+        if (!task_id.empty())    j["taskId"]    = task_id;
+        if (!context_id.empty()) j["contextId"] = context_id;
+        return j;
+    }
+    static A2AMessage from_json(const json& j) {
+        A2AMessage m;
+        m.role       = j.value("role", "agent");
+        m.message_id = j.value("messageId", "");
+        m.task_id    = j.value("taskId", "");
+        m.context_id = j.value("contextId", "");
+        if (j.contains("parts") && j["parts"].is_array())
+            for (const auto& p : j["parts"]) m.parts.push_back(A2APart::from_json(p));
+        return m;
+    }
+};
+
+/** A2A 任务状态（JSON 绑定的 kebab-case）。 */
+enum class A2ATaskState {
+    Submitted, Working, InputRequired, AuthRequired,
+    Completed, Failed, Canceled, Rejected, Unknown
+};
+inline A2ATaskState a2a_parse_state(const std::string& s) {
+    if (s == "submitted")      return A2ATaskState::Submitted;
+    if (s == "working")        return A2ATaskState::Working;
+    if (s == "input-required") return A2ATaskState::InputRequired;
+    if (s == "auth-required")  return A2ATaskState::AuthRequired;
+    if (s == "completed")      return A2ATaskState::Completed;
+    if (s == "failed")         return A2ATaskState::Failed;
+    if (s == "canceled")       return A2ATaskState::Canceled;
+    if (s == "rejected")       return A2ATaskState::Rejected;
+    return A2ATaskState::Unknown;
+}
+inline bool a2a_is_terminal(A2ATaskState s) {
+    return s == A2ATaskState::Completed || s == A2ATaskState::Failed
+        || s == A2ATaskState::Canceled  || s == A2ATaskState::Rejected;
+}
+
+/** A2A 任务。 */
+struct A2ATask {
+    std::string             id;
+    std::string             context_id;
+    A2ATaskState            state = A2ATaskState::Unknown;
+    std::vector<A2AMessage> history;
+    json                    artifacts = json::array();
+    json                    raw;   // 完整原始 JSON
+
+    static A2ATask from_json(const json& j) {
+        A2ATask t;
+        t.raw        = j;
+        t.id         = j.value("id", "");
+        t.context_id = j.value("contextId", "");
+        json status  = j.value("status", json::object());
+        t.state      = a2a_parse_state(status.value("state", ""));
+        if (j.contains("history") && j["history"].is_array())
+            for (const auto& m : j["history"]) t.history.push_back(A2AMessage::from_json(m));
+        t.artifacts  = j.value("artifacts", json::array());
+        return t;
+    }
+};
+
+/** A2A Agent 技能。 */
+struct A2AAgentSkill {
+    std::string              id, name, description;
+    std::vector<std::string> tags;
+    static A2AAgentSkill from_json(const json& j) {
+        A2AAgentSkill s;
+        s.id          = j.value("id", "");
+        s.name        = j.value("name", "");
+        s.description = j.value("description", "");
+        if (j.contains("tags") && j["tags"].is_array())
+            for (const auto& t : j["tags"]) if (t.is_string()) s.tags.push_back(t.get<std::string>());
+        return s;
+    }
+};
+
+/** A2A Agent Card — agent 身份/能力/技能/服务端点元数据文档。 */
+struct A2AAgentCard {
+    std::string                name, description, url, version, protocol_version;
+    std::vector<std::string>   default_input_modes, default_output_modes;
+    std::vector<A2AAgentSkill> skills;
+    bool                       streaming = false;  // capabilities.streaming
+    json                       raw;
+
+    static A2AAgentCard from_json(const json& j) {
+        A2AAgentCard c;
+        c.raw              = j;
+        c.name             = j.value("name", "");
+        c.description      = j.value("description", "");
+        c.url              = j.value("url", "");
+        c.version          = j.value("version", "");
+        c.protocol_version = j.value("protocolVersion", "");
+        json caps          = j.value("capabilities", json::object());
+        c.streaming        = caps.value("streaming", false);
+        auto arr_str = [](const json& a) {
+            std::vector<std::string> v;
+            if (a.is_array()) for (const auto& x : a) if (x.is_string()) v.push_back(x.get<std::string>());
+            return v;
+        };
+        c.default_input_modes  = arr_str(j.value("defaultInputModes", json::array()));
+        c.default_output_modes = arr_str(j.value("defaultOutputModes", json::array()));
+        if (j.contains("skills") && j["skills"].is_array())
+            for (const auto& s : j["skills"]) c.skills.push_back(A2AAgentSkill::from_json(s));
+        return c;
+    }
+};
+
+/** A2A 客户端：AgentCard 发现 + message/send（JSON-RPC 2.0 over HTTP）。
+ *  发现端点：GET {base}/.well-known/agent-card.json。 */
+class A2AClient {
+public:
+    /** base_url: A2A 服务器根 URL（如 https://host）；api_key 可选（Bearer）。 */
+    explicit A2AClient(std::string base_url, std::string api_key = "")
+        : base_url_(rtrim_slash(std::move(base_url))), api_key_(std::move(api_key)) {}
+
+    /** 拉取 Agent Card；若 card.url 非空则后续 RPC 发往该端点。 */
+    A2AAgentCard fetch_agent_card();
+
+    /** 发送消息（method=message/send）。返回 result（Message 或 Task）。 */
+    json send_message(const A2AMessage& msg);
+
+    /** 便捷：发送一句话，返回 agent 回复的拼接文本。 */
+    std::string ask(const std::string& text);
+
+    /** 构造 JSON-RPC 2.0 请求信封（静态，便于离线测试）。 */
+    static json make_rpc(int id, const std::string& method, const json& params) {
+        return {{"jsonrpc", "2.0"}, {"id", id}, {"method", method}, {"params", params}};
+    }
+
+    /** 当前 RPC 端点（card.url 优先，否则 base_url）。 */
+    std::string endpoint() const { return endpoint_.empty() ? base_url_ : endpoint_; }
+
+private:
+    static std::string rtrim_slash(std::string s) {
+        while (!s.empty() && s.back() == '/') s.pop_back();
+        return s;
+    }
+    std::string base_url_;
+    std::string api_key_;
+    std::string endpoint_;   // 来自 card.url
+    int         next_id_ = 1;
 };
 
 class WorkflowEngine {

@@ -2,6 +2,20 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.8.0] - 2026-06-23
+
+Theme: **Retrieval, memory & context engineering + A2A interop.** Researched against live June 2026 docs (A2A v1.0 Linux Foundation, MCP 2025-11-25, hybrid-retrieval RAG gold standard, context-compaction research arXiv 2601.07190).
+
+### Added
+- **BM25 + RRF hybrid retrieval** (D89): `Bm25Index` (Okapi BM25, k1=1.2/b=0.75, Lucene恒正 IDF) for sparse lexical search; `reciprocal_rank_fusion()` (k=60) rank-based fusion; `HybridRetriever` combines vector cosine + BM25 via RRF. Now the industry RAG default — sparse handles exact/rare-term matches, dense handles paraphrase.
+- **Memory scoping + temporal** (D90): `MemoryQuery` options (`scope_prefix`, `recency_half_life_sec`, `now_ts`); `InMemoryVectorStore::add_scoped()` + scoped `query()` overload. Filter by `user:`/`session:`/`agent:` scope, re-rank with exponential recency decay `0.5^(age/half_life)`.
+- **Context compaction** (D91): `ContextCompactor` with pluggable `SummarizerFn` replaces the oldest conversation turns with one LLM summary message when a token threshold is exceeded (complements D64 observation masking). `CompactionConfig` (`trigger_tokens`, `keep_recent`) + `should_compact()`.
+- **A2A (Agent2Agent) client** (D92): Linux Foundation A2A v1.0 interop. Canonical types `A2AAgentCard`/`A2AAgentSkill`/`A2AMessage`/`A2APart`/`A2ATask` (+states), JSON-RPC envelope builder, `A2AClient` (`fetch_agent_card()` via `/.well-known/agent-card.json` + `message/send` over HTTP, reusing the per-request CurlHandle pattern). New `A2AError` exception.
+- 17 new tests (213 total)
+
+### Changed
+- Exception hierarchy gains `A2AError` (sibling of `McpError` under `AriadneError`).
+
 ## [2.7.0] - 2026-06-23
 
 Theme: **Latest provider APIs + OpenTelemetry observability.** Researched against live June 2026 docs (Gemini 3, GPT-5.5, Claude structured-output GA, OTel GenAI semconv 1.40).

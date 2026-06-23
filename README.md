@@ -8,7 +8,7 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-160%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-213%20passed-brightgreen)](#tests)
 
 </div>
 
@@ -61,6 +61,12 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Metrics** -- pluggable `IMetricsCollector`, 10 event kinds
 - **Token estimation** -- `estimate_tokens()` heuristic
 
+### Retrieval & Memory
+- **Hybrid retrieval** -- `HybridRetriever` fuses dense vectors (cosine) + sparse `Bm25Index` (Okapi BM25) via Reciprocal Rank Fusion -- the 2026 RAG gold standard
+- **Memory scoping + temporal** -- `MemoryQuery` filters by `user:`/`session:`/`agent:` scope and re-ranks with exponential recency decay
+- **Context compaction** -- `ContextCompactor` summarizes the oldest turns into one message when a token threshold is hit (complements observation masking)
+- **Vector store** -- `InMemoryVectorStore` cosine search, JSON serialization
+
 ### Persistence
 - **Plan caching** -- NeurIPS 2025 APC pattern, context-aware LRU
 - **Response caching** -- FNV-1a hash, temperature-aware
@@ -74,7 +80,8 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Thread-safe** -- `shared_mutex` on ToolRegistry, atomic flags
 
 ### Integration
-- **MCP client** -- Model Context Protocol (stdio transport, JSON-RPC 2.0)
+- **MCP client** -- Model Context Protocol (stdio + Streamable HTTP, JSON-RPC 2.0)
+- **A2A client** -- Agent2Agent v1.0 (Linux Foundation) interop: AgentCard discovery + `message/send` over JSON-RPC/HTTP
 - **Ariadne Studio** -- visual workflow editor (localhost web UI)
 - **Streaming** -- SSE token delivery
 - **CMake** -- FetchContent, find_package, pkg-config
@@ -122,7 +129,7 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 160 tests
+./build/unit_tests          # 213 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
@@ -184,7 +191,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 160 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 213 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 

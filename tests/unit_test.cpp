@@ -2116,8 +2116,220 @@ void test_span_exporter_capture() {
     set_span_exporter(std::make_shared<NullSpanExporter>());  // 复位，避免影响其他测试
 }
 
-void test_version_is_2_7_0() {
-    ASSERT(version().find("2.7.0") != std::string::npos);
+// ── v2.8.0: Retrieval, Memory & Context Engineering + A2A ──
+
+// D89 — BM25 + RRF hybrid retrieval
+void test_bm25_basic() {
+    Bm25Index idx;
+    idx.add("d1", "the quick brown fox");
+    idx.add("d2", "the lazy dog sleeps");
+    idx.add("d3", "quick brown dog runs");
+    ASSERT(idx.size() == 3);
+    auto r = idx.query("quick fox", 5);
+    ASSERT(!r.empty());
+    ASSERT(r[0].id == "d1");   // d1 含 quick+fox 两词
+}
+
+void test_bm25_exact_rare_term() {
+    Bm25Index idx;
+    idx.add("d1", "error code SKU12345 found");
+    idx.add("d2", "the system reported an error");
+    idx.add("d3", "general information about errors here");
+    auto r = idx.query("SKU12345", 3);
+    ASSERT(r.size() == 1);     // 罕见精确词仅在 d1
+    ASSERT(r[0].id == "d1");
+}
+
+void test_bm25_remove_clear() {
+    Bm25Index idx;
+    idx.add("a", "hello world");
+    idx.add("b", "hello there");
+    idx.remove("a");
+    ASSERT(idx.size() == 1);
+    ASSERT(idx.query("world", 5).empty());  // world 仅在已删除文档
+    ASSERT(!idx.query("hello", 5).empty());
+    idx.clear();
+    ASSERT(idx.size() == 0);
+}
+
+void test_rrf_fusion() {
+    std::vector<RankedDoc> listA = {{"x", 9.0}, {"y", 8.0}, {"z", 1.0}};
+    std::vector<RankedDoc> listB = {{"z", 9.0}, {"x", 5.0}};
+    auto fused = reciprocal_rank_fusion({listA, listB}, 3);
+    ASSERT(fused.size() == 3);
+    // x: 1/61 + 1/62 ; z: 1/63 + 1/61 ; y: 1/62 — x 略高于 z
+    ASSERT(fused[0].id == "x");
+    ASSERT(fused[1].id == "z");
+}
+
+void test_hybrid_retriever() {
+    HybridRetriever hr;
+    hr.add("d1", {1.0f, 0.0f}, "machine learning models");
+    hr.add("d2", {0.0f, 1.0f}, "deep neural networks");
+    hr.add("d3", {0.7f, 0.7f}, "data science pipeline");
+    ASSERT(hr.size() == 3);
+    auto r = hr.query({1.0f, 0.0f}, "machine learning", 3);  // 向量+词法都偏向 d1
+    ASSERT(!r.empty());
+    ASSERT(r[0].id == "d1");
+}
+
+// D90 — memory scoping + temporal
+void test_add_scoped_and_filter() {
+    InMemoryVectorStore s;
+    s.add_scoped("u1", {1.0f, 0.0f}, "user:alice", 1000);
+    s.add_scoped("u2", {1.0f, 0.0f}, "user:bob",   1000);
+    s.add_scoped("s1", {1.0f, 0.0f}, "session:42", 1000);
+    MemoryQuery q; q.top_k = 10; q.scope_prefix = "user:";
+    auto r = s.query({1.0f, 0.0f}, q);
+    ASSERT(r.size() == 2);              // 仅 user:* 两条
+    for (const auto& x : r) ASSERT(x.id != "s1");
+}
+
+void test_memory_recency_decay() {
+    InMemoryVectorStore s;
+    s.add_scoped("old", {1.0f, 0.0f}, "", 1000);
+    s.add_scoped("new", {1.0f, 0.0f}, "", 2000);
+    MemoryQuery q; q.top_k = 2; q.recency_half_life_sec = 1000; q.now_ts = 2000;
+    auto r = s.query({1.0f, 0.0f}, q);  // 同 cosine，仅时间不同
+    ASSERT(r.size() == 2);
+    ASSERT(r[0].id == "new");           // age=0 → decay 1.0 胜过 age=1000 → 0.5
+    ASSERT(r[0].score > r[1].score);
+}
+
+// D91 — context compaction
+void test_compactor_below_threshold() {
+    ContextCompactor c([](const std::string&){ return std::string("SUMMARY"); });
+    std::vector<ChatMessage> msgs = {
+        ChatMessage::text("system", "you are helpful"),
+        ChatMessage::text("user", "hi"),
+        ChatMessage::text("assistant", "hello"),
+    };
+    ASSERT(c.compact(msgs).size() == msgs.size());  // 未超阈值 → 原样
+}
+
+void test_compactor_compacts() {
+    CompactionConfig cfg; cfg.trigger_tokens = 10; cfg.keep_recent = 2;
+    bool called = false;
+    ContextCompactor c([&](const std::string&){ called = true; return std::string("DIGEST"); }, cfg);
+    std::string big(400, 'x');
+    std::vector<ChatMessage> msgs = {
+        ChatMessage::text("system", "sys"),
+        ChatMessage::text("user", big),
+        ChatMessage::text("assistant", big),
+        ChatMessage::text("user", big),
+        ChatMessage::text("assistant", "recent2"),
+    };
+    auto out = c.compact(msgs);
+    ASSERT(called);
+    ASSERT(out.size() == 4);                                  // system + summary + 末尾2条
+    ASSERT(out[0].role == "system");
+    ASSERT(out[1].content.find("DIGEST") != std::string::npos);
+    ASSERT(out.back().content == "recent2");
+}
+
+void test_compactor_should_compact() {
+    CompactionConfig cfg; cfg.trigger_tokens = 10; cfg.keep_recent = 1;
+    ContextCompactor c([](const std::string&){ return std::string("S"); }, cfg);
+    std::vector<ChatMessage> tiny = { ChatMessage::text("user", "hi") };
+    ASSERT(!c.should_compact(tiny));
+    std::vector<ChatMessage> big = {
+        ChatMessage::text("user", std::string(200, 'y')),
+        ChatMessage::text("user", std::string(200, 'y')),
+        ChatMessage::text("user", "last"),
+    };
+    ASSERT(c.should_compact(big));
+}
+
+// D92 — A2A client
+void test_a2a_part_roundtrip() {
+    A2APart t = A2APart::from_text("hello");
+    json jt = t.to_json();
+    ASSERT(jt["kind"] == "text" && jt["text"] == "hello");
+    A2APart back = A2APart::from_json(jt);
+    ASSERT(back.kind == "text" && back.text == "hello");
+
+    A2APart d = A2APart::from_data({{"x", 1}});
+    json jd = d.to_json();
+    ASSERT(jd["kind"] == "data" && jd["data"]["x"] == 1);
+
+    json jf = {{"kind", "file"}, {"file", {{"uri", "http://f"}, {"mimeType", "text/plain"}}}};
+    A2APart f = A2APart::from_json(jf);
+    ASSERT(f.kind == "file" && f.file_uri == "http://f" && f.media_type == "text/plain");
+}
+
+void test_a2a_message_roundtrip() {
+    A2AMessage m = A2AMessage::user_text("what is 2+2", "m1");
+    ASSERT(m.role == "user" && m.text() == "what is 2+2");
+    json j = m.to_json();
+    ASSERT(j["role"] == "user" && j["messageId"] == "m1");
+    ASSERT(j["parts"][0]["text"] == "what is 2+2");
+    A2AMessage back = A2AMessage::from_json(j);
+    ASSERT(back.role == "user" && back.message_id == "m1" && back.text() == "what is 2+2");
+}
+
+void test_a2a_task_parse() {
+    json j = {
+        {"id", "t1"}, {"contextId", "c1"},
+        {"status", {{"state", "completed"}}},
+        {"history", json::array({
+            {{"role", "user"},  {"parts", json::array({{{"kind","text"},{"text","q"}}})}},
+            {{"role", "agent"}, {"parts", json::array({{{"kind","text"},{"text","a"}}})}}
+        })}
+    };
+    A2ATask t = A2ATask::from_json(j);
+    ASSERT(t.id == "t1");
+    ASSERT(t.state == A2ATaskState::Completed);
+    ASSERT(a2a_is_terminal(t.state));
+    ASSERT(t.history.size() == 2);
+    ASSERT(t.history[1].role == "agent" && t.history[1].text() == "a");
+}
+
+void test_a2a_agent_card_parse() {
+    json j = {
+        {"name", "Researcher"}, {"description", "does research"},
+        {"url", "https://agent.example/a2a"}, {"version", "1.2.0"},
+        {"protocolVersion", "1.0"},
+        {"capabilities", {{"streaming", true}}},
+        {"defaultInputModes",  json::array({"text/plain"})},
+        {"defaultOutputModes", json::array({"text/plain", "application/json"})},
+        {"skills", json::array({
+            {{"id","s1"},{"name","search"},{"description","web search"},{"tags",json::array({"web","search"})}}
+        })}
+    };
+    A2AAgentCard c = A2AAgentCard::from_json(j);
+    ASSERT(c.name == "Researcher");
+    ASSERT(c.url == "https://agent.example/a2a");
+    ASSERT(c.version == "1.2.0" && c.protocol_version == "1.0");
+    ASSERT(c.streaming == true);
+    ASSERT(c.default_output_modes.size() == 2);
+    ASSERT(c.skills.size() == 1 && c.skills[0].name == "search" && c.skills[0].tags.size() == 2);
+}
+
+void test_a2a_make_rpc() {
+    json params = {{"message", {{"role", "user"}}}};
+    json req = A2AClient::make_rpc(7, "message/send", params);
+    ASSERT(req["jsonrpc"] == "2.0");
+    ASSERT(req["id"] == 7);
+    ASSERT(req["method"] == "message/send");
+    ASSERT(req["params"]["message"]["role"] == "user");
+}
+
+void test_a2a_client_endpoint() {
+    A2AClient cli("https://host.example/");   // 尾部斜杠应被去除
+    ASSERT(cli.endpoint() == "https://host.example");
+}
+
+void test_a2a_state_parse() {
+    ASSERT(a2a_parse_state("submitted")      == A2ATaskState::Submitted);
+    ASSERT(a2a_parse_state("input-required") == A2ATaskState::InputRequired);
+    ASSERT(a2a_parse_state("working")        == A2ATaskState::Working);
+    ASSERT(a2a_parse_state("nonsense")       == A2ATaskState::Unknown);
+    ASSERT(!a2a_is_terminal(A2ATaskState::Working));
+    ASSERT(a2a_is_terminal(A2ATaskState::Failed));
+}
+
+void test_version_is_2_8_0() {
+    ASSERT(version().find("2.8.0") != std::string::npos);
 }
 
 int main() {
@@ -2369,7 +2581,26 @@ int main() {
     RUN(test_redact_secrets);
     RUN(test_genai_span_otel_json);
     RUN(test_span_exporter_capture);
-    RUN(test_version_is_2_7_0);
+
+    std::cout<<"\n=== v2.8.0 Retrieval, Memory & Context + A2A ===\n";
+    RUN(test_bm25_basic);
+    RUN(test_bm25_exact_rare_term);
+    RUN(test_bm25_remove_clear);
+    RUN(test_rrf_fusion);
+    RUN(test_hybrid_retriever);
+    RUN(test_add_scoped_and_filter);
+    RUN(test_memory_recency_decay);
+    RUN(test_compactor_below_threshold);
+    RUN(test_compactor_compacts);
+    RUN(test_compactor_should_compact);
+    RUN(test_a2a_part_roundtrip);
+    RUN(test_a2a_message_roundtrip);
+    RUN(test_a2a_task_parse);
+    RUN(test_a2a_agent_card_parse);
+    RUN(test_a2a_make_rpc);
+    RUN(test_a2a_client_endpoint);
+    RUN(test_a2a_state_parse);
+    RUN(test_version_is_2_8_0);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

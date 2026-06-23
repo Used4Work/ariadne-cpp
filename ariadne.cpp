@@ -536,6 +536,57 @@ void InMemoryVectorStore::load_json(const json& j) {
     }
 }
 
+// ── D90: memory scoping + temporal ───────────────────────────────
+
+static long long unix_now_sec() {
+    return (long long)std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+void InMemoryVectorStore::add_scoped(const std::string& id, const std::vector<float>& embedding,
+                                      const std::string& scope, long long ts, const json& metadata) {
+    json meta = metadata.is_object() ? metadata : json::object();
+    if (!scope.empty()) meta["scope"] = scope;
+    meta["ts"] = (ts == 0) ? unix_now_sec() : ts;
+    add(id, embedding, meta);
+}
+
+std::vector<VectorResult> InMemoryVectorStore::query(const std::vector<float>& embedding,
+                                                       const MemoryQuery& opts) const {
+    auto q = normalize_vec(embedding);
+    long long now = opts.now_ts;
+    if (opts.recency_half_life_sec > 0.0 && now == 0) now = unix_now_sec();
+
+    std::shared_lock<std::shared_mutex> lk(mu_);
+    std::vector<VectorResult> scored;
+    scored.reserve(entries_.size());
+    for (const auto& e : entries_) {
+        // scope 前缀过滤
+        if (!opts.scope_prefix.empty()) {
+            std::string sc = e.metadata.is_object()
+                           ? e.metadata.value("scope", std::string()) : std::string();
+            if (sc.rfind(opts.scope_prefix, 0) != 0) continue;  // 不以前缀开头 → 跳过
+        }
+        float dot = 0.0f;
+        if (q.size() == e.embedding.size())
+            for (size_t i = 0; i < q.size(); ++i) dot += q[i] * e.embedding[i];
+        double score = (double)dot;
+        // recency 时间衰减：score *= 0.5^(age/half_life)
+        if (opts.recency_half_life_sec > 0.0 && e.metadata.is_object() && e.metadata.contains("ts")) {
+            long long ts = e.metadata.value("ts", (long long)0);
+            double age = (double)(now - ts);
+            if (age < 0.0) age = 0.0;
+            score *= std::pow(0.5, age / opts.recency_half_life_sec);
+        }
+        scored.push_back({e.id, (float)score, e.metadata});
+    }
+    const size_t k = std::min((size_t)std::max(0, opts.top_k), scored.size());
+    std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
+        [](const VectorResult& a, const VectorResult& b) { return a.score > b.score; });
+    scored.resize(k);
+    return scored;
+}
+
 // ── ILLMProvider::complete_chat default ──────────────────────────
 
 LLMResponse ILLMProvider::complete_chat(const std::vector<ChatMessage>& messages,
@@ -4265,5 +4316,105 @@ void WorkflowEngine::set_deadline(std::chrono::seconds timeout) {
     deadline_ = std::chrono::steady_clock::now() + timeout;
 }
 void WorkflowEngine::clear_deadline() { has_deadline_ = false; }
+
+// ════════════════════════════════════════════════════════════════
+// D92 — A2A (Agent2Agent) Client 实现
+//   复用每请求一个 CurlHandle 的线程安全模式（同 MCP HttpTransport）。
+// ════════════════════════════════════════════════════════════════
+
+static size_t a2a_write_cb(char* p, size_t s, size_t n, void* u) {
+    static_cast<std::string*>(u)->append(p, s * n);
+    return s * n;
+}
+
+static std::string a2a_http_get(const std::string& url, const std::string& api_key) {
+    CurlHandle curl;
+    CURL* c = curl.get();
+    std::string resp;
+    struct curl_slist* h = nullptr;
+    h = curl_slist_append(h, "Accept: application/json");
+    if (!api_key.empty())
+        h = curl_slist_append(h, ("Authorization: Bearer " + api_key).c_str());
+    curl_easy_setopt(c, CURLOPT_URL,            url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER,     h);
+    curl_easy_setopt(c, CURLOPT_HTTPGET,        1L);
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,  +a2a_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,      &resp);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,        30L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    CURLcode rc = curl_easy_perform(c);
+    curl_slist_free_all(h);
+    if (rc != CURLE_OK)
+        throw A2AError(std::string("A2A GET: ") + curl_easy_strerror(rc));
+    return resp;
+}
+
+static json a2a_http_post(const std::string& url, const std::string& api_key, const json& body) {
+    CurlHandle curl;
+    CURL* c = curl.get();
+    std::string b = body.dump();
+    std::string resp;
+    struct curl_slist* h = nullptr;
+    h = curl_slist_append(h, "Content-Type: application/json");
+    h = curl_slist_append(h, "Accept: application/json");
+    if (!api_key.empty())
+        h = curl_slist_append(h, ("Authorization: Bearer " + api_key).c_str());
+    curl_easy_setopt(c, CURLOPT_URL,            url.c_str());
+    curl_easy_setopt(c, CURLOPT_HTTPHEADER,     h);
+    curl_easy_setopt(c, CURLOPT_POSTFIELDS,     b.c_str());
+    curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,  (long)b.size());
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,  +a2a_write_cb);
+    curl_easy_setopt(c, CURLOPT_WRITEDATA,      &resp);
+    curl_easy_setopt(c, CURLOPT_TIMEOUT,        60L);
+    curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
+    CURLcode rc = curl_easy_perform(c);
+    curl_slist_free_all(h);
+    if (rc != CURLE_OK)
+        throw A2AError(std::string("A2A POST: ") + curl_easy_strerror(rc));
+    if (resp.empty())
+        throw A2AError("A2A: empty response");
+    try { return json::parse(resp); }
+    catch (...) { throw A2AError("A2A: invalid JSON response"); }
+}
+
+A2AAgentCard A2AClient::fetch_agent_card() {
+    std::string url  = base_url_ + "/.well-known/agent-card.json";
+    std::string body = a2a_http_get(url, api_key_);
+    json j;
+    try { j = json::parse(body); }
+    catch (...) { throw A2AError("A2A: agent card is not valid JSON"); }
+    A2AAgentCard card = A2AAgentCard::from_json(j);
+    if (!card.url.empty()) endpoint_ = card.url;  // 后续 RPC 发往声明的端点
+    return card;
+}
+
+json A2AClient::send_message(const A2AMessage& msg) {
+    json params = {{"message", msg.to_json()}};
+    json req    = make_rpc(next_id_++, "message/send", params);
+    json resp   = a2a_http_post(endpoint(), api_key_, req);
+    if (resp.contains("error") && !resp["error"].is_null()) {
+        json e = resp["error"];
+        throw A2AError("A2A RPC error: " + e.value("message", e.dump()));
+    }
+    return resp.value("result", json::object());
+}
+
+std::string A2AClient::ask(const std::string& text) {
+    json result = send_message(A2AMessage::user_text(text));
+    // result 可能是 Message（含 parts）或 Task（含 status）
+    if (result.contains("parts"))
+        return A2AMessage::from_json(result).text();
+    if (result.contains("status")) {
+        A2ATask t = A2ATask::from_json(result);
+        for (auto it = t.history.rbegin(); it != t.history.rend(); ++it)
+            if (it->role == "agent") return it->text();
+    }
+    if (result.contains("message"))
+        return A2AMessage::from_json(result["message"]).text();
+    return result.dump();
+}
 
 } // namespace ariadne
