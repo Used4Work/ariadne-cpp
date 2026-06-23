@@ -521,8 +521,10 @@ struct VectorResult {
 };
 
 /** 检索过滤/重排选项 (D90 — memory scoping + temporal)
- *  scope_prefix: 仅匹配 metadata["scope"] 以此前缀开头的条目（空=全部）。
+ *  scope_prefix: 按 ':' 分段安全匹配 metadata["scope"]（空=全部）。
  *               典型作用域: "user:alice" / "session:42" / "agent:researcher"。
+ *               "user:alice" 命中 "user:alice" 与 "user:alice:*"，但**不会**
+ *               命中 "user:alice2"（租户隔离，避免前缀越界匹配）。
  *  recency_half_life_sec: >0 时按时间衰减重排 score *= 0.5^(age/half_life)，
  *                         age = now_ts - metadata["ts"]（秒）。
  *  now_ts: recency 计算的"现在"(unix 秒)；为 0 且启用 recency 时回退到系统时钟。 */
@@ -532,6 +534,17 @@ struct MemoryQuery {
     double      recency_half_life_sec = 0.0;
     long long   now_ts                = 0;
 };
+
+/** scope 分段安全匹配（D90）：避免 "user:alice" 误匹配 "user:alice2"。
+ *  命中条件：完全相等，或 scope 以 prefix 开头且边界落在 ':' 分隔符上
+ *  （prefix 以 ':' 结尾，或 prefix 之后紧跟 ':'）。空 prefix 命中全部。 */
+inline bool memory_scope_matches(const std::string& scope, const std::string& prefix) {
+    if (prefix.empty())            return true;
+    if (scope == prefix)           return true;
+    if (scope.size() <= prefix.size()) return false;
+    if (scope.compare(0, prefix.size(), prefix) != 0) return false;
+    return prefix.back() == ':' || scope[prefix.size()] == ':';
+}
 
 class IMemoryStore {
 public:
@@ -2201,6 +2214,39 @@ public:
     /** 当前 RPC 端点（card.url 优先，否则 base_url）。 */
     std::string endpoint() const { return endpoint_.empty() ? base_url_ : endpoint_; }
 
+    /** 允许 AgentCard 把 RPC 端点切到与 base_url 不同源的主机（默认禁止）。
+     *  默认禁止可防止恶意/被攻陷的 A2A 服务器把端点指向攻击者主机，
+     *  导致 Bearer 凭据外泄 / SSRF。仅在显式信任服务器时开启。 */
+    void set_allow_cross_origin_endpoint(bool allow) { allow_cross_origin_ = allow; }
+
+    /** 提取 URL 的源 "scheme://host"（小写，忽略端口/路径/userinfo）；
+     *  非 http(s) 或无法解析返回 ""。 */
+    static std::string origin_of(const std::string& url) {
+        auto sep = url.find("://");
+        if (sep == std::string::npos) return "";
+        std::string scheme = url.substr(0, sep);
+        for (auto& ch : scheme) ch = (char)std::tolower((unsigned char)ch);
+        if (scheme != "http" && scheme != "https") return "";
+        size_t hs = sep + 3;
+        size_t he = url.find_first_of("/?#", hs);
+        std::string auth = (he == std::string::npos) ? url.substr(hs) : url.substr(hs, he - hs);
+        auto at = auth.find('@');                      // 去 userinfo@
+        if (at != std::string::npos) auth = auth.substr(at + 1);
+        auto colon = auth.find(':');                   // 去端口
+        if (colon != std::string::npos) auth = auth.substr(0, colon);
+        for (auto& ch : auth) ch = (char)std::tolower((unsigned char)ch);
+        if (auth.empty()) return "";
+        return scheme + "://" + auth;
+    }
+
+    /** 是否允许把 RPC 端点切到 card_url（同源放行；跨源仅在显式 opt-in 时放行）。 */
+    bool endpoint_pivot_allowed(const std::string& card_url) const {
+        if (card_url.empty())   return false;
+        if (allow_cross_origin_) return true;
+        std::string co = origin_of(card_url);
+        return !co.empty() && co == origin_of(base_url_);
+    }
+
 private:
     static std::string rtrim_slash(std::string s) {
         while (!s.empty() && s.back() == '/') s.pop_back();
@@ -2210,6 +2256,7 @@ private:
     std::string api_key_;
     std::string endpoint_;   // 来自 card.url
     int         next_id_ = 1;
+    bool        allow_cross_origin_ = false;
 };
 
 class WorkflowEngine {

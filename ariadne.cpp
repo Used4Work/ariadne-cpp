@@ -561,11 +561,11 @@ std::vector<VectorResult> InMemoryVectorStore::query(const std::vector<float>& e
     std::vector<VectorResult> scored;
     scored.reserve(entries_.size());
     for (const auto& e : entries_) {
-        // scope 前缀过滤
+        // scope 分段安全过滤（避免 "user:alice" 越界匹配 "user:alice2"）
         if (!opts.scope_prefix.empty()) {
             std::string sc = e.metadata.is_object()
                            ? e.metadata.value("scope", std::string()) : std::string();
-            if (sc.rfind(opts.scope_prefix, 0) != 0) continue;  // 不以前缀开头 → 跳过
+            if (!memory_scope_matches(sc, opts.scope_prefix)) continue;
         }
         float dot = 0.0f;
         if (q.size() == e.embedding.size())
@@ -4343,7 +4343,8 @@ static std::string a2a_http_get(const std::string& url, const std::string& api_k
     curl_easy_setopt(c, CURLOPT_TIMEOUT,        30L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
-    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
+    // 不跟随重定向：携带 Authorization 时跨源重定向会把 Bearer 泄露给第三方主机
+    curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 0L);
     CURLcode rc = curl_easy_perform(c);
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
@@ -4387,7 +4388,18 @@ A2AAgentCard A2AClient::fetch_agent_card() {
     try { j = json::parse(body); }
     catch (...) { throw A2AError("A2A: agent card is not valid JSON"); }
     A2AAgentCard card = A2AAgentCard::from_json(j);
-    if (!card.url.empty()) endpoint_ = card.url;  // 后续 RPC 发往声明的端点
+    // 仅在同源（或显式 opt-in）时把后续 RPC 切到 card 声明的端点，
+    // 否则继续用 base_url，避免凭据随 Bearer 泄露到不可信主机 / SSRF。
+    if (!card.url.empty()) {
+        if (endpoint_pivot_allowed(card.url)) {
+            endpoint_ = card.url;
+        } else {
+            log_msg(LogLevel::LOG_WARN, "a2a",
+                "ignoring cross-origin AgentCard url '" + card.url +
+                "' (base origin " + origin_of(base_url_) +
+                "); call set_allow_cross_origin_endpoint(true) to override");
+        }
+    }
     return card;
 }
 

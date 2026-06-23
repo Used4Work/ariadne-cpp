@@ -2328,6 +2328,48 @@ void test_a2a_state_parse() {
     ASSERT(a2a_is_terminal(A2ATaskState::Failed));
 }
 
+// D90/D92 — security hardening (segment-safe scope, A2A SSRF gating)
+void test_memory_scope_matches() {
+    ASSERT(memory_scope_matches("user:alice", "user:alice"));     // 完全相等
+    ASSERT(memory_scope_matches("user:alice:s1", "user:alice"));  // 子作用域（':' 边界）
+    ASSERT(memory_scope_matches("user:alice", "user:"));          // 前缀以 ':' 结尾
+    ASSERT(memory_scope_matches("anything", ""));                 // 空前缀=全部
+    ASSERT(!memory_scope_matches("user:alice2", "user:alice"));   // 租户隔离：不越界
+    ASSERT(!memory_scope_matches("user:bob", "user:alice"));
+    ASSERT(!memory_scope_matches("session:1", "user:"));
+}
+
+void test_memory_scope_isolation() {
+    InMemoryVectorStore s;
+    s.add_scoped("a", {1.0f, 0.0f}, "user:alice",      1000);
+    s.add_scoped("b", {1.0f, 0.0f}, "user:alice2",     1000);  // 不同租户，前缀相近
+    s.add_scoped("c", {1.0f, 0.0f}, "user:alice:sess", 1000);
+    MemoryQuery q; q.top_k = 10; q.scope_prefix = "user:alice";
+    auto r = s.query({1.0f, 0.0f}, q);
+    ASSERT(r.size() == 2);                       // 仅 a + c，绝不含 b
+    for (const auto& x : r) ASSERT(x.id != "b");
+}
+
+void test_a2a_origin_of() {
+    ASSERT(A2AClient::origin_of("https://host.example/a2a")  == "https://host.example");
+    ASSERT(A2AClient::origin_of("https://host.example:8443/x") == "https://host.example"); // 忽略端口
+    ASSERT(A2AClient::origin_of("http://h") == "http://h");
+    ASSERT(A2AClient::origin_of("https://user:pass@host.example/p") == "https://host.example"); // 去 userinfo
+    ASSERT(A2AClient::origin_of("ftp://h").empty());            // 非 http(s)
+    ASSERT(A2AClient::origin_of("noscheme").empty());
+}
+
+void test_a2a_endpoint_pivot_allowed() {
+    A2AClient cli("https://host.example");
+    ASSERT(cli.endpoint_pivot_allowed("https://host.example/a2a"));      // 同源放行
+    ASSERT(cli.endpoint_pivot_allowed("https://host.example:9000/a2a")); // 同主机不同端口放行
+    ASSERT(!cli.endpoint_pivot_allowed("https://evil.com/a2a"));         // 跨源拒绝（防凭据外泄）
+    ASSERT(!cli.endpoint_pivot_allowed("http://host.example"));          // 协议降级拒绝
+    ASSERT(!cli.endpoint_pivot_allowed(""));                             // 空拒绝
+    cli.set_allow_cross_origin_endpoint(true);
+    ASSERT(cli.endpoint_pivot_allowed("https://evil.com/a2a"));          // 显式 opt-in 放行
+}
+
 void test_version_is_2_8_0() {
     ASSERT(version().find("2.8.0") != std::string::npos);
 }
@@ -2600,6 +2642,10 @@ int main() {
     RUN(test_a2a_make_rpc);
     RUN(test_a2a_client_endpoint);
     RUN(test_a2a_state_parse);
+    RUN(test_memory_scope_matches);
+    RUN(test_memory_scope_isolation);
+    RUN(test_a2a_origin_of);
+    RUN(test_a2a_endpoint_pivot_allowed);
     RUN(test_version_is_2_8_0);
 
     std::cout<<"\n────────────────────────────────────────\n";
