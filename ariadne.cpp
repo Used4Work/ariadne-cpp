@@ -4424,9 +4424,11 @@ json McpClient::initialize(const std::string& client_name, const std::string& ve
 std::vector<ToolDef> McpClient::list_tools() {
     if (!initialized_) throw McpError("MCP: not initialized");
     discovered_tools_.clear();
-    // D104 — 游标分页：循环拉取直到没有 nextCursor（修正只取首页的截断 bug）
-    std::string cursor;
-    do {
+    // D104 — 游标分页：循环拉取直到没有 nextCursor（修正只取首页的截断 bug）。
+    // 安全：对页数与游标重复设上限，避免恶意/异常服务器返回恒定 nextCursor 造成死循环。
+    std::string cursor, prev_cursor;
+    const int kMaxPages = 1000;
+    for (int page = 0; page < kMaxPages; ++page) {
         json params = json::object();
         if (!cursor.empty()) params["cursor"] = cursor;
         auto result = make_request("tools/list", params);
@@ -4442,9 +4444,11 @@ std::vector<ToolDef> McpClient::list_tools() {
                 discovered_tools_.push_back(def);
             }
         }
+        prev_cursor = cursor;
         cursor = (result.contains("nextCursor") && result["nextCursor"].is_string())
                  ? result["nextCursor"].get<std::string>() : "";
-    } while (!cursor.empty());
+        if (cursor.empty() || cursor == prev_cursor) break;  // 终止 / 防卡死
+    }
     return discovered_tools_;
 }
 
