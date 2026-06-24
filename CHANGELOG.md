@@ -2,6 +2,33 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.10.0] - 2026-06-24
+
+Theme: **Durability, reliability & safety.** Researched against live June 2026 docs (LangGraph durable execution + time-travel, AG-UI event streaming, τ²-bench reliability science, GPTCache semantic caching, Microsoft/Google prompt-injection spotlighting, MCP 2025-11-25 tool annotations, A2A v1.0.1 Linux Foundation).
+
+### Added
+- **Durable auto-resume** (D97): the DAG executor now checkpoints `WorkflowState` after each topological batch and can resume skipping already-completed steps. `WorkflowEngine::run_durable(task, id)` persists `{plan,state}` per batch; `resume(id)` reloads and finishes the remaining DAG. Closes the roadmap's "durable auto-resume" item — every major framework (LangGraph/CrewAI/ADK) ships skip-completed resume.
+- **Time-travel / state fork** (D98): `HistoryCheckpointStore` keeps every version of a checkpoint; `WorkflowState::fork(edits, invalidate)` branches a snapshot; `WorkflowEngine::fork_and_resume(from, new, edits, invalidate)` replays from a prior checkpoint with edits, auto-invalidating the transitive downstream so edited values propagate (LangGraph "time travel").
+- **Structured event stream** (D99): typed `AgentEvent` taxonomy (RUN/STEP/TOOL/MESSAGE started·finished) + `AgentEventSink`; `WorkflowEngine::set_event_sink()` emits from `run_agent_native`. `to_ag_ui_json()` maps to AG-UI protocol event names (cross-framework UI wire format) without committing to the unstable spec.
+- **Tool-output spotlighting** (D100): `spotlight_text()` (Delimit / Datamark / Encode modes) + `SPOTLIGHT_SYS` defend against indirect prompt injection by marking untrusted tool output as data-not-instructions (Microsoft spotlighting, deployed in Google Gemini). Opt-in via `enable_tool_output_spotlighting()` — applied to native-agent tool results.
+- **pass^k reliability metric** (D101): `PromptEvalGate::run_reliability(cases, k, …)` returns a `ReliabilityReport` with `pass^k` (all-k-succeed, the τ²-bench production-reliability metric) alongside per-run pass rate — surfaces flakiness that pass@1 hides.
+- **Semantic response cache** (D102): `SemanticCache` keys cached responses by embedding cosine similarity (pluggable `EmbedFn`, FIFO cap) instead of exact-match hashing — 30–70% production hit rates on free-form prompts (GPTCache pattern). Reuses `InMemoryVectorStore`.
+- **CRITIC verify-and-retry** (D103): `DynamicWorkflow::verify_and_retry(produce, verify, max_attempts)` runs an external-signal correction loop (verifier returns nullopt=pass or an error fed back into the next attempt) — complements N-vote `adversarial_verify`. External signal only (ICLR'24: intrinsic self-reflection is unreliable).
+- **MCP tool annotations + pagination** (D104): `tools/list` now follows `nextCursor` pagination (fixes silent truncation on servers with many tools) and parses `ToolAnnotations` (`readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`, treated as untrusted hints) onto `ToolDef`. First offline MCP-client tests via a mock transport.
+- **A2A v1.0.1 alignment** (D105): task lifecycle `tasks/get`/`tasks/cancel` + `poll_until_terminal`; `a2a_parse_stream_frame()` parses `message/stream` SSE frames (task/message/status-update/artifact-update by `kind`, with the v1.0-removed `final` field now inferred from terminal state); `A2AAgentCard` parses v1.0 fields (`pushNotifications`, `extendedAgentCard`, `signature`, `securitySchemes`, `preferredTransport`).
+- 22 new tests (251 total)
+
+### Changed
+- `ToolDef` gains an `annotations` field (default-constructed; existing aggregate initializers unaffected).
+- `WorkflowExecutor::execute()` gains two trailing optional params (`resume_state`, `on_batch_done`) — backward compatible.
+
+### Fixed
+- `WorkflowPlan::from_json()` no longer throws when a serialized plan's `metadata` is null/absent (robust task extraction) — surfaced by durable checkpoint round-trips.
+
+### Security
+- **Tool-output spotlighting** (D100): defense-in-depth against indirect prompt injection — untrusted tool/web output marked as data, with a system-prompt clause instructing the model to never follow embedded instructions (probabilistic; layer with `GuardrailFn`).
+- **MCP annotations are untrusted** (D104): `ToolAnnotations` are parsed for UX/routing hints only, never as a security boundary (per spec); destructive/read-only hints default conservatively.
+
 ## [2.9.0] - 2026-06-24
 
 Theme: **Composability & production ops.** Researched against live June 2026 docs (LangGraph 1.0/1.2 subgraphs + durable execution, eval-driven prompt development, MCP 2025-11-25 stable spec).

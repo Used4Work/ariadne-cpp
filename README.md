@@ -8,7 +8,7 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-251%20passed-brightgreen)](#tests)
 
 </div>
 
@@ -41,6 +41,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 ### Prompt Ops
 - **Prompt versioning** -- `PromptVersionStore` keeps named prompts with multiple versions, active-version pin, and history (git-style)
 - **Eval gate** -- `PromptEvalGate` runs a golden set through a runner + scorer and gates on an avg-score threshold (eval-driven development)
+- **pass^k reliability** -- `run_reliability(cases, k, …)` reports `pass^k` (all-k-succeed, the τ²-bench production-reliability metric) to surface flakiness that pass@1 hides
 
 ### Dynamic Workflow (Ultracode-level)
 - `parallel()` -- fan-out N tasks, barrier wait
@@ -49,6 +50,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - `loop_until()` -- dynamic loops with budget awareness
 - `fan_out_agents()` -- parallel ReACT agent spawning
 - `adversarial_verify()` -- multi-vote claim verification
+- `verify_and_retry()` -- CRITIC-style external-signal correction loop (verifier feedback → regenerate)
 
 ### Reliability
 - **9 providers** -- OpenAI, Anthropic, Gemini, Groq, GitHub Models, Cerebras, SambaNova, Mistral, LLM7
@@ -57,10 +59,12 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **429/5xx retry** -- exponential backoff with Retry-After header parsing
 - **Idempotency keys** -- auto-generated per request, prevents double-billing
 - **Token budget** -- enforcement with `TokenBudgetError` on exceed
+- **Semantic cache** -- `SemanticCache` keys responses by embedding cosine similarity (pluggable `EmbedFn`), not exact-match hashing
 
 ### Observability
 - **Structured logging** -- `ILogger` interface, zero stdout/stderr by default
 - **OTel GenAI traces** -- `gen_ai.*` semantic conventions, pluggable `ISpanExporter` / `OtelJsonSpanExporter`, auto-emitted per LLM call
+- **Event stream** -- typed `AgentEvent` taxonomy + `set_event_sink()`; `to_ag_ui_json()` maps to AG-UI protocol event names for UI consumers
 - **Secret redaction** -- `redact_secrets()` masks API keys / bearer tokens in logs & traces
 - **Cost tracking** -- `ModelPricing` with auto-pricing per provider
 - **Metrics** -- pluggable `IMetricsCollector`, 10 event kinds
@@ -75,18 +79,21 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 ### Persistence
 - **Plan caching** -- NeurIPS 2025 APC pattern, context-aware LRU
 - **Response caching** -- FNV-1a hash, temperature-aware
-- **Checkpointing** -- `ICheckpointStore` / `FileCheckpointStore`
+- **Checkpointing** -- `ICheckpointStore` / `FileCheckpointStore` / `HistoryCheckpointStore`
+- **Durable auto-resume** -- `run_durable()` checkpoints per batch; `resume()` skips completed steps (LangGraph durable execution)
+- **Time-travel** -- `fork_and_resume()` replays from a prior checkpoint with edits, auto-invalidating the downstream
 - **Serialization** -- `WorkflowPlan::to_json()` / `from_json()`
 
 ### Safety
 - **Guardrails** -- input/output/tool validation hooks
+- **Tool-output spotlighting** -- `spotlight_text()` (delimit/datamark/encode) marks untrusted tool output as data-not-instructions (indirect prompt-injection defense)
 - **Human-in-the-loop** -- `InterruptError` + `set_interrupt_hook()`
 - **Cancellation** -- `cancel()` + `set_deadline()`
 - **Thread-safe** -- `shared_mutex` on ToolRegistry, atomic flags
 
 ### Integration
-- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0)
-- **A2A client** -- Agent2Agent v1.0 (Linux Foundation) interop: AgentCard discovery + `message/send` over JSON-RPC/HTTP
+- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0); `tools/list` pagination + tool annotations
+- **A2A client** -- Agent2Agent v1.0.1 (Linux Foundation) interop: AgentCard discovery, `message/send`, task lifecycle (`tasks/get`/`cancel`), `message/stream` SSE frame parsing
 - **Ariadne Studio** -- visual workflow editor (localhost web UI)
 - **Streaming** -- SSE token delivery
 - **CMake** -- FetchContent, find_package, pkg-config
@@ -134,7 +141,7 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 229 tests
+./build/unit_tests          # 251 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
@@ -196,7 +203,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 229 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 251 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 

@@ -1494,9 +1494,12 @@ json WorkflowPlan::to_json() const {
 }
 
 WorkflowPlan WorkflowPlan::from_json(const json& j) {
-    auto plan = WorkflowPlanner::parse_plan(j, j.value("metadata", json::object()).value("task", ""));
-    if (j.contains("id")) plan.id = j["id"].get<std::string>();
-    if (j.contains("metadata")) plan.metadata = j["metadata"];
+    // metadata 可能缺失或为 null（手工构造 / 序列化的计划）——稳健取出 task
+    json md = j.value("metadata", json::object());
+    std::string task = md.is_object() ? md.value("task", "") : "";
+    auto plan = WorkflowPlanner::parse_plan(j, task);
+    if (j.contains("id") && j["id"].is_string()) plan.id = j["id"].get<std::string>();
+    if (j.contains("metadata") && !j["metadata"].is_null()) plan.metadata = j["metadata"];
     validate_dag(plan);
     return plan;
 }
@@ -1700,9 +1703,19 @@ WorkflowExecutor::WorkflowExecutor(LLMClient& llm, ToolRegistry& tools, size_t m
 WorkflowState WorkflowExecutor::execute(const WorkflowPlan& plan,
                                          const json& task_input,
                                          CancelToken cancel,
-                                         StepInterruptFn interrupt) const {
+                                         StepInterruptFn interrupt,
+                                         const WorkflowState* resume_state,
+                                         BatchCheckpointFn on_batch_done) const {
     WorkflowState state;
     state.task_input = task_input;
+
+    // D97 — 断点续跑：预填上次已完成步骤的输出（含已决议的 CONDITION/错误）
+    if (resume_state) {
+        state.step_outputs = resume_state->step_outputs;
+        state.errors       = resume_state->errors;
+        if (!resume_state->task_input.is_null() && task_input.is_null())
+            state.task_input = resume_state->task_input;
+    }
 
     // 构建 step 类型索引，用于 CONDITION 分支控制
     std::map<std::string, StepType> step_types;
@@ -1717,6 +1730,11 @@ WorkflowState WorkflowExecutor::execute(const WorkflowPlan& plan,
         std::vector<std::pair<Step, std::future<FutResult>>> futs;
 
         for (const auto& step : batch) {
+            // D97 — 断点续跑：已完成的步骤直接跳过
+            if (state.step_outputs.count(step.id)) {
+                state.record_trace({step.id, "resume", "skipped", "", 0, "already completed"});
+                continue;
+            }
             // Human-in-the-loop: interrupt check before each step
             if (interrupt) {
                 auto reason = interrupt(step, state);
@@ -1785,6 +1803,7 @@ WorkflowState WorkflowExecutor::execute(const WorkflowPlan& plan,
                 state.step_outputs[step.id] = result;
             }
         }
+        if (on_batch_done) on_batch_done(state);   // D97 — 每批次后写 checkpoint
     }
     return state;
 }
@@ -2162,6 +2181,31 @@ json DynamicWorkflow::adversarial_verify(const std::string& claim, int num_voter
             {"votes_yes", yes}, {"votes_no", no},
             {"avg_confidence", votes.empty() ? 0.0 : total_confidence / votes.size()},
             {"reasons", all_reasons}};
+}
+
+VerifyResult DynamicWorkflow::verify_and_retry(const ProduceFn& produce,
+                                               const VerifyFn& verify,
+                                               int max_attempts) {
+    phase("verify_and_retry");
+    VerifyResult r;
+    if (max_attempts < 1) max_attempts = 1;
+    std::string feedback;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        r.attempts = attempt;
+        r.output   = produce ? produce(attempt, feedback) : json(nullptr);
+        // 外部确定性信号验证：nullopt = 通过
+        std::optional<std::string> err = verify ? verify(r.output) : std::nullopt;
+        if (!err) {
+            r.verified = true;
+            emit("verify_and_retry: passed on attempt " + std::to_string(attempt));
+            return r;
+        }
+        feedback = *err;
+        r.feedback.push_back(feedback);
+        emit("verify_and_retry: attempt " + std::to_string(attempt) + " rejected — " + feedback);
+    }
+    r.verified = false;
+    return r;
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -3004,6 +3048,139 @@ WorkflowResult WorkflowEngine::run_internal(const std::string& task, WorkflowCon
     return res;
 }
 
+// ── D97 — 持久化执行 / 断点续跑 ──────────────────────────────
+void WorkflowEngine::assemble_durable_result(const WorkflowPlan& plan,
+                                             WorkflowState& state, WorkflowResult& res) {
+    auto leaves = plan.leaf_steps();
+    if (leaves.size() == 1)
+        res.output = state.step_outputs.count(leaves[0].id)
+                     ? state.step_outputs[leaves[0].id] : nullptr;
+    else {
+        res.output = json::object();
+        for (const auto& l : leaves)
+            res.output[l.id] = state.step_outputs.count(l.id)
+                               ? state.step_outputs[l.id] : nullptr;
+    }
+    res.traces     = state.traces;
+    res.step_count = (int)plan.steps.size();
+    res.success    = true;
+}
+
+WorkflowResult WorkflowEngine::run_durable(const std::string& task,
+                                           const std::string& workflow_id) {
+    if (!checkpoint_store_) throw AriadneError("run_durable: no checkpoint store set");
+    reset_cancel();
+    llm_->reset_usage();
+    WorkflowResult res;
+    auto t0 = std::chrono::steady_clock::now();
+    metrics_->record({MetricEvent::Kind::WORKFLOW_START, workflow_id, "", "", "", 0, true, task});
+    try {
+        json task_json = {{"task", task}};
+        for (const auto& guard : input_guardrails_) {
+            auto err = guard(task_json);
+            if (err) throw GuardrailError("Input guardrail: " + *err);
+        }
+        auto tools = tools_->list_tools();
+        WorkflowContext empty_ctx;
+        WorkflowPlan plan = planner_->plan(task, tools, empty_ctx);
+        for (const auto& step : plan.steps) {
+            if (step.type == StepType::TOOL && !tools_->has_tool(step.action))
+                throw PlanningError("Plan references unregistered tool '" + step.action +
+                                    "' in step '" + step.id + "'");
+        }
+        auto store = checkpoint_store_;
+        const std::string wf = workflow_id;
+        // 先持久化计划 + 初始 state，使首批次失败也能 resume 拿到 DAG
+        WorkflowState seed; seed.task_input = task_json;
+        store->save(wf, json{{"plan", plan.to_json()}, {"state", seed.to_json()}});
+        WorkflowExecutor::BatchCheckpointFn on_batch = [store, wf, &plan](const WorkflowState& st) {
+            store->save(wf, json{{"plan", plan.to_json()}, {"state", st.to_json()}});
+        };
+        auto state = executor_->execute(plan, task_json, cancel_, interrupt_hook_, nullptr, on_batch);
+        assemble_durable_result(plan, state, res);
+        for (const auto& guard : output_guardrails_) {
+            auto err = guard(res.output);
+            if (err) throw GuardrailError("Output guardrail: " + *err);
+        }
+    } catch (const std::exception& e) {
+        res.success = false; res.error_message = e.what();
+    }
+    res.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    res.token_usage = llm_->total_usage();
+    metrics_->record({MetricEvent::Kind::WORKFLOW_END, workflow_id, "", "", "",
+                      res.duration_ms, res.success, res.error_message});
+    return res;
+}
+
+WorkflowResult WorkflowEngine::resume(const std::string& workflow_id) {
+    if (!checkpoint_store_) throw AriadneError("resume: no checkpoint store set");
+    if (!checkpoint_store_->exists(workflow_id))
+        throw AriadneError("resume: no checkpoint for workflow '" + workflow_id + "'");
+    reset_cancel();
+    llm_->reset_usage();
+    WorkflowResult res;
+    auto t0 = std::chrono::steady_clock::now();
+    metrics_->record({MetricEvent::Kind::WORKFLOW_START, workflow_id, "", "", "", 0, true, "resume"});
+    try {
+        json ckpt = checkpoint_store_->load(workflow_id);
+        WorkflowPlan  plan = WorkflowPlan::from_json(ckpt.at("plan"));
+        WorkflowState prev = WorkflowState::from_json(ckpt.at("state"));
+        auto store = checkpoint_store_;
+        const std::string wf = workflow_id;
+        WorkflowExecutor::BatchCheckpointFn on_batch = [store, wf, &plan](const WorkflowState& st) {
+            store->save(wf, json{{"plan", plan.to_json()}, {"state", st.to_json()}});
+        };
+        auto state = executor_->execute(plan, prev.task_input, cancel_, interrupt_hook_, &prev, on_batch);
+        assemble_durable_result(plan, state, res);
+        for (const auto& guard : output_guardrails_) {
+            auto err = guard(res.output);
+            if (err) throw GuardrailError("Output guardrail: " + *err);
+        }
+    } catch (const std::exception& e) {
+        res.success = false; res.error_message = e.what();
+    }
+    res.duration_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    res.token_usage = llm_->total_usage();
+    metrics_->record({MetricEvent::Kind::WORKFLOW_END, workflow_id, "", "", "",
+                      res.duration_ms, res.success, res.error_message});
+    return res;
+}
+
+WorkflowResult WorkflowEngine::fork_and_resume(const std::string& from_workflow_id,
+                                               const std::string& new_workflow_id,
+                                               const json& edits,
+                                               const std::vector<std::string>& invalidate) {
+    if (!checkpoint_store_) throw AriadneError("fork_and_resume: no checkpoint store set");
+    if (!checkpoint_store_->exists(from_workflow_id))
+        throw AriadneError("fork_and_resume: no checkpoint for '" + from_workflow_id + "'");
+    json ckpt = checkpoint_store_->load(from_workflow_id);
+    WorkflowPlan  plan = WorkflowPlan::from_json(ckpt.at("plan"));
+    WorkflowState prev = WorkflowState::from_json(ckpt.at("state"));
+
+    // 计算需重跑的步骤集合：invalidate 自身 + (invalidate ∪ edited) 的传递下游。
+    // 被编辑步骤本身保留新值（不进 rerun），其下游进 rerun 以采用新值。
+    std::set<std::string> rerun(invalidate.begin(), invalidate.end());
+    std::set<std::string> roots = rerun;
+    if (edits.is_object())
+        for (auto it = edits.begin(); it != edits.end(); ++it) roots.insert(it.key());
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (const auto& s : plan.steps) {
+            if (rerun.count(s.id)) continue;
+            for (const auto& dep : s.depends_on)
+                if (roots.count(dep) || rerun.count(dep)) { rerun.insert(s.id); changed = true; break; }
+        }
+    }
+    std::vector<std::string> rerun_vec(rerun.begin(), rerun.end());
+    WorkflowState forked = prev.fork(edits, rerun_vec);
+    checkpoint_store_->save(new_workflow_id,
+        json{{"plan", ckpt.at("plan")}, {"state", forked.to_json()}});
+    return resume(new_workflow_id);
+}
+
 
 
 void AnthropicProvider::complete_stream(const std::string& prompt,
@@ -3557,6 +3734,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
     auto wf_id = "native_" + std::to_string(
         std::chrono::system_clock::now().time_since_epoch().count() % 1000000);
     metrics_->record({MetricEvent::Kind::WORKFLOW_START, wf_id, "", "", "", 0, true, task});
+    emit_event(AgentEvent::Kind::RUN_STARTED, "agent", {{"task", task}});  // D99
 
     // Input guardrails
     json task_json = {{"task", task}};
@@ -3565,6 +3743,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         if (err) {
             result.error = "Input guardrail: " + *err;
             metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "", 0, false, result.error});
+            emit_event(AgentEvent::Kind::RUN_ERROR, "agent", {{"error", result.error}});  // D99
             return result;
         }
     }
@@ -3580,6 +3759,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         "When you have enough data, respond with a text message containing your final answer. "
         "You may call multiple tools in parallel when appropriate.";
     std::string sys_prompt = custom_agent_prompt_.empty() ? NATIVE_AGENT_SYS : custom_agent_prompt_;
+    if (tool_output_spotlight_) sys_prompt += std::string("\n\n") + SPOTLIGHT_SYS;  // D100
 
     std::vector<ChatMessage> messages;
     messages.push_back({"system", sys_prompt, {}, "", ""});
@@ -3593,12 +3773,14 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
         auto step_t0 = std::chrono::steady_clock::now();
         AgentStep step;
         step.iteration = iter + 1;
+        emit_event(AgentEvent::Kind::STEP_STARTED, "iteration", {{"iteration", iter + 1}});  // D99
 
         LLMResponse resp;
         try {
             resp = llm_->complete_chat(ModelTier::ORCHESTRATOR, messages, tools, 0.0);
         } catch (const std::exception& e) {
             result.error = std::string("LLM error: ") + e.what();
+            emit_event(AgentEvent::Kind::RUN_ERROR, "agent", {{"error", result.error}});  // D99
             break;
         }
 
@@ -3617,13 +3799,17 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
             std::string tool_names;
             json all_obs = json::array();
             for (const auto& tc : resp.tool_calls) {
+                emit_event(AgentEvent::Kind::TOOL_STARTED, tc.name, {{"args", tc.arguments}});  // D99
                 json obs;
                 try { obs = tools_->call(tc.name, tc.arguments); }
                 catch (const std::exception& e) {
                     obs = {{"error", std::string("tool failed: ") + e.what()}};
                 }
-                // Append tool result message for each call
-                messages.push_back({"tool", obs.dump(), {}, tc.id, tc.name});
+                emit_event(AgentEvent::Kind::TOOL_FINISHED, tc.name, {{"result", obs}});  // D99
+                // Append tool result message for each call (D100: spotlight untrusted output)
+                std::string obs_str = obs.dump();
+                if (tool_output_spotlight_) obs_str = spotlight_text(obs_str, spotlight_mode_);
+                messages.push_back({"tool", obs_str, {}, tc.id, tc.name});
                 all_obs.push_back(obs);
                 if (!tool_names.empty()) tool_names += "+";
                 tool_names += tc.name;
@@ -3659,6 +3845,7 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
             result.success = true;
             result.final_answer = resp.content;
             result.iterations_used = iter + 1;
+            emit_event(AgentEvent::Kind::MESSAGE, "final", {{"text", resp.content}});  // D99
             if (on_step) on_step(step);
             break;
         }
@@ -3718,6 +3905,9 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
     }
     metrics_->record({MetricEvent::Kind::WORKFLOW_END, wf_id, "", "", "",
                       result.duration_ms, result.success, result.error});
+    emit_event(result.success ? AgentEvent::Kind::RUN_FINISHED : AgentEvent::Kind::RUN_ERROR,
+               "agent", {{"success", result.success}, {"error", result.error},
+                         {"iterations", result.iterations_used}});  // D99
     return result;
 }
 
@@ -4233,18 +4423,28 @@ json McpClient::initialize(const std::string& client_name, const std::string& ve
 
 std::vector<ToolDef> McpClient::list_tools() {
     if (!initialized_) throw McpError("MCP: not initialized");
-    auto result = make_request("tools/list");
     discovered_tools_.clear();
-    if (result.contains("tools")) {
-        for (const auto& t : result["tools"]) {
-            ToolDef def;
-            def.name        = t.value("name", "");
-            def.description = t.value("description", "");
-            def.input_schema  = t.value("inputSchema", json::object());
-            def.output_schema = t.value("outputSchema", json::object());
-            discovered_tools_.push_back(def);
+    // D104 — 游标分页：循环拉取直到没有 nextCursor（修正只取首页的截断 bug）
+    std::string cursor;
+    do {
+        json params = json::object();
+        if (!cursor.empty()) params["cursor"] = cursor;
+        auto result = make_request("tools/list", params);
+        if (result.contains("tools") && result["tools"].is_array()) {
+            for (const auto& t : result["tools"]) {
+                ToolDef def;
+                def.name        = t.value("name", "");
+                def.description = t.value("description", "");
+                def.input_schema  = t.value("inputSchema", json::object());
+                def.output_schema = t.value("outputSchema", json::object());
+                if (t.contains("annotations"))            // D104 — 工具注解
+                    def.annotations = ToolAnnotations::from_json(t["annotations"]);
+                discovered_tools_.push_back(def);
+            }
         }
-    }
+        cursor = (result.contains("nextCursor") && result["nextCursor"].is_string())
+                 ? result["nextCursor"].get<std::string>() : "";
+    } while (!cursor.empty());
     return discovered_tools_;
 }
 
@@ -4450,6 +4650,39 @@ std::string A2AClient::ask(const std::string& text) {
     if (result.contains("message"))
         return A2AMessage::from_json(result["message"]).text();
     return result.dump();
+}
+
+// D105 — 任务生命周期
+A2ATask A2AClient::get_task(const std::string& task_id, int history_length) {
+    json params = {{"id", task_id}};
+    if (history_length > 0) params["historyLength"] = history_length;
+    json req  = make_rpc(next_id_++, "tasks/get", params);
+    json resp = a2a_http_post(endpoint(), api_key_, req);
+    if (resp.contains("error") && !resp["error"].is_null()) {
+        json e = resp["error"];
+        throw A2AError("A2A RPC error: " + e.value("message", e.dump()));
+    }
+    return A2ATask::from_json(resp.value("result", json::object()));
+}
+
+A2ATask A2AClient::cancel_task(const std::string& task_id) {
+    json req  = make_rpc(next_id_++, "tasks/cancel", {{"id", task_id}});
+    json resp = a2a_http_post(endpoint(), api_key_, req);
+    if (resp.contains("error") && !resp["error"].is_null()) {
+        json e = resp["error"];
+        throw A2AError("A2A RPC error: " + e.value("message", e.dump()));
+    }
+    return A2ATask::from_json(resp.value("result", json::object()));
+}
+
+A2ATask A2AClient::poll_until_terminal(const std::string& task_id, int poll_ms, int max_polls) {
+    A2ATask t;
+    for (int i = 0; i < max_polls; ++i) {
+        t = get_task(task_id);
+        if (a2a_is_terminal(t.state)) return t;
+        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+    }
+    return t;
 }
 
 } // namespace ariadne
