@@ -2,6 +2,20 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.9.0] - 2026-06-24
+
+Theme: **Composability & production ops.** Researched against live June 2026 docs (LangGraph 1.0/1.2 subgraphs + durable execution, eval-driven prompt development, MCP 2025-11-25 stable spec).
+
+### Added
+- **Sub-workflow nesting** (D93): `WorkflowRegistry` registers named `SubWorkflowFn` units (input json → output json) with thread-safety + recursion-depth guard. `WorkflowEngine::register_sub_workflow()`/`run_sub_workflow()`/`register_workflow_as_tool()` let a parent agent or DAG invoke a reusable workflow as a tool (LangGraph "subgraph as a node" pattern). Self-recursion past `max_depth` throws `StepExecutionError`.
+- **Prompt versioning** (D94): `PromptVersionStore` keeps multiple named prompt versions with an active-version pointer + history (`add`/`get`/`render`/`set_active`/`versions`/`active_version`). Git-style prompt management; complements the template-rendering `PromptRegistry`.
+- **Prompt eval gate** (D95): `PromptEvalGate` runs a golden set of `EvalCase`s through a `Runner` + `Scorer`, returns an `EvalReport` (per-case pass count, avg score) and gates on an avg-score threshold. Eval-driven development primitive — pluggable runner/scorer (LLM, local, or test stub), testable without HTTP.
+- **MCP 2025-11-25 protocol version** (D96): `MCP_PROTOCOL_VERSION` constant; `McpClient::initialize()` advertises `2025-11-25` (was `2025-06-18`); `HttpTransport` sends the `MCP-Protocol-Version` header on every request. Aligns with the latest stable MCP spec (async Tasks, OAuth, extensions).
+- 13 new tests (229 total)
+
+### Changed
+- MCP transport now advertises protocol version `2025-11-25` (was `2025-06-18`).
+
 ## [2.8.0] - 2026-06-23
 
 Theme: **Retrieval, memory & context engineering + A2A interop.** Researched against live June 2026 docs (A2A v1.0 Linux Foundation, MCP 2025-11-25, hybrid-retrieval RAG gold standard, context-compaction research arXiv 2601.07190).

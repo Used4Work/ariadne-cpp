@@ -2868,6 +2868,28 @@ WorkflowEngine::WorkflowEngine(const EngineConfig& cfg)
 void WorkflowEngine::register_tool(const ToolDef& def, ToolFn fn) {
     tools_->register_tool(def, std::move(fn));
 }
+
+// ── D93: 子工作流嵌套 ────────────────────────────────────────────
+void WorkflowEngine::register_sub_workflow(const std::string& name, SubWorkflowFn fn) {
+    sub_workflows_.register_workflow(name, std::move(fn));
+}
+json WorkflowEngine::run_sub_workflow(const std::string& name, const json& input) {
+    return sub_workflows_.run(name, input);
+}
+void WorkflowEngine::register_workflow_as_tool(const std::string& tool_name,
+                                               const std::string& description,
+                                               SubWorkflowFn fn) {
+    sub_workflows_.register_workflow(tool_name, std::move(fn));
+    ToolDef def;
+    def.name         = tool_name;
+    def.description  = description;
+    def.input_schema = json::object();
+    // 工具 lambda 经 sub_workflows_.run 调用，从而享有递归深度保护。
+    register_tool(def, [this, tool_name](const json& params) -> json {
+        return sub_workflows_.run(tool_name, params);
+    });
+}
+
 void WorkflowEngine::print_provider_status() const { llm_->print_status(); }
 WorkflowPlan WorkflowEngine::plan_only(const std::string& task) {
     auto tools = tools_->list_tools();
@@ -4003,6 +4025,7 @@ void HttpTransport::send(const json& message) {
     struct curl_slist* h = nullptr;
     h = curl_slist_append(h, "Content-Type: application/json");
     h = curl_slist_append(h, "Accept: application/json");
+    h = curl_slist_append(h, ("MCP-Protocol-Version: " + std::string(MCP_PROTOCOL_VERSION)).c_str()); // D96
     if (!api_key_.empty())
         h = curl_slist_append(h, ("Authorization: Bearer " + api_key_).c_str());
     auto write_cb = [](char* p, size_t s, size_t n, void* u) -> size_t {
@@ -4198,7 +4221,7 @@ json McpClient::make_request(const std::string& method, const json& params) {
 
 json McpClient::initialize(const std::string& client_name, const std::string& ver) {
     auto result = make_request("initialize", {
-        {"protocolVersion", "2025-06-18"},
+        {"protocolVersion", MCP_PROTOCOL_VERSION},   // D96: 2025-11-25 最新稳定规范
         {"capabilities", json::object()},
         {"clientInfo", {{"name", client_name}, {"version", ver}}}
     });

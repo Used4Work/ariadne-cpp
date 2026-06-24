@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cctype>
+#include <cstdint>
 #include <set>
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
@@ -53,7 +54,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.8.0";
+constexpr const char* ARIADNE_VERSION = "2.9.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -1449,6 +1450,148 @@ private:
     std::map<std::string, PromptTemplate> templates_;
 };
 
+// ════════════════════════════════════════════════════════════════
+// D94 — Prompt 版本管理 (Prompt versioning)
+//   生产级 prompt 管理：每个名字保存多个不可变版本 + 激活版本指针 +
+//   历史。配合 D95 eval gate 做"评测通过才提升为激活版本"(eval-driven)。
+//   与上面的模板型 PromptRegistry 互补（那个做变量渲染，这个做版本控制）。
+// ════════════════════════════════════════════════════════════════
+
+struct PromptVersion {
+    std::string version;   // 版本号（如 "v1" / "2026-06-24" / 哈希）
+    std::string text;      // prompt 正文
+    json        metadata;  // 任意元数据（作者、note、eval 分数...）
+};
+
+class PromptVersionStore {
+public:
+    /** 追加一个版本（version 为空则自动取 "v{N}"）。同名 version 视为同一版本，
+     *  更新其内容。首次添加某 name 时自动设为激活版本。返回版本号。 */
+    std::string add(const std::string& name, const std::string& text,
+                    std::string version = "", const json& metadata = {}) {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        auto& vs = store_[name];
+        if (version.empty()) version = "v" + std::to_string(vs.size() + 1);
+        for (auto& v : vs) {
+            if (v.version == version) { v.text = text; v.metadata = metadata; break; }
+        }
+        if (std::none_of(vs.begin(), vs.end(),
+                [&](const PromptVersion& v){ return v.version == version; }))
+            vs.push_back({version, text, metadata});
+        if (!active_.count(name)) active_[name] = version;
+        return version;
+    }
+
+    bool has(const std::string& name) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return store_.count(name) > 0;
+    }
+
+    /** 取指定版本（version 为空=激活版本）。找不到抛 AriadneError。 */
+    PromptVersion get(const std::string& name, const std::string& version = "") const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        auto it = store_.find(name);
+        if (it == store_.end()) throw AriadneError("prompt not found: " + name);
+        std::string want = version;
+        if (want.empty()) {
+            auto ai = active_.find(name);
+            want = (ai != active_.end()) ? ai->second
+                 : (it->second.empty() ? "" : it->second.back().version);
+        }
+        for (const auto& v : it->second) if (v.version == want) return v;
+        throw AriadneError("prompt version not found: " + name + "@" + want);
+    }
+
+    /** 取正文（version 为空=激活版本）。 */
+    std::string render(const std::string& name, const std::string& version = "") const {
+        return get(name, version).text;
+    }
+
+    /** 设为激活版本。version 必须已存在，否则抛 AriadneError。 */
+    void set_active(const std::string& name, const std::string& version) {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        auto it = store_.find(name);
+        if (it == store_.end()) throw AriadneError("prompt not found: " + name);
+        for (const auto& v : it->second)
+            if (v.version == version) { active_[name] = version; return; }
+        throw AriadneError("prompt version not found: " + name + "@" + version);
+    }
+
+    std::string active_version(const std::string& name) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        auto ai = active_.find(name);
+        return ai != active_.end() ? ai->second : "";
+    }
+
+    std::vector<std::string> versions(const std::string& name) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        std::vector<std::string> out;
+        auto it = store_.find(name);
+        if (it != store_.end())
+            for (const auto& v : it->second) out.push_back(v.version);
+        return out;
+    }
+
+private:
+    mutable std::shared_mutex mu_;
+    std::map<std::string, std::vector<PromptVersion>> store_;
+    std::map<std::string, std::string> active_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// D95 — Prompt 评测门禁 (Eval gate, eval-driven development)
+//   用一组 golden cases 跑某个 prompt/runner，按 scorer 打分，平均分
+//   达到阈值才"通过"。可用于 CI 门禁，或提升 prompt 版本前的回归校验。
+// ════════════════════════════════════════════════════════════════
+
+struct EvalCase {
+    std::string input;     // 输入
+    std::string expected;  // 期望（scorer 可用，也可忽略）
+    json        metadata;
+};
+
+struct EvalReport {
+    int                 total       = 0;
+    int                 passed      = 0;     // score >= per_case_threshold 的数量
+    double              avg_score   = 0.0;
+    bool                gate_passed = false; // avg_score >= threshold
+    std::vector<double> scores;
+};
+
+/** 评测门禁：runner 把 input 跑成 output，scorer 给 (output, case)→[0,1] 分。 */
+class PromptEvalGate {
+public:
+    using Runner = std::function<std::string(const std::string& input)>;
+    using Scorer = std::function<double(const std::string& output, const EvalCase& c)>;
+
+    explicit PromptEvalGate(double threshold = 0.8, double per_case_threshold = 0.5)
+        : threshold_(threshold), per_case_threshold_(per_case_threshold) {}
+
+    EvalReport run(const std::vector<EvalCase>& cases,
+                   const Runner& runner, const Scorer& scorer) const {
+        EvalReport r;
+        r.total = (int)cases.size();
+        double sum = 0.0;
+        for (const auto& c : cases) {
+            std::string out = runner ? runner(c.input) : "";
+            double s = scorer ? scorer(out, c) : 0.0;
+            s = std::max(0.0, std::min(1.0, s));   // clamp 到 [0,1]
+            r.scores.push_back(s);
+            sum += s;
+            if (s >= per_case_threshold_) r.passed++;
+        }
+        r.avg_score   = r.total > 0 ? sum / r.total : 0.0;
+        r.gate_passed = r.total > 0 && r.avg_score >= threshold_;
+        return r;
+    }
+
+    double threshold() const { return threshold_; }
+
+private:
+    double threshold_;
+    double per_case_threshold_;
+};
+
 using ToolFn = std::function<json(const json& params)>;
 
 struct ToolDef {
@@ -1609,7 +1752,73 @@ public:
 /// @deprecated Use StepExecutionError
 using WorkflowExecutionError = StepExecutionError;
 
+// ════════════════════════════════════════════════════════════════
+// D93 — 子工作流嵌套 (Sub-workflow nesting)
+//   把一个可复用工作流当作"节点/工具"嵌入父工作流（对标 LangGraph
+//   subgraph：父图的某个节点本身是一个完整子图）。带递归深度保护，
+//   防止 A→B→A 之类的无限嵌套。
+// ════════════════════════════════════════════════════════════════
 
+/** 子工作流：输入 json → 输出 json（可包裹 engine.run / agent / 任意逻辑）。 */
+using SubWorkflowFn = std::function<json(const json& input)>;
+
+/** 命名子工作流注册表，线程安全 + 递归深度保护。 */
+class WorkflowRegistry {
+public:
+    explicit WorkflowRegistry(int max_depth = 8) : max_depth_(max_depth) {}
+
+    void register_workflow(const std::string& name, SubWorkflowFn fn) {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        flows_[name] = std::move(fn);
+    }
+    bool has(const std::string& name) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return flows_.count(name) > 0;
+    }
+    std::vector<std::string> list() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        std::vector<std::string> v;
+        for (const auto& kv : flows_) v.push_back(kv.first);
+        return v;
+    }
+    size_t size() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return flows_.size();
+    }
+
+    /** 调用命名子工作流。未注册抛 ToolNotFoundError；
+     *  嵌套深度超过 max_depth 抛 StepExecutionError（防无限递归）。 */
+    json run(const std::string& name, const json& input) const {
+        SubWorkflowFn fn;
+        {
+            std::shared_lock<std::shared_mutex> lk(mu_);
+            auto it = flows_.find(name);
+            if (it == flows_.end())
+                throw ToolNotFoundError(name, "sub-workflow not registered");
+            fn = it->second;   // 拷贝后解锁，避免持锁执行子工作流
+        }
+        if (depth() >= max_depth_)
+            throw StepExecutionError(name, "sub-workflow",
+                "recursion depth exceeded (" + std::to_string(max_depth_) + ")");
+        DepthGuard g;          // RAII：进入 +1 / 退出 -1（thread_local）
+        return fn(input);
+    }
+
+    /** 当前线程的嵌套深度（用于诊断/测试）。 */
+    int current_depth() const { return depth(); }
+    int max_depth()     const { return max_depth_; }
+
+private:
+    // thread_local 深度计数：同一线程跨实例共享，能检测跨注册表的递归。
+    static int& depth() { static thread_local int d = 0; return d; }
+    struct DepthGuard {
+        DepthGuard()  { ++depth(); }
+        ~DepthGuard() { --depth(); }
+    };
+    mutable std::shared_mutex mu_;
+    std::map<std::string, SubWorkflowFn> flows_;
+    int max_depth_;
+};
 
 class IMetricsCollector;  // forward declaration
 
@@ -1939,6 +2148,11 @@ private:
 // MCP Client — Model Context Protocol (stdio transport)
 // JSON-RPC 2.0 over subprocess stdin/stdout (NDJSON)
 // ════════════════════════════════════════════════════════════════
+
+/** MCP 协议版本（D96）。当前稳定规范 2025-11-25（async Tasks、OAuth 对齐、
+ *  extensions 框架）。initialize 时声明，Streamable HTTP 传输带
+ *  `MCP-Protocol-Version` 头。 */
+constexpr const char* MCP_PROTOCOL_VERSION = "2025-11-25";
 
 /** MCP 传输层接口 */
 class IMcpTransport {
@@ -2276,6 +2490,19 @@ public:
 
     void           register_tool(const ToolDef& def, ToolFn fn);
 
+    /** 注册命名子工作流（D93）。fn: input json → output json，可包裹
+     *  本 engine 或另一个 engine 的 run/agent，实现可复用的工作流组合。 */
+    void           register_sub_workflow(const std::string& name, SubWorkflowFn fn);
+    /** 运行已注册的子工作流（带递归深度保护）。 */
+    json           run_sub_workflow(const std::string& name, const json& input);
+    /** 把子工作流暴露为工具：父 agent / DAG 可像普通工具一样调用它
+     *  （LangGraph「子图作为节点」模式）。tool 调用经过深度保护。 */
+    void           register_workflow_as_tool(const std::string& tool_name,
+                                             const std::string& description,
+                                             SubWorkflowFn fn);
+    /** 已注册子工作流名列表。 */
+    std::vector<std::string> list_sub_workflows() const { return sub_workflows_.list(); }
+
     /** 单次运行，无记忆 */
     WorkflowResult run(const std::string& task);
 
@@ -2435,6 +2662,7 @@ private:
     std::shared_ptr<ICheckpointStore> checkpoint_store_;
     std::shared_ptr<IMemoryStore> memory_store_;
     PromptRegistry prompt_registry_;
+    WorkflowRegistry sub_workflows_;
     InterruptFn interrupt_hook_;
 
     WorkflowResult run_internal(const std::string& task, WorkflowContext* ctx);

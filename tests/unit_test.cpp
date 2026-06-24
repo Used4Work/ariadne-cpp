@@ -2370,8 +2370,124 @@ void test_a2a_endpoint_pivot_allowed() {
     ASSERT(cli.endpoint_pivot_allowed("https://evil.com/a2a"));          // 显式 opt-in 放行
 }
 
-void test_version_is_2_8_0() {
-    ASSERT(version().find("2.8.0") != std::string::npos);
+// ── v2.9.0: Composability & Production Ops ─────────────────
+
+// D93 — sub-workflow nesting
+void test_workflow_registry_basic() {
+    WorkflowRegistry reg;
+    reg.register_workflow("upper", [](const json& in)->json{
+        std::string s = in.value("text", std::string());
+        for (auto& ch : s) ch = (char)std::toupper((unsigned char)ch);
+        return {{"out", s}};
+    });
+    ASSERT(reg.has("upper"));
+    ASSERT(reg.size() == 1);
+    ASSERT(reg.list().size() == 1);
+    auto r = reg.run("upper", {{"text", "hi"}});
+    ASSERT(r["out"] == "HI");
+}
+
+void test_workflow_registry_not_found() {
+    WorkflowRegistry reg;
+    ASSERT(!reg.has("nope"));
+    ASSERT_THROWS(ToolNotFoundError, reg.run("nope", json::object()));
+}
+
+void test_workflow_registry_depth_guard() {
+    WorkflowRegistry reg(2);   // max_depth=2
+    reg.register_workflow("recurse", [&](const json& in)->json{
+        return reg.run("recurse", in);   // 无限自递归 → 深度超限抛出
+    });
+    ASSERT_THROWS(StepExecutionError, reg.run("recurse", json::object()));
+}
+
+void test_engine_sub_workflow() {
+    WorkflowEngine engine(EngineConfig::from_single(
+        ProviderConfig::openai_compatible("test", "http://localhost:9999", "mock")));
+    engine.register_sub_workflow("double", [](const json& in)->json{
+        return {{"result", in.value("n", 0) * 2}};
+    });
+    ASSERT(engine.list_sub_workflows().size() == 1);
+    auto r = engine.run_sub_workflow("double", {{"n", 21}});
+    ASSERT(r["result"].get<int>() == 42);
+}
+
+void test_engine_workflow_as_tool() {
+    WorkflowEngine engine(EngineConfig::from_single(
+        ProviderConfig::openai_compatible("test", "http://localhost:9999", "mock")));
+    engine.register_workflow_as_tool("greet", "Greets a name",
+        [](const json& in)->json{ return {{"msg", "hi " + in.value("name", std::string())}}; });
+    auto r = engine.call_tool("greet", {{"name", "ada"}});   // 暴露为工具后可调用
+    ASSERT(r["msg"] == "hi ada");
+}
+
+// D94 — prompt versioning
+void test_prompt_version_store_basic() {
+    PromptVersionStore ps;
+    std::string v1 = ps.add("sys", "You are v1");
+    std::string v2 = ps.add("sys", "You are v2");
+    ASSERT(v1 == "v1" && v2 == "v2");
+    ASSERT(ps.has("sys"));
+    ASSERT(ps.versions("sys").size() == 2);
+    ASSERT(ps.active_version("sys") == "v1");           // 默认激活=首个版本
+    ASSERT(ps.render("sys") == "You are v1");           // 默认=激活
+    ASSERT(ps.render("sys", "v2") == "You are v2");     // 指定版本
+}
+
+void test_prompt_version_set_active() {
+    PromptVersionStore ps;
+    ps.add("p", "a", "alpha");
+    ps.add("p", "b", "beta");
+    ASSERT(ps.active_version("p") == "alpha");
+    ps.set_active("p", "beta");
+    ASSERT(ps.active_version("p") == "beta");
+    ASSERT(ps.render("p") == "b");
+    ASSERT_THROWS(AriadneError, ps.set_active("p", "ghost"));
+}
+
+void test_prompt_version_not_found() {
+    PromptVersionStore ps;
+    ASSERT_THROWS(AriadneError, ps.get("missing"));
+}
+
+// D95 — eval gate
+void test_eval_gate_pass() {
+    PromptEvalGate gate(0.8);
+    std::vector<EvalCase> cases = {{"a","A",{}}, {"b","B",{}}};
+    auto runner = [](const std::string& in){ return in == "a" ? std::string("A") : std::string("B"); };
+    auto scorer = [](const std::string& out, const EvalCase& c){ return out == c.expected ? 1.0 : 0.0; };
+    auto rep = gate.run(cases, runner, scorer);
+    ASSERT(rep.total == 2 && rep.passed == 2);
+    ASSERT(rep.avg_score == 1.0);
+    ASSERT(rep.gate_passed);
+}
+
+void test_eval_gate_fail() {
+    PromptEvalGate gate(0.8);
+    std::vector<EvalCase> cases = {{"a","A",{}}, {"b","B",{}}};
+    auto runner = [](const std::string&){ return std::string("wrong"); };
+    auto scorer = [](const std::string& out, const EvalCase& c){ return out == c.expected ? 1.0 : 0.0; };
+    auto rep = gate.run(cases, runner, scorer);
+    ASSERT(rep.passed == 0);
+    ASSERT(rep.avg_score == 0.0);
+    ASSERT(!rep.gate_passed);
+}
+
+void test_eval_gate_empty() {
+    PromptEvalGate gate(0.5);
+    auto rep = gate.run({}, [](const std::string&){ return std::string(); },
+                            [](const std::string&, const EvalCase&){ return 1.0; });
+    ASSERT(rep.total == 0);
+    ASSERT(!rep.gate_passed);   // 空集不通过
+}
+
+// D96 — MCP protocol version
+void test_mcp_protocol_version() {
+    ASSERT(std::string(MCP_PROTOCOL_VERSION) == "2025-11-25");
+}
+
+void test_version_is_2_9_0() {
+    ASSERT(version().find("2.9.0") != std::string::npos);
 }
 
 int main() {
@@ -2646,7 +2762,21 @@ int main() {
     RUN(test_memory_scope_isolation);
     RUN(test_a2a_origin_of);
     RUN(test_a2a_endpoint_pivot_allowed);
-    RUN(test_version_is_2_8_0);
+
+    std::cout<<"\n=== v2.9.0 Composability & Production Ops ===\n";
+    RUN(test_workflow_registry_basic);
+    RUN(test_workflow_registry_not_found);
+    RUN(test_workflow_registry_depth_guard);
+    RUN(test_engine_sub_workflow);
+    RUN(test_engine_workflow_as_tool);
+    RUN(test_prompt_version_store_basic);
+    RUN(test_prompt_version_set_active);
+    RUN(test_prompt_version_not_found);
+    RUN(test_eval_gate_pass);
+    RUN(test_eval_gate_fail);
+    RUN(test_eval_gate_empty);
+    RUN(test_mcp_protocol_version);
+    RUN(test_version_is_2_9_0);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

@@ -8,7 +8,7 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-217%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-229%20passed-brightgreen)](#tests)
 
 </div>
 
@@ -36,6 +36,11 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **AdaptiveOrchestrator** -- LLM auto-selects optimal strategy per task
 - **Multimodal vision** -- image input via base64 or URL (OpenAI + Anthropic + Gemini)
 - **Reasoning control** -- `reasoning_effort`/`verbosity` → Gemini 3 `thinking_level`, GPT-5.x params (`max_completion_tokens`), Anthropic `output_config` GA structured output
+- **Sub-workflow nesting** -- `WorkflowRegistry` embeds a reusable workflow as a tool/node in a parent agent or DAG, with recursion-depth guard (LangGraph subgraph pattern)
+
+### Prompt Ops
+- **Prompt versioning** -- `PromptVersionStore` keeps named prompts with multiple versions, active-version pin, and history (git-style)
+- **Eval gate** -- `PromptEvalGate` runs a golden set through a runner + scorer and gates on an avg-score threshold (eval-driven development)
 
 ### Dynamic Workflow (Ultracode-level)
 - `parallel()` -- fan-out N tasks, barrier wait
@@ -80,7 +85,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Thread-safe** -- `shared_mutex` on ToolRegistry, atomic flags
 
 ### Integration
-- **MCP client** -- Model Context Protocol (stdio + Streamable HTTP, JSON-RPC 2.0)
+- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0)
 - **A2A client** -- Agent2Agent v1.0 (Linux Foundation) interop: AgentCard discovery + `message/send` over JSON-RPC/HTTP
 - **Ariadne Studio** -- visual workflow editor (localhost web UI)
 - **Streaming** -- SSE token delivery
@@ -129,7 +134,7 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 217 tests
+./build/unit_tests          # 229 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
@@ -191,7 +196,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 217 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 229 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 
