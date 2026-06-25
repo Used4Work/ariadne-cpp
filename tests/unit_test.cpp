@@ -2785,6 +2785,35 @@ struct MockMcpTransport : IMcpTransport {
                           {"structuredContent", {{"rows", 5}}}};
             else
                 result = {{"content", json::array({{{"type","text"},{"text","ok"}}})}};
+        } else if (method == "resources/list") {         // D111 — 分页资源
+            std::string cursor = params.value("cursor", "");
+            if (cursor.empty())
+                result = {{"resources", json::array({
+                    {{"uri","file:///a.txt"},{"name","a"},{"mimeType","text/plain"},{"size",12}}
+                })}, {"nextCursor","rp2"}};
+            else if (cursor == "rp2")
+                result = {{"resources", json::array({
+                    {{"uri","file:///b.png"},{"name","b"},{"mimeType","image/png"}}
+                })}};
+        } else if (method == "resources/read") {
+            std::string uri = params.value("uri","");
+            if (uri == "file:///b.png")
+                result = {{"contents", json::array({
+                    {{"uri",uri},{"mimeType","image/png"},{"blob","QUJD"}}})}};
+            else
+                result = {{"contents", json::array({
+                    {{"uri",uri},{"mimeType","text/plain"},{"text","hello world"}}})}};
+        } else if (method == "prompts/list") {           // D112 — 提示
+            result = {{"prompts", json::array({
+                {{"name","code_review"},{"title","Review"},{"description","d"},
+                 {"arguments", json::array({{{"name","code"},{"required",true}}})}}
+            })}};
+        } else if (method == "prompts/get") {
+            std::string code = params.value("arguments", json::object()).value("code","");
+            result = {{"description","Code review prompt"},
+                      {"messages", json::array({
+                        {{"role","user"},{"content",{{"type","text"},{"text","Review: " + code}}}}
+                      })}};
         }
         return {{"jsonrpc","2.0"},{"id",id},{"result",result}};
     }
@@ -2871,8 +2900,209 @@ void test_a2a_task_rpc_builders() {
     ASSERT(cancel["method"] == "tasks/cancel" && cancel["id"] == 2);
 }
 
-void test_version_is_2_10_0() {
-    ASSERT(version().find("2.10.0") != std::string::npos);
+// ════════════════════════════════════════════════════════════════
+// v2.11.0 — Defense, Rigor & Provider Correctness (D106–D114)
+// ════════════════════════════════════════════════════════════════
+
+// D106 — 致命三元组污点追踪
+void test_taint_lethal_trifecta() {
+    TaintTracker t;
+    ToolCapability web(true,false,true);   // 读不可信 + 对外发送（同工具兼具：危险）
+    ToolCapability send(false,false,true); // 纯对外发送
+    ToolCapability read(true,false,false); // 纯读不可信
+    ASSERT(!t.blocks_external_send(send));  // 初始无污点：允许
+    t.observe(read);                        // 读入不可信 → 污点
+    ASSERT(t.tainted());
+    ASSERT(t.blocks_external_send(send));   // 污点后：对外发送被拦截
+    ASSERT(!t.blocks_external_send(read));  // 非发送工具不受影响
+    // require_private：仅完整三元组拦截
+    TaintTracker t2; t2.mark_untrusted();
+    ASSERT(!t2.blocks_external_send(send, true));  // 缺私有数据
+    t2.mark_private();
+    ASSERT(t2.blocks_external_send(send, true));   // 完整三元组
+    // observe 复合能力 + reset
+    TaintTracker t3; t3.observe(web);
+    ASSERT(t3.blocks_external_send(send));
+    t3.reset();
+    ASSERT(!t3.tainted());
+}
+
+// D107 — 风险分级工具授权
+void test_tool_authorization() {
+    ToolAuthorizationPolicy pol;            // 默认 Confirm（fail-closed）
+    pol.allow("search");
+    pol.set_risk("send_email", ToolRiskLevel::Confirm);
+    pol.set_risk("wire_money", ToolRiskLevel::DualConfirm);
+    pol.deny("rm_rf");
+    ASSERT(pol.decide("search")     == AuthDecision::Allow);
+    ASSERT(pol.decide("send_email") == AuthDecision::NeedsApproval);
+    ASSERT(pol.decide("wire_money") == AuthDecision::NeedsDualApproval);
+    ASSERT(pol.decide("rm_rf")      == AuthDecision::Block);
+    ASSERT(pol.decide("unknown")    == AuthDecision::NeedsApproval);  // fail-closed
+    // 校验和绑定：同动作同校验和；改 args/工具即失效
+    json a1 = {{"to","a@b.com"},{"body","hi"}};
+    auto tok = ToolAuthorizationPolicy::approval_checksum("send_email", a1);
+    ASSERT(ToolAuthorizationPolicy::approval_valid(tok, "send_email", a1));
+    ASSERT(!ToolAuthorizationPolicy::approval_valid(tok, "send_email",
+            json({{"to","evil@x.com"},{"body","hi"}})));
+    ASSERT(!ToolAuthorizationPolicy::approval_valid(tok, "wire_money", a1));
+    // 键序无关（nlohmann 规范化）
+    ASSERT(ToolAuthorizationPolicy::approval_valid(tok, "send_email",
+            json({{"body","hi"},{"to","a@b.com"}})));
+}
+
+// D108 — 确定性 JSON 修复
+void test_json_repair() {
+    ASSERT(parse_json_lenient("```json\n{\"x\": 1}\n```")["x"] == 1);          // 围栏
+    auto b = parse_json_lenient("{\"a\":1, \"b\":[1,2,3,],}");                 // 尾随逗号
+    ASSERT(b["a"] == 1 && b["b"].size() == 3);
+    ASSERT(parse_json_lenient("{'k': 'v'}")["k"] == "v");                      // 单引号
+    ASSERT(parse_json_lenient("Sure! Here:\n{\"ok\": true}\nDone.")["ok"] == true); // 散文
+    ASSERT(parse_json_lenient("{\n // c\n \"n\": 42 /* t */\n}")["n"] == 42);  // 注释
+    auto f = parse_json_lenient("{\"items\": [1, 2, {\"deep\": \"trunc");      // 截断补全
+    ASSERT(f["items"].size() == 3 && f["items"][2]["deep"] == "trunc");
+    ASSERT(parse_json_lenient("{\"clean\": [1,2]}")["clean"][1] == 2);         // 有效原样
+}
+
+// D109 — 评测统计严谨性
+void test_eval_statistics() {
+    auto ci = wilson_interval(8, 10);
+    ASSERT(std::abs(ci.point - 0.8) < 1e-9);
+    ASSERT(ci.low > 0.4 && ci.low < 0.8 && ci.high > 0.8 && ci.high <= 1.0);
+    ASSERT(wilson_interval(0,0).point == 0.0);
+    ASSERT(wilson_interval(20,20).low > 0.8);
+    // 无偏 pass@k
+    ASSERT(std::abs(pass_at_k(10,10,1) - 1.0) < 1e-9);
+    ASSERT(pass_at_k(10,0,1) == 0.0);
+    ASSERT(pass_at_k(5,1,5) == 1.0);
+    ASSERT(std::abs(pass_at_k(10,3,1) - 0.3) < 1e-9);
+    ASSERT(pass_at_k(10,3,3) > pass_at_k(10,3,1));   // k 增大单调不减
+    // 配对自助法回归门禁（确定性 seed）
+    std::vector<double> worse = {-0.2,-0.3,-0.1,-0.25,-0.15,-0.2,-0.3,-0.1};
+    auto rb = paired_bootstrap(worse, 2000, 7);
+    ASSERT(rb.mean_delta < 0 && rb.regression && !rb.improvement);
+    std::vector<double> better(8, 0.2);
+    auto ib = paired_bootstrap(better, 2000, 7);
+    ASSERT(ib.improvement && !ib.regression);
+    std::vector<double> noisy = {0.5,-0.5,0.4,-0.4,0.3,-0.3};
+    auto nb = paired_bootstrap(noisy, 2000, 7);
+    ASSERT(!nb.regression && !nb.improvement);       // 跨 0：不确定
+    ASSERT(paired_bootstrap(worse,2000,7).ci_low == paired_bootstrap(worse,2000,7).ci_low);
+}
+
+// D110 — 轨迹评测
+void test_trajectory_eval() {
+    std::vector<std::string> exp = {"search","read","summarize"};
+    auto strict = score_trajectory({"search","read","summarize"}, exp, TrajectoryMatch::Strict);
+    ASSERT(strict.match && std::abs(strict.overlap - 1.0) < 1e-9 && strict.redundant == 0);
+    ASSERT(!score_trajectory({"read","search","summarize"}, exp, TrajectoryMatch::Strict).match);
+    ASSERT(score_trajectory({"read","search","summarize"}, exp, TrajectoryMatch::Unordered).match);
+    auto extra = score_trajectory({"search","read","summarize","x"}, exp, TrajectoryMatch::Superset);
+    ASSERT(extra.match && extra.redundant == 1);
+    ASSERT(!score_trajectory({"search","read","summarize","x"}, exp, TrajectoryMatch::Unordered).match);
+    auto sub = score_trajectory({"search","read"}, exp, TrajectoryMatch::Subset);
+    ASSERT(sub.match && std::abs(sub.overlap - 2.0/3.0) < 1e-9);
+    ASSERT(!score_trajectory({"search","read"}, exp, TrajectoryMatch::Superset).match);
+}
+
+// D111 — MCP 资源
+void test_mcp_resources() {
+    McpClient client(std::make_unique<MockMcpTransport>());
+    client.initialize("test");
+    auto res = client.list_resources();
+    ASSERT(res.size() == 2);                          // 分页 page1(1)+page2(1)
+    ASSERT(res[0].uri == "file:///a.txt" && res[0].mime_type == "text/plain" && res[0].size == 12);
+    ASSERT(res[1].uri == "file:///b.png");
+    auto c = client.read_resource("file:///a.txt");   // 文本
+    ASSERT(c.text == "hello world" && !c.is_binary());
+    auto b = client.read_resource("file:///b.png");   // 二进制 blob
+    ASSERT(b.is_binary() && b.blob == "QUJD");
+}
+
+// D112 — MCP 提示
+void test_mcp_prompts() {
+    McpClient client(std::make_unique<MockMcpTransport>());
+    client.initialize("test");
+    auto prompts = client.list_prompts();
+    ASSERT(prompts.size() == 1 && prompts[0].name == "code_review");
+    ASSERT(prompts[0].arguments.size() == 1);
+    ASSERT(prompts[0].arguments[0].name == "code" && prompts[0].arguments[0].required);
+    auto msgs = client.get_prompt("code_review", {{"code","x=1"}});
+    ASSERT(msgs.size() == 1 && msgs[0].role == "user" && msgs[0].content == "Review: x=1");
+}
+
+// D113 — Gemini thoughtSignature/函数调用 id 往返
+void test_gemini_thought_signature_roundtrip() {
+    json resp = {{"candidates", json::array({
+        {{"content",{{"parts", json::array({
+            {{"text","thinking..."}},
+            {{"functionCall",{{"name","search"},{"args",{{"q","x"}}},{"id","fc_1"}}},
+             {"thoughtSignature","SIG123"}}
+        })}}}}
+    })}};
+    auto r = gemini_parse_chat(resp);
+    ASSERT(r.content == "thinking...");
+    ASSERT(r.tool_calls.size() == 1 && r.tool_calls[0].name == "search");
+    ASSERT(r.tool_calls[0].id == "fc_1");                       // 真实 id 被采用
+    ASSERT(r.tool_calls[0].thought_signature == "SIG123");
+    // 构建：thoughtSignature 原样回带，functionResponse 带回真实 id
+    std::vector<ChatMessage> msgs;
+    json tc = json::array({{{"id","fc_1"},{"type","function"},
+        {"function",{{"name","search"},{"arguments","{\"q\":\"x\"}"}}},
+        {"thoughtSignature","SIG123"}}});
+    msgs.push_back({"assistant","",tc,"",""});
+    msgs.push_back({"tool","result data",{}, "fc_1","search"});
+    auto contents = gemini_build_contents(msgs);
+    ASSERT(contents.size() == 2);
+    ASSERT(contents[0]["parts"][0]["functionCall"]["name"] == "search");
+    ASSERT(contents[0]["parts"][0]["thoughtSignature"] == "SIG123");
+    ASSERT(contents[1]["parts"][0]["functionResponse"]["id"] == "fc_1");
+    // 合成 id（gemini_ 前缀）不回带
+    std::vector<ChatMessage> msgs2{{"tool","r",{}, "gemini_search","search"}};
+    auto c2 = gemini_build_contents(msgs2);
+    ASSERT(!c2[0]["parts"][0]["functionResponse"].contains("id"));
+}
+
+// D113 — Anthropic effort/温度锁/output_config
+void test_anthropic_effort_and_config() {
+    ASSERT(anthropic_effort("minimal") == "low" && anthropic_effort("none") == "low");
+    ASSERT(anthropic_effort("high") == "high" && anthropic_effort("max") == "max");
+    ASSERT(anthropic_effort("").empty() && anthropic_effort("bogus").empty());
+    auto oc = anthropic_output_config({{"type","object"}}, "high");
+    ASSERT(oc["format"]["type"] == "json_schema");
+    ASSERT(oc["format"]["schema"]["type"] == "object" && oc["effort"] == "high");
+    auto oe = anthropic_output_config(json::object(), "medium");
+    ASSERT(!oe.contains("format") && oe["effort"] == "medium");
+    auto os = anthropic_output_config({{"type","object"}}, "");
+    ASSERT(os.contains("format") && !os.contains("effort"));
+    ASSERT(anthropic_output_config(json::object(), "").empty());
+    ASSERT(anthropic_locks_temperature("claude-opus-4-8"));
+    ASSERT(anthropic_locks_temperature("claude-fable-5"));
+    ASSERT(!anthropic_locks_temperature("claude-3-5-sonnet"));
+    ASSERT(gemini_thinking_level("none") == "minimal" && gemini_thinking_level("xhigh") == "high");
+}
+
+// D114 — Anthropic 提示缓存断点 + 模型注册
+void test_anthropic_cache_control() {
+    json body = {{"model","claude-opus-4-8"},{"system","You are helpful."},
+                 {"tools", json::array({
+                    {{"name","a"},{"description","da"}}, {{"name","b"},{"description","db"}}
+                 })}};
+    apply_anthropic_cache_control(body);
+    ASSERT(body["tools"].back()["cache_control"]["type"] == "ephemeral");
+    ASSERT(!body["tools"][0].contains("cache_control"));   // 仅末项
+    ASSERT(body["system"].is_array());
+    ASSERT(body["system"][0]["text"] == "You are helpful.");
+    ASSERT(body["system"][0]["cache_control"]["type"] == "ephemeral");
+    json empty = {{"model","x"}};
+    apply_anthropic_cache_control(empty);                  // 无 tools/system 不崩
+    ASSERT(!empty.contains("tools"));
+    ASSERT(!ProviderConfig::anthropic("k").prompt_caching); // 默认关
+    ASSERT(std::abs(ProviderConfig::anthropic("k","claude-fable-5").pricing.input_per_1m - 10.0) < 1e-9);
+}
+
+void test_version_is_2_11_0() {
+    ASSERT(version().find("2.11.0") != std::string::npos);
 }
 
 int main() {
@@ -3185,7 +3415,19 @@ int main() {
     RUN(test_a2a_stream_frame_parse);
     RUN(test_a2a_card_v1_fields);
     RUN(test_a2a_task_rpc_builders);
-    RUN(test_version_is_2_10_0);
+
+    std::cout<<"\n=== v2.11.0 Defense, Rigor & Provider Correctness ===\n";
+    RUN(test_taint_lethal_trifecta);             // D106
+    RUN(test_tool_authorization);                // D107
+    RUN(test_json_repair);                       // D108
+    RUN(test_eval_statistics);                   // D109
+    RUN(test_trajectory_eval);                   // D110
+    RUN(test_mcp_resources);                     // D111
+    RUN(test_mcp_prompts);                       // D112
+    RUN(test_gemini_thought_signature_roundtrip);// D113
+    RUN(test_anthropic_effort_and_config);       // D113
+    RUN(test_anthropic_cache_control);           // D114
+    RUN(test_version_is_2_11_0);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";

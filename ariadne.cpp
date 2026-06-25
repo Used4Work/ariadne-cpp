@@ -193,14 +193,15 @@ std::string AnthropicProvider::complete(const std::string& prompt,
                                           bool force_json,
                                           const json& output_schema) const {
     json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
-                  {"temperature", temp},
                   {"messages", {{{"role","user"}, {"content", prompt}}}}};
+    if (!anthropic_locks_temperature(cfg_.model)) body["temperature"] = temp;  // D113 — 温度锁
     if (!sys.empty()) body["system"] = sys;
-    // 结构化输出：GA output_config.format（替代旧 response_format）(D85)
-    if (!output_schema.is_null() && !output_schema.empty())
-        body["output_config"] = anthropic_output_config(output_schema);
-    else if (force_json)
+    // 结构化输出 GA output_config.format (D85) + 推理力度 effort (D113)
+    json oc = anthropic_output_config(output_schema, cfg_.reasoning_effort);
+    if (!oc.empty()) body["output_config"] = oc;
+    if (force_json && !oc.contains("format"))
         body["response_format"] = {{"type", "json_object"}};
+    if (cfg_.prompt_caching) apply_anthropic_cache_control(body);  // D114 — 提示缓存断点
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
     auto resp = http_post(base + "/v1/messages",
         {"Content-Type: application/json",
@@ -293,8 +294,8 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
         }
     }
 
-    json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens},
-                  {"temperature", temperature}, {"messages", msgs}};
+    json body = {{"model", cfg_.model}, {"max_tokens", cfg_.max_tokens}, {"messages", msgs}};
+    if (!anthropic_locks_temperature(cfg_.model)) body["temperature"] = temperature;  // D113 — 温度锁
     if (!system_prompt.empty()) body["system"] = system_prompt;
 
     // Add tools if provided (Anthropic format)
@@ -317,9 +318,10 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
         else body["tool_choice"] = {{"type","auto"}};
     }
 
-    // 结构化输出：GA output_config.format (D85)
-    if (!output_schema.is_null() && !output_schema.empty())
-        body["output_config"] = anthropic_output_config(output_schema);
+    // 结构化输出 GA output_config.format (D85) + 推理力度 effort (D113)
+    json oc = anthropic_output_config(output_schema, cfg_.reasoning_effort);
+    if (!oc.empty()) body["output_config"] = oc;
+    if (cfg_.prompt_caching) apply_anthropic_cache_control(body);  // D114 — 提示缓存断点（tools 之后）
 
     std::string base = cfg_.base_url.empty() ? "https://api.anthropic.com" : cfg_.base_url;
     auto resp = http_post(base + "/v1/messages",
@@ -625,8 +627,16 @@ LLMResponse OpenAIChatProvider::complete_chat(const std::vector<ChatMessage>& me
         } else {
             msg["content"] = nullptr;
         }
-        if (m.role == "assistant" && !m.tool_calls.is_null() && !m.tool_calls.empty())
-            msg["tool_calls"] = m.tool_calls;
+        if (m.role == "assistant" && !m.tool_calls.is_null() && !m.tool_calls.empty()) {
+            // 仅透传 OpenAI 期望字段，剥离 thoughtSignature 等他方字段 (D113)
+            json tcs = json::array();
+            for (const auto& tc : m.tool_calls) {
+                json clean = {{"id", tc.value("id","")}, {"type", tc.value("type","function")}};
+                if (tc.contains("function")) clean["function"] = tc["function"];
+                tcs.push_back(std::move(clean));
+            }
+            msg["tool_calls"] = tcs;
+        }
         if (m.role == "tool") {
             msg["tool_call_id"] = m.tool_call_id;
             if (!m.name.empty()) msg["name"] = m.name;
@@ -871,49 +881,10 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
                                            double temperature,
                                            const std::string& tool_choice,
                                            const json& output_schema) const {
-    json contents = json::array();
+    // D113 — contents 构建（透传 thoughtSignature/函数调用 id）抽到可单测的纯函数
     std::string system_instruction;
-    for (const auto& m : messages) {
-        if (m.role == "system") { system_instruction = m.content; continue; }
-        std::string role = (m.role == "assistant") ? "model" : "user";
-        if (m.role == "tool") role = "user";  // Gemini: tool results as user
-        json parts = json::array();
-        if (m.is_multimodal()) {
-            for (const auto& p : m.content_parts) {
-                if (p.value("type","") == "text")
-                    parts.push_back({{"text", p.value("text","")}});
-                else if (p.value("type","") == "image_url") {
-                    std::string url = p["image_url"].value("url","");
-                    if (url.find("data:") == 0) {
-                        auto comma = url.find(',');
-                        auto semi = url.find(';');
-                        std::string mt = (semi != std::string::npos) ? url.substr(5,semi-5) : "image/jpeg";
-                        std::string data = (comma != std::string::npos) ? url.substr(comma+1) : "";
-                        parts.push_back({{"inline_data",{{"mime_type",mt},{"data",data}}}});
-                    }
-                }
-            }
-        } else if (m.role == "tool" || !m.tool_call_id.empty()) {
-            parts.push_back({{"functionResponse",{
-                {"name", m.name.empty() ? "tool" : m.name},
-                {"response", {{"result", m.content}}}
-            }}});
-        } else if (!m.content.empty()) {
-            parts.push_back({{"text", m.content}});
-        }
-        // Gemini: assistant tool_calls → functionCall parts
-        if (m.role == "assistant" && !m.tool_calls.is_null()) {
-            for (const auto& tc : m.tool_calls) {
-                json args = tc.contains("arguments") ? tc["arguments"] : json::object();
-                if (args.is_string()) try { args = json::parse(args.get<std::string>()); } catch (...) {}
-                std::string fn_name = tc.contains("function")
-                    ? tc["function"].value("name","") : tc.value("name","");
-                parts.push_back({{"functionCall",{{"name",fn_name},{"args",args}}}});
-            }
-        }
-        if (!parts.empty())
-            contents.push_back({{"role",role},{"parts",parts}});
-    }
+    for (const auto& m : messages) if (m.role == "system") system_instruction = m.content;
+    json contents = gemini_build_contents(messages);
 
     json body = {{"contents", contents}};
     json gen_config = {{"temperature", temperature}, {"maxOutputTokens", cfg_.max_tokens}};
@@ -965,23 +936,7 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
         g_last_token_usage.total_tokens  = u.value("totalTokenCount", 0L);
     }
 
-    LLMResponse result;
-    if (j.contains("candidates") && j["candidates"].is_array() && !j["candidates"].empty()
-        && j["candidates"][0].contains("content")
-        && j["candidates"][0]["content"].contains("parts")) {
-        const auto& parts = j["candidates"][0]["content"]["parts"];
-        for (const auto& p : parts) {
-            if (p.contains("text")) result.content += p["text"].get<std::string>();
-            if (p.contains("functionCall")) {
-                LLMToolCall tc;
-                tc.name = p["functionCall"].value("name","");
-                tc.arguments = p["functionCall"].value("args", json::object());
-                tc.id = "gemini_" + tc.name;
-                result.tool_calls.push_back(std::move(tc));
-            }
-        }
-    }
-    return result;
+    return gemini_parse_chat(j);   // D113 — 捕获 thoughtSignature/函数调用 id
 }
 
 void GeminiProvider::complete_stream(const std::string& prompt,
@@ -1588,6 +1543,10 @@ json WorkflowPlanner::extract_json(const std::string& text) {
     std::regex obj(R"(\{[\s\S]+\})");
     if (std::regex_search(text, m, obj)) try { return json::parse(m[0].str()); } catch (const std::exception& e) {
         log_msg(LogLevel::LOG_DEBUG, "Planner", std::string("regex parse failed: ") + e.what());
+    }
+    // D108 — 确定性 JSON 修复兜底（去围栏/单引号/尾随逗号/注释/截断 LIFO 补全）
+    try { return json::parse(repair_json(text)); } catch (const std::exception& e) {
+        log_msg(LogLevel::LOG_DEBUG, "Planner", std::string("repair parse failed: ") + e.what());
     }
     throw PlanningError("Cannot extract JSON from LLM response: " + text.substr(0, 300));
 }
@@ -3788,10 +3747,13 @@ AgentResult WorkflowEngine::run_agent_native(const std::string& task, int max_it
             // Build assistant message with ALL tool_calls for conversation history
             json tc_json = json::array();
             for (const auto& c : resp.tool_calls) {
-                tc_json.push_back({
+                json one = {
                     {"id", c.id}, {"type", "function"},
                     {"function", {{"name", c.name}, {"arguments", c.arguments.dump()}}}
-                });
+                };
+                if (!c.thought_signature.empty())            // D113 — Gemini 3.x 多轮工具调用
+                    one["thoughtSignature"] = c.thought_signature;
+                tc_json.push_back(std::move(one));
             }
             messages.push_back({"assistant", resp.content, tc_json, "", ""});
 
@@ -4421,35 +4383,99 @@ json McpClient::initialize(const std::string& client_name, const std::string& ve
     return result;
 }
 
-std::vector<ToolDef> McpClient::list_tools() {
+// D104 — 通用游标分页：循环拉取直到没有 nextCursor（修正只取首页的截断 bug）。
+// 安全：对页数与游标重复设上限，避免恶意/异常服务器返回恒定 nextCursor 造成死循环。
+void McpClient::paginate(const std::string& method, const std::string& key,
+                         const std::function<void(const json&)>& fn) {
     if (!initialized_) throw McpError("MCP: not initialized");
-    discovered_tools_.clear();
-    // D104 — 游标分页：循环拉取直到没有 nextCursor（修正只取首页的截断 bug）。
-    // 安全：对页数与游标重复设上限，避免恶意/异常服务器返回恒定 nextCursor 造成死循环。
     std::string cursor, prev_cursor;
     const int kMaxPages = 1000;
     for (int page = 0; page < kMaxPages; ++page) {
         json params = json::object();
         if (!cursor.empty()) params["cursor"] = cursor;
-        auto result = make_request("tools/list", params);
-        if (result.contains("tools") && result["tools"].is_array()) {
-            for (const auto& t : result["tools"]) {
-                ToolDef def;
-                def.name        = t.value("name", "");
-                def.description = t.value("description", "");
-                def.input_schema  = t.value("inputSchema", json::object());
-                def.output_schema = t.value("outputSchema", json::object());
-                if (t.contains("annotations"))            // D104 — 工具注解
-                    def.annotations = ToolAnnotations::from_json(t["annotations"]);
-                discovered_tools_.push_back(def);
-            }
-        }
+        auto result = make_request(method, params);
+        if (result.contains(key) && result[key].is_array())
+            for (const auto& item : result[key]) fn(item);
         prev_cursor = cursor;
         cursor = (result.contains("nextCursor") && result["nextCursor"].is_string())
                  ? result["nextCursor"].get<std::string>() : "";
         if (cursor.empty() || cursor == prev_cursor) break;  // 终止 / 防卡死
     }
+}
+
+std::vector<ToolDef> McpClient::list_tools() {
+    discovered_tools_.clear();
+    paginate("tools/list", "tools", [this](const json& t) {
+        ToolDef def;
+        def.name          = t.value("name", "");
+        def.description   = t.value("description", "");
+        def.input_schema  = t.value("inputSchema", json::object());
+        def.output_schema = t.value("outputSchema", json::object());
+        if (t.contains("annotations"))                // D104 — 工具注解
+            def.annotations = ToolAnnotations::from_json(t["annotations"]);
+        discovered_tools_.push_back(def);
+    });
     return discovered_tools_;
+}
+
+// D111 — 资源 ----------------------------------------------------------
+std::vector<McpResource> McpClient::list_resources() {
+    std::vector<McpResource> out;
+    paginate("resources/list", "resources",
+             [&out](const json& r) { out.push_back(McpResource::from_json(r)); });
+    return out;
+}
+
+std::vector<McpResourceContent> McpClient::read_resource_all(const std::string& uri) {
+    if (!initialized_) throw McpError("MCP: not initialized");
+    auto result = make_request("resources/read", {{"uri", uri}});
+    std::vector<McpResourceContent> out;
+    if (result.contains("contents") && result["contents"].is_array())
+        for (const auto& c : result["contents"])
+            out.push_back(McpResourceContent::from_json(c));
+    return out;
+}
+
+McpResourceContent McpClient::read_resource(const std::string& uri) {
+    auto all = read_resource_all(uri);
+    if (all.empty()) throw McpError("MCP: empty resource contents for " + uri);
+    return all.front();
+}
+
+// D112 — 提示 ----------------------------------------------------------
+std::vector<McpPrompt> McpClient::list_prompts() {
+    std::vector<McpPrompt> out;
+    paginate("prompts/list", "prompts",
+             [&out](const json& p) { out.push_back(McpPrompt::from_json(p)); });
+    return out;
+}
+
+std::vector<ChatMessage> McpClient::get_prompt(const std::string& name, const json& arguments) {
+    if (!initialized_) throw McpError("MCP: not initialized");
+    json params = {{"name", name}};
+    if (!arguments.is_null() && !arguments.empty()) params["arguments"] = arguments;
+    auto result = make_request("prompts/get", params);
+    std::vector<ChatMessage> msgs;
+    if (result.contains("messages") && result["messages"].is_array()) {
+        for (const auto& m : result["messages"]) {
+            std::string role = m.value("role", "user");
+            std::string text;
+            if (m.contains("content")) {
+                const auto& content = m["content"];
+                if (content.is_object()) {
+                    const std::string type = content.value("type", "");
+                    if (type == "text") text = content.value("text", "");
+                    else if (type == "resource" && content.contains("resource"))
+                        text = content["resource"].value("text", content["resource"].dump());
+                    else text = content.dump();          // image/audio 等：保留原始 JSON
+                } else if (content.is_string()) {
+                    text = content.get<std::string>();
+                }
+            }
+            msgs.push_back(ChatMessage::text(role, text));
+        }
+    }
+    return msgs;
 }
 
 json McpClient::call_tool(const std::string& name, const json& arguments) {

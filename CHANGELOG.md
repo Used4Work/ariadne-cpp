@@ -2,6 +2,33 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.11.0] - 2026-06-25
+
+Theme: **Defense, rigor & provider correctness.** Researched against live June 2026 docs (CaMeL / lethal-trifecta agent security, OWASP LLM06 excessive agency, τ²-bench eval rigor, ADK/LangSmith trajectory evals, MCP 2025-11-25 resources/prompts, Gemini 3.x thought signatures, Anthropic `output_config.effort` GA + prompt caching).
+
+### Added
+- **Lethal-trifecta taint tracking** (D106): `TaintTracker` + `ToolCapability` implement the deterministic data-flow defense behind spotlighting (which is only probabilistic). Once untrusted content enters context, `blocks_external_send()` flags any externally-communicating tool — injected instructions can't weaponize an exfiltration tool. CaMeL is 77% provably-secure on AgentDojo; this is the structural complement to D100.
+- **Risk-tiered tool authorization** (D107): `ToolAuthorizationPolicy` maps tools to `ToolRiskLevel` (Auto / Confirm / DualConfirm / Deny), **fail-closed** by default (unknown tools require approval, never silent Auto). `approval_checksum()` binds an approval to the exact `(tool, args)` so a token can't be replayed on a different action (OWASP LLM06 "complete mediation").
+- **Deterministic JSON repair** (D108): `repair_json()` / `parse_json_lenient()` — single-pass char scanner (no ML, no regex) that strips markdown fences, leading/trailing prose, trailing commas, single quotes and `//`+`/* */` comments, and LIFO-closes unclosed strings/objects/arrays on truncation. Wired as the final fallback in `WorkflowPlanner::extract_json()`. Providers' "structured output" under-enforces complex schemas (OpenAI ~29% empirical coverage on hard schemas), so robust parsing matters.
+- **Eval statistical rigor** (D109): `wilson_interval()` (small-sample binomial CI), `pass_at_k()` (the *unbiased* Codex/HumanEval estimator `1 − C(n−c,k)/C(n,k)`), and `paired_bootstrap()` regression gate (per-case paired deltas → 95% CI; flags a regression only when the interval is entirely below zero). Deterministic (fixed seed) for CI use.
+- **Trajectory evaluation** (D110): `score_trajectory()` scores an agent's tool-call sequence against an expected one in four modes (Strict / Unordered / Superset / Subset) plus overlap (recall) and redundant-call count (efficiency) — ADK `tool_trajectory` / LangSmith `agentevals` pattern, complementing output-only scoring.
+- **MCP resources** (D111): `McpClient::list_resources()` (cursor-paginated) + `read_resource()` / `read_resource_all()` returning text-or-blob `McpResourceContent`. Lets MCP servers supply readable context for RAG. (Resource content is server-supplied and untrusted — spotlight before feeding an LLM.)
+- **MCP prompts** (D112): `McpClient::list_prompts()` (paginated) + `get_prompt(name, args)` → `std::vector<ChatMessage>`. Server-provided reusable prompt templates; complements `PromptVersionStore`. `tools/list` was refactored onto a shared `paginate()` helper (same hardened cursor loop).
+- **Anthropic prompt caching** (D114): opt-in `ProviderConfig::prompt_caching` emits `cache_control: {type:"ephemeral"}` breakpoints on the stable prefix (last tool + system) — cache reads are 0.1× input price (90% off). Stacks with the existing sorted tool defs (D65) for maximum hit rate. Model registry refresh: `ModelPricing::claude_fable()` ($10/$50), `anthropic()` routes Fable/Mythos pricing.
+- 10 new tests (261 total).
+
+### Changed
+- **Provider correctness** (D113):
+  - **Gemini 3.x multi-turn native tools** — `gemini_build_contents()` / `gemini_parse_chat()` (now testable pure helpers) capture the per-turn encrypted `thoughtSignature` and re-emit it unchanged, and thread real function-call `id`s into `functionResponse`. Without this, Gemini 3.x multi-turn tool loops degrade or 400 (a latent regression). `LLMToolCall` gains a `thought_signature` field.
+  - **Anthropic `output_config.effort`** — the unified `reasoning_effort` now maps to Anthropic's GA effort control (D83 previously skipped Anthropic); `anthropic_output_config()` carries both `format` (schema) and `effort`.
+  - **Anthropic temperature lock** — Claude Opus 4.7/4.8 and Fable/Mythos 5 reject non-default `temperature` (like GPT-5); `anthropic_locks_temperature()` omits it for those models.
+  - `none` is now a recognized reasoning-effort value (OpenAI GPT-5.1 default); Gemini maps `none`/`minimal` → `minimal`.
+  - OpenAI `complete_chat()` now sanitizes assistant `tool_calls` to OpenAI-only fields (strips `thoughtSignature`).
+
+### Security
+- **Lethal-trifecta taint tracking + risk-tiered authorization** (D106/D107): structural, deterministic defenses against prompt-injection-driven data exfiltration and excessive agency — the by-design complement to probabilistic spotlighting (D100). Fail-closed authorization + checksum-bound approval implement OWASP LLM06 "complete mediation."
+- **MCP resource content is untrusted** (D111): server-supplied resource bytes flow into prompts and must be spotlighted/guarded exactly like tool output (per MCP security best practices).
+
 ## [2.10.0] - 2026-06-24
 
 Theme: **Durability, reliability & safety.** Researched against live June 2026 docs (LangGraph durable execution + time-travel, AG-UI event streaming, τ²-bench reliability science, GPTCache semantic caching, Microsoft/Google prompt-injection spotlighting, MCP 2025-11-25 tool annotations, A2A v1.0.1 Linux Foundation).

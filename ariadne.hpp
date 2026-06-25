@@ -32,6 +32,7 @@
 #include <cctype>
 #include <cstdint>
 #include <set>
+#include <random>
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 
@@ -54,7 +55,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.10.0";
+constexpr const char* ARIADNE_VERSION = "2.11.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -86,6 +87,7 @@ struct ModelPricing {
     static ModelPricing gpt4o() { return {2.50, 10.00}; }
     static ModelPricing claude_sonnet() { return {3.00, 15.00}; }
     static ModelPricing claude_opus() { return {15.00, 75.00}; }
+    static ModelPricing claude_fable() { return {10.00, 50.00}; }  // Fable 5 / Mythos 5 旗舰 (D114)
     static ModelPricing gemini_flash() { return {0.075, 0.30}; }
     static ModelPricing gemini_pro()   { return {1.25, 5.00};  }
 };
@@ -342,6 +344,203 @@ inline std::string spotlight_text(const std::string& untrusted,
 }
 
 // ════════════════════════════════════════════════════════════════
+// 致命三元组污点追踪 (Lethal-trifecta taint tracking) — 结构化注入防御 (D106)
+//   Spotlighting (D100) 是概率性防御；CaMeL/Simon Willison「致命三元组」给出
+//   确定性的数据流防御：当一个 agent 同时拥有 (1) 访问私有数据、(2) 暴露于
+//   不可信内容、(3) 对外通信能力 —— 就可被注入指令窃取数据。
+//   核心规则：一旦不可信内容进入上下文，就阻止/升级任何「对外发送」工具
+//   （注入的指令可能借该工具外泄数据）。AgentDojo 上 CaMeL 可证明安全率 77%。
+// ════════════════════════════════════════════════════════════════
+
+/** 工具的「致命三元组」能力标记（按需由调用方为每个工具声明）。 */
+struct ToolCapability {
+    bool reads_untrusted = false; // 工具会引入不可信外部内容（网页/邮件/文件/MCP 资源）
+    bool reads_private   = false; // 工具可读取私有/敏感数据
+    bool sends_external  = false; // 工具可对外通信/外泄（发邮件、HTTP POST、发消息）
+
+    ToolCapability() = default;
+    ToolCapability(bool untrusted, bool priv, bool ext)
+        : reads_untrusted(untrusted), reads_private(priv), sends_external(ext) {}
+};
+
+/** 污点追踪器：随工具执行累积「已见不可信内容 / 已读私有数据」两个污点位，
+ *  并据此判断「对外发送」工具此刻是否构成致命三元组风险。线程内使用即可。 */
+class TaintTracker {
+public:
+    void mark_untrusted() { seen_untrusted_ = true; }
+    void mark_private()   { seen_private_   = true; }
+    /** 工具运行后调用：根据其能力更新污点位。 */
+    void observe(const ToolCapability& cap) {
+        if (cap.reads_untrusted) seen_untrusted_ = true;
+        if (cap.reads_private)   seen_private_   = true;
+    }
+    bool tainted()        const { return seen_untrusted_; }
+    bool seen_untrusted() const { return seen_untrusted_; }
+    bool seen_private()   const { return seen_private_; }
+    void reset() { seen_untrusted_ = false; seen_private_ = false; }
+
+    /** 致命三元组检查：此刻派发一个「对外发送」工具是否危险？
+     *  require_private=false（默认，高召回）：只要已见不可信内容即拦截
+     *    —— 注入的指令可能借此工具外泄；
+     *  require_private=true：仅在完整三元组（不可信 + 私有 + 对外）时拦截。 */
+    bool blocks_external_send(const ToolCapability& cap, bool require_private = false) const {
+        if (!cap.sends_external) return false;
+        return require_private ? (seen_untrusted_ && seen_private_) : seen_untrusted_;
+    }
+private:
+    bool seen_untrusted_ = false;
+    bool seen_private_   = false;
+};
+
+// ════════════════════════════════════════════════════════════════
+// 风险分级工具授权 (Risk-tiered tool authorization) — OWASP LLM06 (D107)
+//   「过度代理」(Excessive Agency) 的官方缓解：最小权限 + 高危操作需人工
+//   批准 + 「完全中介」(在宿主层而非让 LLM 自行决定能否执行)。
+//   实践：map<tool, RiskLevel> → 自动/单人批准/双人批准/拒绝；fail-closed
+//   (未知工具走保守默认，绝不静默放行)；并把批准用 args 校验和绑定，
+//   避免「批准 A 操作的令牌被复用到 B 操作」(complete mediation)。
+// ════════════════════════════════════════════════════════════════
+
+enum class ToolRiskLevel {
+    Auto,        // 无需确认直接执行
+    Confirm,     // 需一次人工批准
+    DualConfirm, // 需两次独立批准（双人复核）
+    Deny         // 永不允许
+};
+
+enum class AuthDecision { Allow, NeedsApproval, NeedsDualApproval, Block };
+
+/** 工具授权策略：按工具名给出风险级别与放行决定。默认 fail-closed。 */
+class ToolAuthorizationPolicy {
+public:
+    explicit ToolAuthorizationPolicy(ToolRiskLevel default_level = ToolRiskLevel::Confirm)
+        : default_(default_level) {}
+
+    void set_risk(const std::string& tool, ToolRiskLevel level) { levels_[tool] = level; }
+    void allow(const std::string& tool) { levels_[tool] = ToolRiskLevel::Auto; }
+    void deny (const std::string& tool) { levels_[tool] = ToolRiskLevel::Deny; }
+
+    ToolRiskLevel risk_of(const std::string& tool) const {
+        auto it = levels_.find(tool);
+        return it != levels_.end() ? it->second : default_;
+    }
+
+    /** fail-closed：未注册工具走 default_（默认 Confirm，绝不静默 Auto）。 */
+    AuthDecision decide(const std::string& tool) const {
+        switch (risk_of(tool)) {
+            case ToolRiskLevel::Auto:        return AuthDecision::Allow;
+            case ToolRiskLevel::Confirm:     return AuthDecision::NeedsApproval;
+            case ToolRiskLevel::DualConfirm: return AuthDecision::NeedsDualApproval;
+            case ToolRiskLevel::Deny:        return AuthDecision::Block;
+        }
+        return AuthDecision::Block;  // fail-closed（防御未知枚举值）
+    }
+
+    /** 把批准绑定到具体 (tool, args)：FNV-1a 校验和。nlohmann::json 默认按键
+     *  排序，dump() 即规范形式，故同一动作产生同一校验和。 */
+    static std::string approval_checksum(const std::string& tool, const json& args) {
+        std::string canonical = tool + "\x1f" + (args.is_null() ? std::string() : args.dump());
+        unsigned long long h = 1469598103934665603ULL;        // FNV-1a 64 offset basis
+        for (unsigned char c : canonical) { h ^= c; h *= 1099511628211ULL; }
+        static const char* hx = "0123456789abcdef";
+        std::string out; out.reserve(16);
+        for (int i = 60; i >= 0; i -= 4) out += hx[(h >> i) & 0xF];
+        return out;
+    }
+    /** 校验批准令牌是否与本次动作匹配（防止令牌跨动作复用）。 */
+    static bool approval_valid(const std::string& token, const std::string& tool, const json& args) {
+        return !token.empty() && token == approval_checksum(tool, args);
+    }
+private:
+    ToolRiskLevel default_;
+    std::map<std::string, ToolRiskLevel> levels_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// 确定性 JSON 修复 (Deterministic JSON repair) — 鲁棒解析 (D108)
+//   LLM「结构化输出」对复杂 schema 实测覆盖不足（OpenAI 在难 schema 上仅
+//   ~29%），且常返回带 markdown 围栏/尾随逗号/单引号/注释/被 token 截断的
+//   JSON。本修复器单遍字符扫描（零 ML、零 regex）修复常见坏形：
+//   去围栏、抽取首个 {/[ 到末个 }/]、单引号转双引号、删尾随逗号、删注释、
+//   截断时按 LIFO 补全未闭合的字符串/对象/数组。
+// ════════════════════════════════════════════════════════════════
+
+/** 尝试把可能损坏的 LLM 输出修复成可解析的 JSON 字符串。 */
+inline std::string repair_json(const std::string& input) {
+    std::string s = input;
+    // 1) 去 markdown 围栏 ```json ... ```（取围栏内内容）
+    {
+        size_t fence = s.find("```");
+        if (fence != std::string::npos) {
+            size_t start = s.find('\n', fence);
+            size_t end   = s.rfind("```");
+            if (start != std::string::npos && end != std::string::npos && end > start)
+                s = s.substr(start + 1, end - start - 1);
+        }
+    }
+    // 2) 抽取首个 {/[ 到末个 }/] 之间的跨度（去除前后散文）
+    {
+        size_t first = s.find_first_of("{[");
+        if (first != std::string::npos) {
+            size_t last = s.find_last_of("}]");
+            size_t end  = (last != std::string::npos && last >= first) ? last + 1 : s.size();
+            s = s.substr(first, end - first);
+        }
+    }
+    // 3) 单遍扫描修复
+    std::string out;
+    out.reserve(s.size() + 8);
+    std::vector<char> stack;   // 记录开启的 {/[，用于补全与尾随逗号判定
+    bool in_str = false;
+    char quote  = '"';
+    bool escaped = false;
+    const size_t n = s.size();
+    for (size_t i = 0; i < n; ++i) {
+        char c = s[i];
+        if (in_str) {
+            if (escaped) { out += c; escaped = false; continue; }
+            if (c == '\\') { out += c; escaped = true; continue; }
+            if (quote == '\'') {                 // 单引号串：规范化为合法 JSON 双引号串
+                if (c == '\'') { out += '"'; in_str = false; continue; }
+                if (c == '"')  { out += "\\\""; continue; }  // 转义内部双引号
+                out += c; continue;
+            }
+            out += c;                            // 双引号串：原样
+            if (c == '"') in_str = false;
+            continue;
+        }
+        // 字符串外
+        if (c == '/' && i + 1 < n && s[i+1] == '/') {        // 行注释
+            size_t nl = s.find('\n', i); if (nl == std::string::npos) break; i = nl; continue;
+        }
+        if (c == '/' && i + 1 < n && s[i+1] == '*') {        // 块注释
+            size_t cl = s.find("*/", i + 2); if (cl == std::string::npos) break; i = cl + 1; continue;
+        }
+        if (c == '"' || c == '\'') { in_str = true; quote = c; out += '"'; continue; }
+        if (c == '{' || c == '[') { stack.push_back(c); out += c; continue; }
+        if (c == '}' || c == ']') { if (!stack.empty()) stack.pop_back(); out += c; continue; }
+        if (c == ',') {                                      // 删尾随逗号
+            size_t j = i + 1;
+            while (j < n && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r')) ++j;
+            if (j < n && (s[j] == '}' || s[j] == ']')) continue;  // 丢弃
+            out += c; continue;
+        }
+        out += c;
+    }
+    // 4) 截断补全：LIFO 闭合悬空字符串与未闭合结构
+    if (in_str) out += '"';
+    for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+        out += (*it == '{') ? '}' : ']';
+    return out;
+}
+
+/** 宽松解析：先直接 parse，失败再 repair 后 parse（仍失败则抛 json::parse_error）。 */
+inline json parse_json_lenient(const std::string& text) {
+    try { return json::parse(text); } catch (...) {}
+    return json::parse(repair_json(text));   // 仍失败则向上抛出
+}
+
+// ════════════════════════════════════════════════════════════════
 // OpenTelemetry GenAI 追踪导出 (D87)
 // 遵循 OTel GenAI semantic conventions（gen_ai.* 属性）。
 // 无外部依赖：导出为 OTLP-JSON 形态的 span，由用户接入采集器。
@@ -458,14 +657,17 @@ struct ProviderConfig {
     std::string  completions_path = "";   // 空 = /v1/chat/completions
     double       max_rps          = 0.0;  // 每秒最大请求数；0=不限速
     ModelPricing pricing;                 // 自动成本追踪
-    std::string  reasoning_effort = "";   // ""|minimal|low|medium|high|xhigh (D83/D84)
+    std::string  reasoning_effort = "";   // ""|none|minimal|low|medium|high|xhigh (D83/D84/D113)
     std::string  verbosity        = "";   // OpenAI GPT-5: low|medium|high (D84)
     bool         strict_tools     = false;// provider 端严格工具 schema 校验 (D84/D85)
+    bool         prompt_caching   = false;// D114 — Anthropic cache_control 缓存断点（默认关）
 
     static ProviderConfig anthropic(const std::string& key,
                                      const std::string& model = "claude-opus-4-8") {
         ProviderConfig c{ProviderType::ANTHROPIC, key, model, "", 4096, 60.0, ""};
-        c.pricing = (model.find("opus") != std::string::npos) ? ModelPricing::claude_opus() :
+        c.pricing = (model.find("fable") != std::string::npos ||
+                     model.find("mythos") != std::string::npos) ? ModelPricing::claude_fable() :
+                    (model.find("opus") != std::string::npos)   ? ModelPricing::claude_opus() :
                     ModelPricing::claude_sonnet();
         return c;
     }
@@ -552,17 +754,59 @@ inline bool is_gpt5_family(const std::string& model) {
     return model.find("gpt-5") != std::string::npos;
 }
 
-/** reasoning effort → Gemini 3 thinking_level（空串=不设置；xhigh 归一为 high）(D83) */
+/** reasoning effort → Gemini 3 thinking_level（空串=不设置；none/minimal→minimal；
+ *  xhigh 归一为 high）(D83/D113)。Gemini 3.x 思考常开，最小档为 minimal。 */
 inline std::string gemini_thinking_level(const std::string& effort) {
+    if (effort == "none" || effort == "minimal") return "minimal";
     if (effort == "xhigh") return "high";
-    if (effort == "minimal" || effort == "low" || effort == "medium" || effort == "high")
-        return effort;
+    if (effort == "low" || effort == "medium" || effort == "high") return effort;
     return "";  // 空串或未知值：不设置
 }
 
-/** Anthropic GA 结构化输出体：output_config.format（替代旧 response_format）(D85) */
-inline json anthropic_output_config(const json& schema) {
-    return {{"format", {{"type", "json_schema"}, {"schema", schema}}}};
+/** reasoning effort → Anthropic output_config.effort（low|medium|high|xhigh|max）(D113)。
+ *  none/minimal 归一为 low（Anthropic 最小档为 low）；空串/未知=不设置。 */
+inline std::string anthropic_effort(const std::string& effort) {
+    if (effort == "none" || effort == "minimal") return "low";
+    if (effort == "low" || effort == "medium" || effort == "high" ||
+        effort == "xhigh" || effort == "max")
+        return effort;
+    return "";
+}
+
+/** 这些 Anthropic 模型拒绝非默认 temperature（同 GPT-5 处理）(D113)。 */
+inline bool anthropic_locks_temperature(const std::string& model) {
+    return model.find("opus-4-8") != std::string::npos
+        || model.find("opus-4-7") != std::string::npos
+        || model.find("fable")    != std::string::npos
+        || model.find("mythos")   != std::string::npos;
+}
+
+/** Anthropic GA output_config：结构化输出 format（D85）+ 推理力度 effort（D113）。
+ *  schema/effort 任一存在即生成对应字段；都为空则返回空对象。 */
+inline json anthropic_output_config(const json& schema, const std::string& effort = "") {
+    json oc = json::object();
+    if (!schema.is_null() && !schema.empty())
+        oc["format"] = {{"type", "json_schema"}, {"schema", schema}};
+    std::string e = anthropic_effort(effort);
+    if (!e.empty()) oc["effort"] = e;
+    return oc;
+}
+
+/** D114 — Anthropic 提示缓存：对稳定前缀（tools 末项 + system）打 ephemeral 缓存断点。
+ *  缓存读取仅 0.1× 输入价（省 90%）。≤4 断点；与已排序的工具定义(D65)叠加最大化命中。 */
+inline void apply_anthropic_cache_control(json& body) {
+    json cc = {{"type", "ephemeral"}};
+    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty())
+        body["tools"].back()["cache_control"] = cc;
+    if (body.contains("system")) {
+        if (body["system"].is_string()) {
+            std::string sys = body["system"].get<std::string>();
+            if (!sys.empty())
+                body["system"] = json::array({{{"type","text"},{"text",sys},{"cache_control",cc}}});
+        } else if (body["system"].is_array() && !body["system"].empty()) {
+            body["system"].back()["cache_control"] = cc;
+        }
+    }
 }
 
 struct ToolDef;  // forward declaration
@@ -945,9 +1189,10 @@ struct ChatMessage {
 };
 
 struct LLMToolCall {
-    std::string id;             // provider 分配的 call ID
-    std::string name;           // 工具名
-    json        arguments;      // 工具参数（已解析的 JSON）
+    std::string id;                // provider 分配的 call ID
+    std::string name;              // 工具名
+    json        arguments;         // 工具参数（已解析的 JSON）
+    std::string thought_signature; // D113 — Gemini 3.x 加密推理签名（多轮工具调用须原样回传）
 };
 
 struct LLMResponse {
@@ -955,6 +1200,87 @@ struct LLMResponse {
     std::vector<LLMToolCall> tool_calls;
     bool has_tool_calls() const { return !tool_calls.empty(); }
 };
+
+// ── D113 — Gemini 3.x 多轮原生工具调用：thoughtSignature + 函数调用 id 透传 ──
+//   Gemini 3.x 在 functionCall part 上返回加密的 thoughtSignature；无状态多轮
+//   工具调用「必须」原样回传，否则推理链断裂、函数调用可能 400。函数调用 id
+//   亦需在 functionResponse 中回带匹配。以下两个纯函数把往返逻辑做成可离线单测。
+
+/** 把会话消息构建为 Gemini contents 数组（透传 thoughtSignature 与函数调用 id）。 */
+inline json gemini_build_contents(const std::vector<ChatMessage>& messages) {
+    json contents = json::array();
+    for (const auto& m : messages) {
+        if (m.role == "system") continue;             // systemInstruction 单独处理
+        std::string role = (m.role == "assistant") ? "model" : "user";
+        if (m.role == "tool") role = "user";
+        json parts = json::array();
+        if (m.is_multimodal()) {
+            for (const auto& p : m.content_parts) {
+                if (p.value("type","") == "text")
+                    parts.push_back({{"text", p.value("text","")}});
+                else if (p.value("type","") == "image_url") {
+                    std::string url = p["image_url"].value("url","");
+                    if (url.find("data:") == 0) {
+                        auto comma = url.find(','); auto semi = url.find(';');
+                        std::string mt = (semi != std::string::npos) ? url.substr(5, semi-5) : "image/jpeg";
+                        std::string data = (comma != std::string::npos) ? url.substr(comma+1) : "";
+                        parts.push_back({{"inline_data",{{"mime_type",mt},{"data",data}}}});
+                    }
+                }
+            }
+        } else if (m.role == "tool" || !m.tool_call_id.empty()) {
+            json fr = {{"name", m.name.empty() ? "tool" : m.name},
+                       {"response", {{"result", m.content}}}};
+            // 真实 Gemini 函数调用 id（非合成的 "gemini_" 前缀）才回带匹配
+            if (!m.tool_call_id.empty() && m.tool_call_id.rfind("gemini_", 0) != 0)
+                fr["id"] = m.tool_call_id;
+            parts.push_back({{"functionResponse", fr}});
+        } else if (!m.content.empty()) {
+            parts.push_back({{"text", m.content}});
+        }
+        if (m.role == "assistant" && !m.tool_calls.is_null()) {
+            for (const auto& tc : m.tool_calls) {
+                json args = tc.contains("arguments") ? tc["arguments"] : json::object();
+                if (args.is_string()) try { args = json::parse(args.get<std::string>()); } catch (...) {}
+                std::string fn_name = tc.contains("function")
+                    ? tc["function"].value("name","") : tc.value("name","");
+                json part = {{"functionCall", {{"name", fn_name}, {"args", args}}}};
+                std::string sig = tc.value("thoughtSignature",
+                                           tc.value("thought_signature", std::string()));
+                if (!sig.empty()) part["thoughtSignature"] = sig;   // D113 — 原样回传
+                parts.push_back(std::move(part));
+            }
+        }
+        if (!parts.empty())
+            contents.push_back({{"role", role}, {"parts", parts}});
+    }
+    return contents;
+}
+
+/** 解析 Gemini generateContent 响应为 LLMResponse（捕获 thoughtSignature 与 id）。 */
+inline LLMResponse gemini_parse_chat(const json& j) {
+    LLMResponse result;
+    if (j.contains("candidates") && j["candidates"].is_array() && !j["candidates"].empty()
+        && j["candidates"][0].contains("content")
+        && j["candidates"][0]["content"].contains("parts")) {
+        const auto& parts = j["candidates"][0]["content"]["parts"];
+        for (const auto& p : parts) {
+            if (p.contains("text") && p["text"].is_string())
+                result.content += p["text"].get<std::string>();
+            if (p.contains("functionCall")) {
+                LLMToolCall tc;
+                tc.name      = p["functionCall"].value("name", "");
+                tc.arguments = p["functionCall"].value("args", json::object());
+                tc.id        = p["functionCall"].contains("id")
+                             ? p["functionCall"].value("id", "")
+                             : ("gemini_" + tc.name);
+                tc.thought_signature = p.value("thoughtSignature", "");  // D113 — 捕获
+                result.tool_calls.push_back(std::move(tc));
+            }
+        }
+    }
+    return result;
+}
 
 // ════════════════════════════════════════════════════════════════
 // D91 — 上下文压缩（LLM 摘要）
@@ -1843,6 +2169,144 @@ private:
     double per_case_threshold_;
 };
 
+// ════════════════════════════════════════════════════════════════
+// 评测统计严谨性 (Eval statistical rigor) — D109
+//   把「点估计阈值」升级为统计推断：Wilson 置信区间（小样本二项比例的
+//   标准做法）、无偏 pass@k 估计量（Codex/HumanEval：1 - C(n-c,k)/C(n,k)）、
+//   配对自助法回归门禁（candidate vs baseline，按 case 配对消除样本间方差；
+//   仅当 95% 区间整体 < 0 才判定回归）。纯计算、确定性（固定随机种子）。
+// ════════════════════════════════════════════════════════════════
+
+struct ConfidenceInterval { double point = 0.0, low = 0.0, high = 0.0; };
+
+/** 二项比例的 Wilson 置信区间（z=1.96 ≈ 95%）。小样本下优于正态近似。 */
+inline ConfidenceInterval wilson_interval(int successes, int n, double z = 1.96) {
+    if (n <= 0) return {0.0, 0.0, 0.0};
+    double phat  = (double)successes / n;
+    double z2    = z * z;
+    double denom = 1.0 + z2 / n;
+    double center = (phat + z2 / (2.0 * n)) / denom;
+    double margin = (z * std::sqrt(phat * (1.0 - phat) / n + z2 / (4.0 * (double)n * n))) / denom;
+    double low = center - margin, high = center + margin;
+    if (low < 0.0)  low = 0.0;
+    if (high > 1.0) high = 1.0;
+    return { phat, low, high };
+}
+
+/** 无偏 pass@k 估计量：n 次采样里 c 次正确，预算 k → 至少 1 次通过的概率。
+ *  数值稳定的乘积形式 1 - Π_{i=n-c+1..n}(1 - k/i)（等价于 1 - C(n-c,k)/C(n,k)）。*/
+inline double pass_at_k(int n, int c, int k) {
+    if (k <= 0 || n <= 0 || c <= 0) return 0.0;
+    if (n - c < k) return 1.0;          // 失败样本不足 k 个 → 必有 ≥1 通过
+    double prod = 1.0;
+    for (int i = n - c + 1; i <= n; ++i)
+        prod *= (1.0 - (double)k / i);  // n-c≥k 保证 i>k，因子恒正
+    return 1.0 - prod;
+}
+
+struct BootstrapResult {
+    double mean_delta  = 0.0;   ///< 平均 (candidate - baseline)
+    double ci_low      = 0.0;
+    double ci_high     = 0.0;
+    bool   regression  = false; ///< 区间整体 < 0：candidate 显著更差
+    bool   improvement = false; ///< 区间整体 > 0：candidate 显著更好
+};
+
+/** 配对自助法：deltas[i] = candidate_i - baseline_i（按 case 配对）。
+ *  重采样 iterations 次求均值分布，取 (alpha/2, 1-alpha/2) 分位为置信区间。
+ *  固定 seed → 确定性、可复现（CI 门禁友好）。 */
+inline BootstrapResult paired_bootstrap(const std::vector<double>& deltas,
+                                        int iterations = 10000,
+                                        unsigned long seed = 42,
+                                        double alpha = 0.05) {
+    BootstrapResult r;
+    const size_t m = deltas.size();
+    if (m == 0 || iterations <= 0) return r;
+    double sum = 0.0; for (double d : deltas) sum += d;
+    r.mean_delta = sum / m;
+    std::mt19937 rng((std::mt19937::result_type)seed);
+    std::uniform_int_distribution<size_t> pick(0, m - 1);
+    std::vector<double> means; means.reserve(iterations);
+    for (int it = 0; it < iterations; ++it) {
+        double s = 0.0;
+        for (size_t j = 0; j < m; ++j) s += deltas[pick(rng)];
+        means.push_back(s / m);
+    }
+    std::sort(means.begin(), means.end());
+    size_t lo = (size_t)std::floor((alpha / 2.0) * iterations);
+    size_t hi = (size_t)std::floor((1.0 - alpha / 2.0) * iterations);
+    if (hi >= means.size()) hi = means.size() - 1;
+    r.ci_low      = means[lo];
+    r.ci_high     = means[hi];
+    r.regression  = r.ci_high < 0.0;
+    r.improvement = r.ci_low  > 0.0;
+    return r;
+}
+
+// ════════════════════════════════════════════════════════════════
+// 轨迹评测 (Trajectory evaluation) — D110
+//   除了对「最终输出」打分，还要对 agent 走过的「工具调用序列」打分
+//   （ADK tool_trajectory / LangSmith agentevals）。四种匹配模式 + 重叠度
+//   （召回）+ 冗余调用数（效率）。纯逻辑，作用于已记录的工具名序列。
+// ════════════════════════════════════════════════════════════════
+
+enum class TrajectoryMatch {
+    Strict,     // 工具名与顺序完全一致
+    Unordered,  // 多重集相等（同样的调用、不计顺序）
+    Superset,   // actual ⊇ expected（至少做了期望的全部）
+    Subset      // actual ⊆ expected（未超出期望范围）
+};
+
+struct TrajectoryScore {
+    bool   match          = false; ///< 选定模式下是否通过
+    double overlap        = 0.0;   ///< |交集| / |expected|（召回），[0,1]
+    int    expected_count = 0;
+    int    actual_count   = 0;
+    int    redundant      = 0;     ///< 超出匹配的多余调用数（效率指标）
+};
+
+/** 给一条工具调用轨迹打分。actual/expected 为工具名序列。 */
+inline TrajectoryScore score_trajectory(const std::vector<std::string>& actual,
+                                        const std::vector<std::string>& expected,
+                                        TrajectoryMatch mode = TrajectoryMatch::Unordered) {
+    TrajectoryScore r;
+    r.actual_count   = (int)actual.size();
+    r.expected_count = (int)expected.size();
+    std::map<std::string,int> ac, ec;
+    for (const auto& s : actual)   ac[s]++;
+    for (const auto& s : expected) ec[s]++;
+    int inter = 0;
+    for (const auto& kv : ec) {
+        auto it = ac.find(kv.first);
+        if (it != ac.end()) inter += std::min(kv.second, it->second);
+    }
+    r.overlap   = expected.empty() ? (actual.empty() ? 1.0 : 0.0)
+                                   : (double)inter / (double)expected.size();
+    r.redundant = std::max(0, (int)actual.size() - inter);
+    switch (mode) {
+        case TrajectoryMatch::Strict:
+            r.match = (actual == expected);
+            break;
+        case TrajectoryMatch::Unordered:
+            r.match = (ac == ec);
+            break;
+        case TrajectoryMatch::Superset: {                 // 每个 expected 键 actual 计数 ≥
+            r.match = true;
+            for (const auto& kv : ec) if (ac[kv.first] < kv.second) { r.match = false; break; }
+            break;
+        }
+        case TrajectoryMatch::Subset: {                   // 每个 actual 键 expected 计数 ≥
+            r.match = true;
+            for (const auto& kv : ac) {
+                auto it = ec.find(kv.first);
+                if (it == ec.end() || it->second < kv.second) { r.match = false; break; }
+            }
+            break;
+        }
+    }
+    return r;
+}
+
 using ToolFn = std::function<json(const json& params)>;
 
 /** D104 — MCP 工具注解（2025-11-25 spec，信任/安全元数据）。
@@ -2532,7 +2996,64 @@ private:
 #endif
 };
 
-/** MCP 客户端：初始化 → 工具发现 → 工具调用 */
+// ── D111 — MCP 资源 (resources/list · resources/read) ────────────
+//   服务器暴露的可读上下文（文件/数据库行/API 响应…）。⚠️ 资源内容来自
+//   服务器，**不可信**，喂给 LLM 前应配合 spotlight_text()（与工具输出同理）。
+
+/** 资源元数据（resources/list 的一项）。 */
+struct McpResource {
+    std::string uri, name, title, description, mime_type;
+    long long   size = -1;   // 字节数；-1 = 未知
+    static McpResource from_json(const json& j) {
+        McpResource r;
+        if (!j.is_object()) return r;
+        r.uri = j.value("uri", ""); r.name = j.value("name", "");
+        r.title = j.value("title", ""); r.description = j.value("description", "");
+        r.mime_type = j.value("mimeType", "");
+        if (j.contains("size") && j["size"].is_number_integer()) r.size = j["size"].get<long long>();
+        return r;
+    }
+};
+
+/** 资源内容块（resources/read 的 contents[] 一项）；text 与 blob(base64) 二选一。 */
+struct McpResourceContent {
+    std::string uri, mime_type, text, blob;
+    bool is_binary() const { return !blob.empty() && text.empty(); }
+    static McpResourceContent from_json(const json& j) {
+        McpResourceContent c;
+        if (!j.is_object()) return c;
+        c.uri = j.value("uri", ""); c.mime_type = j.value("mimeType", "");
+        c.text = j.value("text", ""); c.blob = j.value("blob", "");
+        return c;
+    }
+};
+
+// ── D112 — MCP 提示 (prompts/list · prompts/get) ─────────────────
+//   服务器提供的可复用提示模板，与 PromptVersionStore 互补。
+
+struct McpPromptArgument { std::string name, description; bool required = false; };
+
+/** 提示元数据（prompts/list 的一项）。 */
+struct McpPrompt {
+    std::string name, title, description;
+    std::vector<McpPromptArgument> arguments;
+    static McpPrompt from_json(const json& j) {
+        McpPrompt p;
+        if (!j.is_object()) return p;
+        p.name = j.value("name", ""); p.title = j.value("title", "");
+        p.description = j.value("description", "");
+        if (j.contains("arguments") && j["arguments"].is_array())
+            for (const auto& a : j["arguments"]) {
+                McpPromptArgument arg;
+                arg.name = a.value("name", ""); arg.description = a.value("description", "");
+                arg.required = a.value("required", false);
+                p.arguments.push_back(std::move(arg));
+            }
+        return p;
+    }
+};
+
+/** MCP 客户端：初始化 → 工具/资源/提示发现 → 调用 */
 class McpClient {
 public:
     explicit McpClient(std::unique_ptr<IMcpTransport> transport);
@@ -2542,8 +3063,17 @@ public:
                      const std::string& ver = ARIADNE_VERSION);
     std::vector<ToolDef> list_tools();
     json call_tool(const std::string& name, const json& arguments);
-    void close();
 
+    // D111 — 资源
+    std::vector<McpResource>        list_resources();
+    McpResourceContent              read_resource(const std::string& uri);        // 首个内容块
+    std::vector<McpResourceContent> read_resource_all(const std::string& uri);    // 全部内容块
+    // D112 — 提示
+    std::vector<McpPrompt>          list_prompts();
+    std::vector<ChatMessage>        get_prompt(const std::string& name,
+                                               const json& arguments = json::object());
+
+    void close();
     void register_all_tools(ToolRegistry& registry);
 
 private:
@@ -2553,6 +3083,9 @@ private:
     std::vector<ToolDef> discovered_tools_;
 
     json make_request(const std::string& method, const json& params = json::object());
+    // 通用游标分页：对 method 反复请求直到无 nextCursor，对 result[key] 每项调用 fn。
+    void paginate(const std::string& method, const std::string& key,
+                  const std::function<void(const json&)>& fn);
 };
 
 // ════════════════════════════════════════════════════════════════
