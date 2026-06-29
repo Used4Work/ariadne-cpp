@@ -1,5 +1,5 @@
 {
-  "_updated": "2026-06-15",
+  "_updated": "2026-06-29",
   "providers": {
     "anthropic": {
       "api_endpoint": "https://api.anthropic.com/v1/messages",
@@ -116,6 +116,31 @@
         },
         {
           "id": "meta/meta-llama-3.1-405b-instruct",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "meta/meta-llama-3.1-8b-instruct",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "microsoft/phi-4",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "microsoft/phi-4-mini-instruct",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "microsoft/phi-4-mini-reasoning",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "microsoft/phi-4-multimodal-instruct",
           "role": "subagent",
           "note": "auto"
         }
