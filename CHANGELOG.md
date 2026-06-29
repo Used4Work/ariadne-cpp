@@ -2,6 +2,30 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.12.0] - 2026-06-29
+
+Theme: **Correctness, structural security & orchestration guardrails.** Researched against live June 2026 sources (CaMeL / IFC agent security, OWASP LLM03 supply chain + Agentic T8 repudiation, ASCII-smuggling / EchoLeak exfiltration, MAST multi-agent failure taxonomy, MCP 2025-11-25 transport spec, Anthropic / Gemini / OpenAI provider docs), adversarially verified across four research passes.
+
+### Fixed (correctness — found by research, verified against primary docs)
+- **Gemini `thinking_level` invalid value** (D115): `gemini_thinking_level()` no longer emits `"minimal"` — Gemini 3.x only accepts `low`/`medium`/`high` and 400s on `minimal` (D83/D113 had mapped `none`/`minimal` → `minimal`, a latent bug). Now `none`/`minimal` → `low`.
+- **Anthropic version header** (D115): `anthropic-version` was `2024-10-22` (a model-snapshot date, never a valid header value) at all three call sites → corrected to `2023-06-01` (the documented current version).
+- **Anthropic refusal handling** (D115): a safety refusal returns HTTP 200 with `stop_reason:"refusal"` and `content:[]`; `complete()` / `complete_chat()` now surface this as a clear `ProviderError` instead of a generic "empty content" / out-of-bounds read.
+- **MCP Streamable-HTTP `Accept` header** (D116): now sends `application/json, text/event-stream` (the spec MUST) and parses an SSE-framed JSON-RPC response via `mcp_extract_sse_message()` — previously only `application/json` was accepted, so a spec-conformant streaming server broke the client. Also: `initialize()` now records + validates the negotiated `protocolVersion` (disconnects on an unsupported one).
+
+### Added
+- **Invisible-Unicode + role-marker sanitizers** (D117): `strip_invisible_unicode()` removes Tags-block / variation-selector / zero-width / invisible-math code points (ASCII-smuggling injection + covert exfiltration channel); `sanitize_role_markers()` strips chat-template delimiters (`<|im_start|>`, `[INST]`, …) to block fake-turn injection.
+- **Tool-manifest pinning** (D118): `tool_manifest_hash()` + `ToolPinStore` (pin / verify → Unknown·Unchanged·Drifted / diff) detect MCP rug-pull / tool-poisoning drift; fail-closed (first-seen and drifted both require re-approval). Generalizes D107's `approval_checksum` to the full tool manifest. OWASP LLM03.
+- **Egress allowlist** (D119): `EgressAllowlist` (scheme + host allowlist, rejects IP-literals / `data:` / `file:`, blocks suffix confusion) + `extract_markdown_urls()` deterministically sever the exfiltration leg of the lethal trifecta (EchoLeak / CVE-2025-32711 class). Complements D106 taint: taint decides *if*, allowlist decides *where*.
+- **Tamper-evident audit log** (D120): self-contained `sha256_hex()` + `AuditLog` — a SHA-256 hash chain where any edit/delete/reorder is located by `verify()`. OWASP Agentic T8 (Repudiation & Untraceability); genuinely cryptographic, unlike an FNV chain.
+- **Plan linter** (D121): `PlanLinter` runs deterministic structural lint over a `WorkflowPlan` *before* the executor spends tokens — dangling/undefined deps, dup/empty ids, self-deps, empty actions, json-step-without-schema, fan-out width, dependency cycles; built-in rules + `add_rule` extensibility. MAST: ~42% of multi-agent failures are pre-execution-catchable spec/structure defects.
+- **Rubric scoring** (D122): `rubric_score()` / `rubric_score_ensemble()` — multi-criteria weighted LLM-judge scoring (`clamp01(Σ vᵢ·wᵢ / Σ w⁺)`, negative weights = penalties) with Majority / Weighted / Unanimous / Any ensembles. Rubric decomposition is the documented fix for the style/verbosity judge bias that still dominates on frontier judges.
+- **Note store** (D123): `NoteStore` — a structured, serializable scratchpad *outside* the context window (put / append / str_replace / erase / render-within-budget); the Anthropic memory-tool pattern, with incremental edits to avoid context collapse. Distinct from D91 compaction (which summarizes the live transcript).
+- **Memory write-path** (D124): `FactUpsertPolicy` decides ADD / UPDATE / REMOVE / NOOP for a candidate fact against its top-s neighbors (cosine thresholds + optional injected LLM relation fn) — the Mem0 4-op dedup-merge that a bare vector store lacks.
+- 11 new tests (272 total).
+
+### Security
+- This release is security-led: four of the ten additions are deterministic, structural defenses — D117 invisible-Unicode / role-marker stripping (LLM01), D118 tool-manifest pinning (LLM03), D119 egress allowlist (LLM02), D120 tamper-evident audit log (Agentic T8) — closing standards-mandated gaps with **no new dependencies**. They layer with the existing taint tracker (D106), risk-tiered authorization (D107), and spotlighting (D100). The new `sha256_hex()` is a real cryptographic hash (not FNV), so the audit chain is tamper-*evident against a forging adversary*, not merely accident-detecting.
+
 ## [2.11.0] - 2026-06-25
 
 Theme: **Defense, rigor & provider correctness.** Researched against live June 2026 docs (CaMeL / lethal-trifecta agent security, OWASP LLM06 excessive agency, τ²-bench eval rigor, ADK/LangSmith trajectory evals, MCP 2025-11-25 resources/prompts, Gemini 3.x thought signatures, Anthropic `output_config.effort` GA + prompt caching).

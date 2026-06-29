@@ -206,7 +206,7 @@ std::string AnthropicProvider::complete(const std::string& prompt,
     auto resp = http_post(base + "/v1/messages",
         {"Content-Type: application/json",
          "x-api-key: " + cfg_.api_key,
-         "anthropic-version: 2024-10-22"},
+         "anthropic-version: 2023-06-01"},
         body.dump());
     if (resp.status_code == 429 || resp.status_code == 503) {
         std::string msg = "Anthropic: " + std::to_string(resp.status_code) + " rate limited";
@@ -221,6 +221,10 @@ std::string AnthropicProvider::complete(const std::string& prompt,
     if (j.contains("error"))
         throw ProviderError("Anthropic: " + j["error"].value("message", j["error"].dump()));
     extract_token_usage(j);
+    // D115 — 安全拒答以 HTTP 200 + stop_reason=refusal + content:[] 返回；
+    // 明确抛出而非笼统的「empty content」，避免越界读取并给出可诊断信息。
+    if (j.value("stop_reason", "") == "refusal")
+        throw ProviderError("Anthropic refused the request (stop_reason=refusal; safety decline)");
     if (!j.contains("content") || !j["content"].is_array() || j["content"].empty())
         throw ProviderError("Anthropic: empty content in response");
     return j["content"][0].value("text", "");
@@ -327,7 +331,7 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
     auto resp = http_post(base + "/v1/messages",
         {"Content-Type: application/json",
          "x-api-key: " + cfg_.api_key,
-         "anthropic-version: 2024-10-22"},
+         "anthropic-version: 2023-06-01"},
         body.dump());
     if (resp.status_code == 429 || resp.status_code == 503) {
         std::string msg = "Anthropic: " + std::to_string(resp.status_code) + " rate limited";
@@ -342,6 +346,9 @@ LLMResponse AnthropicProvider::complete_chat(const std::vector<ChatMessage>& mes
     if (j.contains("error"))
         throw ProviderError("Anthropic: " + j["error"].value("message", j["error"].dump()));
     extract_token_usage(j);
+    // D115 — 安全拒答（stop_reason=refusal, content:[]）明确抛出，行为与 complete() 一致。
+    if (j.value("stop_reason", "") == "refusal")
+        throw ProviderError("Anthropic refused the request (stop_reason=refusal; safety decline)");
 
     LLMResponse result;
     // Parse Anthropic response: content array with text and tool_use blocks
@@ -3155,7 +3162,7 @@ void AnthropicProvider::complete_stream(const std::string& prompt,
     do_stream_post(base + "/v1/messages",
         {"Content-Type: application/json",
          "x-api-key: " + cfg_.api_key,
-         "anthropic-version: 2024-10-22"},
+         "anthropic-version: 2023-06-01"},
         body.dump(), parser, cfg_.timeout_sec);
 }
 
@@ -4176,7 +4183,7 @@ void HttpTransport::send(const json& message) {
     std::string resp_body;
     struct curl_slist* h = nullptr;
     h = curl_slist_append(h, "Content-Type: application/json");
-    h = curl_slist_append(h, "Accept: application/json");
+    h = curl_slist_append(h, "Accept: application/json, text/event-stream");  // D116/CF1 — 必须同时声明 JSON 与 SSE
     h = curl_slist_append(h, ("MCP-Protocol-Version: " + std::string(MCP_PROTOCOL_VERSION)).c_str()); // D96
     if (!api_key_.empty())
         h = curl_slist_append(h, ("Authorization: Bearer " + api_key_).c_str());
@@ -4200,12 +4207,15 @@ void HttpTransport::send(const json& message) {
         pending_response_ = json::object();
         has_pending_ = true;
     } else {
-        try {
-            pending_response_ = json::parse(resp_body);
-            has_pending_ = true;
-        } catch (...) {
+        // D116/CF1 — 服务器可对任意请求以 text/event-stream 应答；先按 JSON 解析，
+        // 失败则回退到从 SSE 帧中提取 JSON-RPC 消息（此前仅支持 application/json）。
+        json parsed;
+        try { parsed = json::parse(resp_body); }
+        catch (...) { parsed = mcp_extract_sse_message(resp_body); }
+        if (parsed.is_null())
             throw McpError("MCP HTTP: invalid JSON response");
-        }
+        pending_response_ = std::move(parsed);
+        has_pending_ = true;
     }
 }
 
@@ -4377,6 +4387,14 @@ json McpClient::initialize(const std::string& client_name, const std::string& ve
         {"capabilities", json::object()},
         {"clientInfo", {{"name", client_name}, {"version", ver}}}
     });
+    // D116 — 记录服务器协商到的协议版本；规范规定客户端无法支持时「应」断开。
+    // Ariadne 的 JSON-RPC 表面兼容 2025-03-26 / 2025-06-18 / 2025-11-25。
+    negotiated_version_ = result.value("protocolVersion", std::string(MCP_PROTOCOL_VERSION));
+    static const char* kSupported[] = {"2025-03-26", "2025-06-18", "2025-11-25"};
+    bool supported = negotiated_version_.empty();
+    for (const char* v : kSupported) if (negotiated_version_ == v) supported = true;
+    if (!supported)
+        throw McpError("MCP: server negotiated unsupported protocol version: " + negotiated_version_);
     // Send required initialized notification
     transport_->send({{"jsonrpc","2.0"},{"method","notifications/initialized"}});
     initialized_ = true;

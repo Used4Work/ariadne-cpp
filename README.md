@@ -8,7 +8,7 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-261%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-272%20passed-brightgreen)](#tests)
 
 </div>
 
@@ -37,6 +37,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Multimodal vision** -- image input via base64 or URL (OpenAI + Anthropic + Gemini)
 - **Reasoning control** -- `reasoning_effort`/`verbosity` → Gemini 3 `thinking_level`, GPT-5.x params (`max_completion_tokens`), Anthropic `output_config` GA structured output
 - **Sub-workflow nesting** -- `WorkflowRegistry` embeds a reusable workflow as a tool/node in a parent agent or DAG, with recursion-depth guard (LangGraph subgraph pattern)
+- **Plan linting** -- `PlanLinter` runs structural lint (dangling deps, cycles, dup/empty ids, missing schemas, fan-out width) over a `WorkflowPlan` *before* execution — catches the ~42% of failures MAST attributes to spec/structure
 
 ### Prompt Ops
 - **Prompt versioning** -- `PromptVersionStore` keeps named prompts with multiple versions, active-version pin, and history (git-style)
@@ -44,6 +45,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **pass^k reliability** -- `run_reliability(cases, k, …)` reports `pass^k` (all-k-succeed, the τ²-bench production-reliability metric) to surface flakiness that pass@1 hides
 - **Eval statistics** -- Wilson confidence intervals, the *unbiased* `pass_at_k()` estimator, and a deterministic paired-bootstrap regression gate (blocks only when the 95% CI is entirely negative)
 - **Trajectory evaluation** -- `score_trajectory()` scores the tool-call sequence (strict/unordered/superset/subset) with overlap + redundant-call count
+- **Rubric scoring** -- `rubric_score()` / `rubric_score_ensemble()` decompose an LLM-judge verdict into weighted criteria (penalties supported) with majority/weighted/unanimous ensembles — the documented fix for judge style/verbosity bias
 
 ### Dynamic Workflow (Ultracode-level)
 - `parallel()` -- fan-out N tasks, barrier wait
@@ -79,6 +81,8 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Memory scoping + temporal** -- `MemoryQuery` filters by `user:`/`session:`/`agent:` scope and re-ranks with exponential recency decay
 - **Context compaction** -- `ContextCompactor` summarizes the oldest turns into one message when a token threshold is hit (complements observation masking)
 - **Vector store** -- `InMemoryVectorStore` cosine search, JSON serialization
+- **Memory write-path** -- `FactUpsertPolicy` decides ADD/UPDATE/REMOVE/NOOP for a new fact vs its top-s neighbors (cosine thresholds + optional injected LLM relation fn) — Mem0-style dedup-merge
+- **Note store** -- `NoteStore` is a structured, serializable scratchpad *outside* the context window (put/append/str_replace/render-within-budget) for context offload
 
 ### Persistence
 - **Plan caching** -- NeurIPS 2025 APC pattern, context-aware LRU
@@ -93,12 +97,16 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Tool-output spotlighting** -- `spotlight_text()` (delimit/datamark/encode) marks untrusted tool output as data-not-instructions (indirect prompt-injection defense)
 - **Lethal-trifecta taint tracking** -- `TaintTracker` blocks externally-communicating tools once untrusted content enters context (deterministic CaMeL-style data-flow defense — the structural complement to spotlighting)
 - **Risk-tiered tool authorization** -- `ToolAuthorizationPolicy` (auto/confirm/dual-confirm/deny, fail-closed) + checksum-bound approval, implementing OWASP LLM06 "complete mediation"
+- **Invisible-Unicode + role-marker sanitizers** -- `strip_invisible_unicode()` removes Tags/variation-selector/zero-width code points (ASCII-smuggling injection + covert exfiltration); `sanitize_role_markers()` strips chat-template delimiters (fake-turn injection)
+- **Tool-manifest pinning** -- `ToolPinStore` + `tool_manifest_hash()` detect MCP rug-pull / tool-poisoning drift, fail-closed on first-seen or changed tools (OWASP LLM03)
+- **Egress allowlist** -- `EgressAllowlist` + `extract_markdown_urls()` deterministically cut the data-exfiltration leg of the lethal trifecta (EchoLeak/CVE-2025-32711 class); rejects IP-literals / `data:` / `file:` / suffix confusion
+- **Tamper-evident audit log** -- `AuditLog` + self-contained cryptographic `sha256_hex()`: a hash chain whose `verify()` locates any edit/delete/reorder (OWASP Agentic T8 repudiation)
 - **Human-in-the-loop** -- `InterruptError` + `set_interrupt_hook()`
 - **Cancellation** -- `cancel()` + `set_deadline()`
 - **Thread-safe** -- `shared_mutex` on ToolRegistry, atomic flags
 
 ### Integration
-- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0); paginated `tools` / `resources` / `prompts` + tool annotations
+- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0); paginated `tools` / `resources` / `prompts` + tool annotations; SSE-aware responses + negotiated-version validation
 - **A2A client** -- Agent2Agent v1.0.1 (Linux Foundation) interop: AgentCard discovery, `message/send`, task lifecycle (`tasks/get`/`cancel`), `message/stream` SSE frame parsing
 - **Ariadne Studio** -- visual workflow editor (localhost web UI)
 - **Streaming** -- SSE token delivery
@@ -147,7 +155,7 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 261 tests
+./build/unit_tests          # 272 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
@@ -209,7 +217,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 261 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 272 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 
