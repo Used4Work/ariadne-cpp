@@ -8,7 +8,7 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-272%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-283%20passed-brightgreen)](#tests)
 
 </div>
 
@@ -46,6 +46,9 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Eval statistics** -- Wilson confidence intervals, the *unbiased* `pass_at_k()` estimator, and a deterministic paired-bootstrap regression gate (blocks only when the 95% CI is entirely negative)
 - **Trajectory evaluation** -- `score_trajectory()` scores the tool-call sequence (strict/unordered/superset/subset) with overlap + redundant-call count
 - **Rubric scoring** -- `rubric_score()` / `rubric_score_ensemble()` decompose an LLM-judge verdict into weighted criteria (penalties supported) with majority/weighted/unanimous ensembles — the documented fix for judge style/verbosity bias
+- **Cost-of-Pass economics** -- `cost_of_pass()` (expected \$ per correct answer) + `frontier_cost_of_pass()` bridge `ModelPricing` and `pass_at_k` (arXiv 2504.13359)
+- **Best-of-N selection** -- `best_of_n()` picks a winning candidate over `(answer, score)` pairs (MaxScore/WeightedVote/Majority/Borda) + `prm_aggregate()` (Min/Product/Mean/Last) — distinct from verdict-scoring ensembles
+- **Conformal abstention** -- `conformal_threshold()` calibrates a split-conformal selective-prediction threshold with a distribution-free risk bound (arXiv 2405.01563, DeepMind); nonconformity score injected
 
 ### Dynamic Workflow (Ultracode-level)
 - `parallel()` -- fan-out N tasks, barrier wait
@@ -77,7 +80,9 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Token estimation** -- `estimate_tokens()` heuristic
 
 ### Retrieval & Memory
-- **Hybrid retrieval** -- `HybridRetriever` fuses dense vectors (cosine) + sparse `Bm25Index` (Okapi BM25) via Reciprocal Rank Fusion -- the 2026 RAG gold standard
+- **Hybrid retrieval** -- `HybridRetriever` fuses dense vectors (cosine) + sparse `Bm25Index` (Okapi BM25) via Reciprocal Rank Fusion -- the 2026 RAG gold standard; `reciprocal_rank_fusion_weighted()` adds per-list weights
+- **MMR diversity re-rank** -- `maximal_marginal_relevance()` trades relevance vs redundancy greedily (Carbonell & Goldstein SIGIR'98), reusing stored embeddings
+- **Recursive text splitter** -- `RecursiveCharacterTextSplitter` chunks long documents with configurable separators + overlap (LangChain's algorithm; injectable `LengthFn`, char-count default / `estimate_tokens` opt-in)
 - **Memory scoping + temporal** -- `MemoryQuery` filters by `user:`/`session:`/`agent:` scope and re-ranks with exponential recency decay
 - **Context compaction** -- `ContextCompactor` summarizes the oldest turns into one message when a token threshold is hit (complements observation masking)
 - **Vector store** -- `InMemoryVectorStore` cosine search, JSON serialization
@@ -101,13 +106,16 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Tool-manifest pinning** -- `ToolPinStore` + `tool_manifest_hash()` detect MCP rug-pull / tool-poisoning drift, fail-closed on first-seen or changed tools (OWASP LLM03)
 - **Egress allowlist** -- `EgressAllowlist` + `extract_markdown_urls()` deterministically cut the data-exfiltration leg of the lethal trifecta (EchoLeak/CVE-2025-32711 class); rejects IP-literals / `data:` / `file:` / suffix confusion
 - **Tamper-evident audit log** -- `AuditLog` + self-contained cryptographic `sha256_hex()`: a hash chain whose `verify()` locates any edit/delete/reorder (OWASP Agentic T8 repudiation)
+- **Cross-server tool-shadow guard** -- `ToolShadowGuard` detects when two MCP servers offer the same tool name (flat-namespace shadowing) and is fail-closed first-provider-wins (Microsoft "search"×32 / Invariant WhatsApp PoC; OWASP LLM03)
+- **Tool-call budget + spawn guard** -- `ToolCallBudget` (per-session tool-call cap, distinct from token budget) + `SpawnGuard` (multi-agent depth/fan-out cap, 1/6 default) — LLM10 unbounded-consumption / T5 cascading-failure
+- **Hidden-markup stripping** -- `strip_hidden_markup()` removes HTML comments + `<script>`/`<style>` (the CamoLeak / CVE-2025-59145 channel); `extract_markdown_urls()` now also extracts HTML `src=`/`href=` so `<img>`-pixel exfil is caught by the egress allowlist
 - **Human-in-the-loop** -- `InterruptError` + `set_interrupt_hook()`
 - **Cancellation** -- `cancel()` + `set_deadline()`
 - **Thread-safe** -- `shared_mutex` on ToolRegistry, atomic flags
 
 ### Integration
-- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0); paginated `tools` / `resources` / `prompts` + tool annotations; SSE-aware responses + negotiated-version validation
-- **A2A client** -- Agent2Agent v1.0.1 (Linux Foundation) interop: AgentCard discovery, `message/send`, task lifecycle (`tasks/get`/`cancel`), `message/stream` SSE frame parsing
+- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0); paginated `tools` / `resources` / `prompts` + tool annotations; SSE-aware responses + negotiated-version validation; **session-id capture/echo + negotiated-version headers** (stateful remote servers)
+- **A2A client** -- Agent2Agent **v1.0** (Linux Foundation) interop: AgentCard discovery, `SendMessage`, task lifecycle (`GetTask`/`CancelTask`), `message/stream` SSE frame parsing; lenient `TASK_STATE_*` + kebab state parsing
 - **Ariadne Studio** -- visual workflow editor (localhost web UI)
 - **Streaming** -- SSE token delivery
 - **CMake** -- FetchContent, find_package, pkg-config
@@ -155,7 +163,7 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 272 tests
+./build/unit_tests          # 283 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
@@ -217,7 +225,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 272 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 283 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 

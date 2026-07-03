@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <set>
 #include <random>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
 
@@ -55,7 +56,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.12.0";
+constexpr const char* ARIADNE_VERSION = "2.13.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -410,6 +411,46 @@ inline std::string sanitize_role_markers(const std::string& text) {
     return out;
 }
 
+/** 剥离「对人不可见、但 LLM 会读到」的隐藏标记通道（D133）——HTML/XML 注释
+ *  <!-- ... --> 与 <script>/<style> 块。此类隐藏内容是间接注入的首选载体：
+ *  CamoLeak（CVE-2025-59145，CVSS 9.6）即以 PR 里的 HTML 注释注入 Copilot 再像素外泄。
+ *  与 strip_invisible_unicode(D117) 互补（那里去不可见码点，这里去隐藏标记）。
+ *  ⚠️ 完整的 display:none / zero-font 隐藏节点需真正的 HTML 解析器（超出零依赖范围），
+ *  应与 spotlighting(D100) 分层使用；此处确定性切断最常见的注释/脚本/样式通道。 */
+inline std::string strip_hidden_markup(const std::string& text) {
+    auto lc    = [](char c) { return (char)std::tolower((unsigned char)c); };
+    auto ci_at = [&](size_t pos, const std::string& lit) -> bool {
+        if (pos + lit.size() > text.size()) return false;
+        for (size_t k = 0; k < lit.size(); ++k)
+            if (lc(text[pos + k]) != lc(lit[k])) return false;
+        return true;
+    };
+    auto ci_find = [&](const std::string& lit, size_t from) -> size_t {
+        if (lit.size() > text.size()) return std::string::npos;
+        for (size_t p = from; p + lit.size() <= text.size(); ++p)
+            if (ci_at(p, lit)) return p;
+        return std::string::npos;
+    };
+    std::string out; out.reserve(text.size());
+    size_t i = 0, n = text.size();
+    while (i < n) {
+        if (ci_at(i, "<!--")) {                              // HTML/XML 注释
+            size_t e = text.find("-->", i + 4);
+            i = (e == std::string::npos) ? n : e + 3; continue;
+        }
+        if (ci_at(i, "<script")) {                           // <script>…</script>
+            size_t e = ci_find("</script>", i);
+            i = (e == std::string::npos) ? n : e + 9; continue;
+        }
+        if (ci_at(i, "<style")) {                            // <style>…</style>
+            size_t e = ci_find("</style>", i);
+            i = (e == std::string::npos) ? n : e + 8; continue;
+        }
+        out += text[i++];
+    }
+    return out;
+}
+
 // ════════════════════════════════════════════════════════════════
 // 致命三元组污点追踪 (Lethal-trifecta taint tracking) — 结构化注入防御 (D106)
 //   Spotlighting (D100) 是概率性防御；CaMeL/Simon Willison「致命三元组」给出
@@ -505,6 +546,33 @@ inline std::vector<std::string> extract_markdown_urls(const std::string& text) {
         if (e == std::string::npos) break;
         std::string inner = text.substr(p + 1, e - p - 1);
         if (inner.find("://") != std::string::npos) push(inner);
+    }
+    // 4) HTML 属性 src= / href=（D133）：CamoLeak 类攻击借 <img src> 像素加载外泄，
+    //    Markdown-only 抽取会漏掉，故一并纳入出口审查（大小写不敏感，支持引号/裸值）。
+    {
+        std::string lower; lower.reserve(text.size());
+        for (char c : text) lower += (char)std::tolower((unsigned char)c);
+        for (const char* attr : {"src=", "href="}) {
+            std::string a = attr;
+            for (size_t p = lower.find(a); p != std::string::npos; p = lower.find(a, p + 1)) {
+                size_t q = p + a.size();
+                while (q < text.size() && (text[q] == ' ' || text[q] == '\t')) ++q;
+                if (q >= text.size()) break;
+                std::string val;
+                if (text[q] == '"' || text[q] == '\'') {
+                    char quote = text[q];
+                    size_t en = text.find(quote, q + 1);
+                    if (en == std::string::npos) continue;
+                    val = text.substr(q + 1, en - (q + 1));
+                } else {
+                    size_t en = q;
+                    while (en < text.size() && text[en] != ' ' && text[en] != '>' &&
+                           text[en] != '\t' && text[en] != '\n' && text[en] != '\r') ++en;
+                    val = text.substr(q, en - q);
+                }
+                if (val.find("://") != std::string::npos) push(val);   // 仅收绝对 URL（出口相关）
+            }
+        }
     }
     return urls;
 }
@@ -933,10 +1001,11 @@ struct ProviderConfig {
     std::string  completions_path = "";   // 空 = /v1/chat/completions
     double       max_rps          = 0.0;  // 每秒最大请求数；0=不限速
     ModelPricing pricing;                 // 自动成本追踪
-    std::string  reasoning_effort = "";   // ""|none|minimal|low|medium|high|xhigh (D83/D84/D113)
+    std::string  reasoning_effort = "";   // ""|none|minimal|low|medium|high|xhigh|max (D83/D84/D113/D125)
     std::string  verbosity        = "";   // OpenAI GPT-5: low|medium|high (D84)
     bool         strict_tools     = false;// provider 端严格工具 schema 校验 (D84/D85)
     bool         prompt_caching   = false;// D114 — Anthropic cache_control 缓存断点（默认关）
+    std::string  service_tier     = "";   // D125 — OpenAI service_tier: auto|default|flex|priority（空=不设置）
 
     static ProviderConfig anthropic(const std::string& key,
                                      const std::string& model = "claude-opus-4-8") {
@@ -1030,14 +1099,22 @@ inline bool is_gpt5_family(const std::string& model) {
     return model.find("gpt-5") != std::string::npos;
 }
 
-/** reasoning effort → Gemini 3.x thinking_level（空串=不设置）(D83/D113/D115)。
- *  ⚠️ Gemini 3.x 仅接受 low|medium|high —— "minimal" 不是合法值，发送会 400
- *  （此前 D83/D113 误将 none/minimal 映射为 "minimal"，是隐性 bug）。
- *  归一：none/minimal/low→low，medium→medium，high/xhigh→high。 */
-inline std::string gemini_thinking_level(const std::string& effort) {
-    if (effort == "none" || effort == "minimal" || effort == "low") return "low";
+/** reasoning effort → Gemini thinking_level（空串=不设置）(D83/D113/D115/D125)。
+ *  ⚠️ 合法分档按模型族而定（据 ai.google.dev 官方 per-model 支持表，2026-07 核实）：
+ *   · Flash / Flash-Lite（含默认 gemini-3.5-flash）：minimal|low|medium|high 全部合法，
+ *     故 none/minimal→"minimal"（最快最省的推理档）。D115 曾一刀切删除 minimal，
+ *     反而使默认模型最省档不可达——本次按模型族修正。
+ *   · Pro（gemini-3.x-pro，无法关闭思考）：仅 low|medium|high，故 none/minimal→"low"。
+ *  medium→medium，high/xhigh/max→high。model 缺省（空串）时保守取 Pro 规则
+ *  （绝不向未知模型发送 minimal —— 对 Pro 是 400）。 */
+inline std::string gemini_thinking_level(const std::string& effort,
+                                         const std::string& model = "") {
+    const bool flash = model.find("flash") != std::string::npos
+                    || model.find("lite")  != std::string::npos;
+    if (effort == "none" || effort == "minimal") return flash ? "minimal" : "low";
+    if (effort == "low")    return "low";
     if (effort == "medium") return "medium";
-    if (effort == "high"  || effort == "xhigh")  return "high";
+    if (effort == "high" || effort == "xhigh" || effort == "max") return "high";
     return "";  // 空串或未知值：不设置
 }
 
@@ -1051,10 +1128,14 @@ inline std::string anthropic_effort(const std::string& effort) {
     return "";
 }
 
-/** 这些 Anthropic 模型拒绝非默认 temperature（同 GPT-5 处理）(D113)。 */
+/** 这些 Anthropic 模型对非默认 temperature/top_p/top_k 返回 400（同 GPT-5 处理）
+ *  (D113/D125)。据官方 migration-guide（2026-07 核实）：Opus 4.7/4.8、Sonnet 5、
+ *  Fable/Mythos 5 均锁定；Sonnet 4.6 **不**锁（仅在 prefill-reject 名单里）。
+ *  故用精确子串 "sonnet-5" 而非 "sonnet"，避免误锁 Sonnet 4.x。 */
 inline bool anthropic_locks_temperature(const std::string& model) {
     return model.find("opus-4-8") != std::string::npos
         || model.find("opus-4-7") != std::string::npos
+        || model.find("sonnet-5") != std::string::npos   // D125 — Sonnet 5 亦锁温度
         || model.find("fable")    != std::string::npos
         || model.find("mythos")   != std::string::npos;
 }
@@ -1383,6 +1464,204 @@ inline std::vector<RankedDoc> reciprocal_rank_fusion(
     out.resize(kk);
     return out;
 }
+
+/** 加权 RRF（D135）：给每路排序列表一个权重 wᵣ，score(d)=Σ wᵣ/(k+rank)。
+ *  weights 长度不足时以 1.0 补齐（退化为无权 RRF，向后兼容）。用于让某一路
+ *  召回（如业务加权/交叉编码器）在融合中占更大比重。语料相关，暴露参数而非硬编码。 */
+inline std::vector<RankedDoc> reciprocal_rank_fusion_weighted(
+        const std::vector<std::vector<RankedDoc>>& ranked_lists,
+        const std::vector<double>& weights,
+        int top_k = 5, double k = 60.0) {
+    std::unordered_map<std::string, double> fused;
+    for (size_t li = 0; li < ranked_lists.size(); ++li) {
+        const double w = (li < weights.size()) ? weights[li] : 1.0;
+        const auto& list = ranked_lists[li];
+        for (size_t rank = 0; rank < list.size(); ++rank)
+            fused[list[rank].id] += w / (k + (double)(rank + 1));
+    }
+    std::vector<RankedDoc> out;
+    out.reserve(fused.size());
+    for (const auto& kv : fused) out.push_back({kv.first, kv.second});
+    const size_t kk = std::min((size_t)std::max(0, top_k), out.size());
+    std::partial_sort(out.begin(), out.begin() + kk, out.end(),
+        [](const RankedDoc& a, const RankedDoc& b) { return a.score > b.score; });
+    out.resize(kk);
+    return out;
+}
+
+// ════════════════════════════════════════════════════════════════
+// D134 — Maximal Marginal Relevance（MMR，Carbonell & Goldstein SIGIR'98）
+//   混合检索/向量召回后，top-k 常有语义冗余（近重复文档）。MMR 在「相关性」与
+//   「多样性」间贪心权衡，逐个选入：
+//     MMR = argmax_{Dᵢ∈R\S} [ λ·rel(Dᵢ) − (1−λ)·max_{Dⱼ∈S} cos(Dᵢ,Dⱼ) ]
+//   λ≈0.5（0.3~0.7）。至今仍是 LangChain/LlamaIndex/Haystack 的标准去冗余重排。
+//   纯余弦，复用已存 embedding；价值在「减少冗余」而非某个基准 %。
+// ════════════════════════════════════════════════════════════════
+
+/** MMR 候选：id + embedding + 与 query 的相关性（cosine 或注入分）。 */
+struct MmrCandidate {
+    std::string        id;
+    std::vector<float> embedding;
+    double             relevance = 0.0;
+};
+
+/** MMR 贪心重排：返回选中 id 的有序列表（长度 ≤ k）。λ=1 纯相关性，λ=0 纯多样性。 */
+inline std::vector<std::string> maximal_marginal_relevance(
+        const std::vector<MmrCandidate>& cands, int k, double lambda = 0.5) {
+    std::vector<std::string> selected;
+    if (cands.empty() || k <= 0) return selected;
+    auto cos = [](const std::vector<float>& a, const std::vector<float>& b) -> double {
+        if (a.empty() || a.size() != b.size()) return 0.0;
+        double dot = 0, na = 0, nb = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            dot += (double)a[i] * b[i]; na += (double)a[i] * a[i]; nb += (double)b[i] * b[i];
+        }
+        if (na == 0 || nb == 0) return 0.0;
+        return dot / (std::sqrt(na) * std::sqrt(nb));
+    };
+    const size_t K = std::min((size_t)k, cands.size());
+    std::vector<bool>   used(cands.size(), false);
+    std::vector<size_t> chosen;
+    while (selected.size() < K) {
+        double best_mmr = -std::numeric_limits<double>::infinity();
+        size_t best = cands.size();
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (used[i]) continue;
+            double max_sim = 0.0;
+            for (size_t j : chosen)
+                max_sim = std::max(max_sim, cos(cands[i].embedding, cands[j].embedding));
+            double score = lambda * cands[i].relevance - (1.0 - lambda) * max_sim;
+            if (score > best_mmr) { best_mmr = score; best = i; }
+        }
+        if (best == cands.size()) break;
+        used[best] = true; chosen.push_back(best);
+        selected.push_back(cands[best].id);
+    }
+    return selected;
+}
+
+// ════════════════════════════════════════════════════════════════
+// D135 — 递归字符文本分块器（RecursiveCharacterTextSplitter）
+//   RAG 缺的一环：把长文档切成带重叠的块。移植 LangChain 的递归分隔算法：
+//   按分隔符优先级（默认 ["\n\n","\n"," ",""]）取首个在文本中出现者切分，过大的
+//   块下钻到更细分隔符递归，再贪心合并到 chunk_size 并保留 ≤chunk_overlap 的尾窗。
+//   长度函数默认按字符数（LengthFn 可注入 estimate_tokens 改为按 token）。末位 ""
+//   保证对无空白长串也能逐字符兜底终止。纯逻辑、可离线单测。
+//   ⚠️ chunk_overlap 是否总有益有争议（Chroma 2024 / arXiv 2601.14123），故作为
+//   参数暴露、默认较小，不宣称固定收益；Markdown/代码可传自定义分隔符表。
+// ════════════════════════════════════════════════════════════════
+
+class RecursiveCharacterTextSplitter {
+public:
+    using LengthFn = std::function<size_t(const std::string&)>;
+
+    explicit RecursiveCharacterTextSplitter(
+            size_t chunk_size = 1000, size_t chunk_overlap = 150,
+            std::vector<std::string> separators = {"\n\n", "\n", " ", ""},
+            LengthFn length_fn = nullptr)
+        : chunk_size_(chunk_size), chunk_overlap_(chunk_overlap),
+          separators_(std::move(separators)),
+          length_(length_fn ? std::move(length_fn)
+                            : [](const std::string& s) { return s.size(); }) {}
+
+    std::vector<std::string> split(const std::string& text) const {
+        return split_recursive(text, separators_);
+    }
+
+private:
+    size_t chunk_size_, chunk_overlap_;
+    std::vector<std::string> separators_;
+    LengthFn length_;
+
+    static std::vector<std::string> split_by(const std::string& text, const std::string& sep) {
+        std::vector<std::string> out;
+        if (sep.empty()) {                        // "" → 逐字符
+            for (char c : text) out.emplace_back(1, c);
+            return out;
+        }
+        size_t start = 0, p;
+        while ((p = text.find(sep, start)) != std::string::npos) {
+            out.push_back(text.substr(start, p - start));
+            start = p + sep.size();
+        }
+        out.push_back(text.substr(start));
+        return out;
+    }
+
+    static std::string join_docs(const std::vector<std::string>& docs, const std::string& sep) {
+        std::string text;
+        for (size_t i = 0; i < docs.size(); ++i) { if (i) text += sep; text += docs[i]; }
+        size_t b = text.find_first_not_of(" \t\n\r");        // strip 两端空白
+        if (b == std::string::npos) return "";
+        size_t e = text.find_last_not_of(" \t\n\r");
+        return text.substr(b, e - b + 1);
+    }
+
+    // 贪心把小片合并到 ≤chunk_size，保留 ≤chunk_overlap 的尾窗（LangChain _merge_splits）
+    std::vector<std::string> merge_splits(const std::vector<std::string>& splits,
+                                          const std::string& sep) const {
+        const size_t sep_len = length_(sep);
+        std::vector<std::string> docs, current;
+        size_t total = 0;
+        for (const auto& d : splits) {
+            size_t dlen = length_(d);
+            if (total + dlen + (current.empty() ? 0 : sep_len) > chunk_size_ && !current.empty()) {
+                std::string doc = join_docs(current, sep);
+                if (!doc.empty()) docs.push_back(doc);
+                while (total > chunk_overlap_ ||
+                       (total + dlen + (current.empty() ? 0 : sep_len) > chunk_size_ && total > 0)) {
+                    total -= length_(current.front()) + (current.size() > 1 ? sep_len : 0);
+                    current.erase(current.begin());
+                    if (current.empty()) break;
+                }
+            }
+            current.push_back(d);
+            total += dlen + (current.size() > 1 ? sep_len : 0);
+        }
+        std::string doc = join_docs(current, sep);
+        if (!doc.empty()) docs.push_back(doc);
+        return docs;
+    }
+
+    std::vector<std::string> split_recursive(const std::string& text,
+                                             const std::vector<std::string>& seps) const {
+        std::vector<std::string> final_chunks;
+        std::string sep = seps.empty() ? "" : seps.back();   // 兜底
+        std::vector<std::string> next_seps;
+        for (size_t i = 0; i < seps.size(); ++i) {
+            if (seps[i].empty()) { sep = seps[i]; break; }
+            if (text.find(seps[i]) != std::string::npos) {
+                sep = seps[i];
+                next_seps.assign(seps.begin() + i + 1, seps.end());
+                break;
+            }
+        }
+        auto splits = split_by(text, sep);
+        std::vector<std::string> good;                       // 待合并的小片
+        for (auto& s : splits) {
+            if (length_(s) < chunk_size_) {
+                good.push_back(s);
+            } else {
+                if (!good.empty()) {
+                    auto merged = merge_splits(good, sep);
+                    final_chunks.insert(final_chunks.end(), merged.begin(), merged.end());
+                    good.clear();
+                }
+                if (next_seps.empty()) {
+                    final_chunks.push_back(s);                // 无更细分隔符 → 整块保留
+                } else {
+                    auto rec = split_recursive(s, next_seps);
+                    final_chunks.insert(final_chunks.end(), rec.begin(), rec.end());
+                }
+            }
+        }
+        if (!good.empty()) {
+            auto merged = merge_splits(good, sep);
+            final_chunks.insert(final_chunks.end(), merged.begin(), merged.end());
+        }
+        return final_chunks;
+    }
+};
 
 /** 混合检索器：向量 (cosine) + BM25 (词法)，RRF 融合（D89）。
  *  add() 同时写入两个索引；query() 用 embedding + text 双路召回并融合。 */
@@ -2913,6 +3192,168 @@ inline double rubric_score_ensemble(const std::vector<Criterion>& criteria,
     }
 }
 
+// ════════════════════════════════════════════════════════════════
+// D128 — Cost-of-Pass 经济评估层（arXiv:2504.13359）
+//   Ariadne 有 eval 严谨度（wilson/pass@k/paired_bootstrap）与成本追踪
+//   （ModelPricing），却从未把二者结合。Cost-of-Pass =「拿到一个正确答案的
+//   期望花费」：反复重试至正确 ⇒ E[尝试]=1/p（几何）⇒ v = cost_per_attempt/p。
+//   frontier = 跨模型/策略取最小 v（论文核心：前沿 cost-of-pass 每隔数月约减半）。
+//   纯逻辑、可离线单测；与 pass_at_k / ModelPricing 天然配套。
+// ════════════════════════════════════════════════════════════════
+
+/** 单次尝试成本 + 成功率 → 每个正确答案的期望花费。p<=0 不可达，返回 +inf。 */
+inline double cost_of_pass(double cost_per_attempt, double success_rate) {
+    if (success_rate <= 0.0) return std::numeric_limits<double>::infinity();
+    return cost_per_attempt / success_rate;
+}
+
+/** 「重试至成功、最多 k 次」的期望尝试数 = Σ_{i=0}^{k-1}(1-p)^i = (1-(1-p)^k)/p；
+ *  p<=0 退化为 k（永不成功，白花 k 次），p>=1 为 1。 */
+inline double expected_attempts_bounded(double p, int k) {
+    if (k <= 0)   return 0.0;
+    if (p <= 0.0) return (double)k;
+    if (p >= 1.0) return 1.0;
+    return (1.0 - std::pow(1.0 - p, k)) / p;
+}
+
+/** 一个候选模型/策略的成本画像。 */
+struct CostStrategy {
+    std::string id;
+    double cost_per_attempt = 0.0;
+    double success_rate     = 0.0;
+    double value() const { return cost_of_pass(cost_per_attempt, success_rate); }
+};
+
+/** 前沿 cost-of-pass：在候选集中取 v 最小者（跳过 +inf 的不可达策略）。
+ *  空集或全不可达时返回哨兵（id 为空、value()==+inf）。 */
+inline CostStrategy frontier_cost_of_pass(const std::vector<CostStrategy>& strategies) {
+    CostStrategy best;              // 默认 success_rate=0 → value()==+inf
+    double best_v = std::numeric_limits<double>::infinity();
+    for (const auto& s : strategies) {
+        double v = s.value();
+        if (v < best_v) { best_v = v; best = s; }
+    }
+    return best;
+}
+
+// ════════════════════════════════════════════════════════════════
+// D129 — Best-of-N 选择器 + 过程奖励聚合（test-time compute）
+//   生成 N 个候选后如何「选出赢家」：arXiv:2408.03314（加权多数投票在 N=8 时
+//   较无权多数 +~10%）、2502.18581（self-certainty 置信度，尺度不变）。与
+//   rubric_score_ensemble 不同 —— 后者把「评审意见打成一个标量」，这里是在
+//   (answer, score) 候选间「选赢家」。Borda 基于社会选择理论的尺度不变性（对
+//   分数重标定鲁棒），非某论文摘要公式。分数由调用方注入（真实 reward/judge/
+//   self-certainty，或测试桩），选择本身纯逻辑。
+// ════════════════════════════════════════════════════════════════
+
+enum class BoNRule { MaxScore, WeightedVote, MajorityVote, Borda };
+
+/** 候选：answer_key = 归一化答案标识（相同答案 → 同 key 以便投票聚合）；score = 置信度/奖励。 */
+struct BoNCandidate {
+    std::string answer_key;
+    double      score = 0.0;
+};
+
+struct BoNResult {
+    size_t      index = 0;        // 选中候选在输入中的下标
+    std::string answer_key;       // 选中的答案 key
+    double      aggregate = 0.0;  // 该 key 的聚合分（规则相关）
+};
+
+/** 在 N 个候选中按规则选出赢家。空输入返回 index=0/空 key。
+ *  MaxScore：单候选最高分。WeightedVote：argmax_a Σ_{key==a} score（=CISC 加权自洽）。
+ *  MajorityVote：argmax_a 计数。Borda：按分数降序给名次分 Σ(N-rank)，对分数尺度鲁棒。
+ *  平票取输入顺序中首个达到最高聚合分的候选（确定、稳定）。 */
+inline BoNResult best_of_n(const std::vector<BoNCandidate>& cands, BoNRule rule) {
+    BoNResult r;
+    if (cands.empty()) return r;
+    if (rule == BoNRule::MaxScore) {
+        size_t bi = 0;
+        for (size_t i = 1; i < cands.size(); ++i)
+            if (cands[i].score > cands[bi].score) bi = i;
+        r.index = bi; r.answer_key = cands[bi].answer_key; r.aggregate = cands[bi].score;
+        return r;
+    }
+    std::unordered_map<std::string, double> agg;
+    if (rule == BoNRule::WeightedVote) {
+        for (const auto& c : cands) agg[c.answer_key] += c.score;
+    } else if (rule == BoNRule::MajorityVote) {
+        for (const auto& c : cands) agg[c.answer_key] += 1.0;
+    } else { // Borda：按 score 降序排名，名次分 = N-rank（rank 从 0 起）
+        std::vector<size_t> order(cands.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(),
+            [&](size_t a, size_t b) { return cands[a].score > cands[b].score; });
+        const double N = (double)cands.size();
+        for (size_t rank = 0; rank < order.size(); ++rank)
+            agg[cands[order[rank]].answer_key] += (N - (double)rank);
+    }
+    std::string best_key; double best_val = -1.0;
+    for (const auto& c : cands) {                       // 按输入顺序找首个最高聚合 key
+        double v = agg[c.answer_key];
+        if (v > best_val) { best_val = v; best_key = c.answer_key; }
+    }
+    r.answer_key = best_key; r.aggregate = best_val;
+    for (size_t i = 0; i < cands.size(); ++i)
+        if (cands[i].answer_key == best_key) { r.index = i; break; }
+    return r;
+}
+
+enum class PrmAggregate { Min, Product, Mean, Last };
+
+/** 过程奖励聚合：把逐步骤分数标量化为单一序列分（arXiv:2501.07301/2504.15275）。
+ *  Min（最小步=短板，min-form 与可验证 RL 最贴合）/ Product / Mean / Last。
+ *  空序列返回 0。Min-form 有已知的「集中于末步」漂移，故四种模式全提供。 */
+inline double prm_aggregate(const std::vector<double>& step_scores, PrmAggregate mode) {
+    if (step_scores.empty()) return 0.0;
+    switch (mode) {
+        case PrmAggregate::Min: {
+            double m = step_scores[0];
+            for (double s : step_scores) m = std::min(m, s);
+            return m;
+        }
+        case PrmAggregate::Product: {
+            double p = 1.0;
+            for (double s : step_scores) p *= s;
+            return p;
+        }
+        case PrmAggregate::Mean: {
+            double sum = 0.0;
+            for (double s : step_scores) sum += s;
+            return sum / (double)step_scores.size();
+        }
+        case PrmAggregate::Last:
+        default:
+            return step_scores.back();
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// D130 — 保形弃权阈值（split-conformal abstention，arXiv:2405.01563 DeepMind）
+//   给定一组「校准非一致性分数」+ 目标风险 alpha，算出阈值 q̂，使可交换性假设下
+//   测试分 ≤ q̂ 的边际覆盖率 ≥ 1-alpha —— 对幻觉率给出与分布无关的严格上界
+//   （优于 logprob 基线）。这是 Ariadne 缺的「校准选择性预测」能力，而非又一个
+//   helper。非一致性分数由调用方注入（1-self_certainty / 语义熵 / 1-置信度）。
+// ════════════════════════════════════════════════════════════════
+
+/** split-conformal 阈值：q̂ = 升序校准分的第 ceil((n+1)(1-alpha)) 个（1 基）；
+ *  当该秩 > n（样本太少，保证不可达）返回 +inf（永不弃权）。 */
+inline double conformal_threshold(std::vector<double> calib_scores, double alpha) {
+    const size_t n = calib_scores.size();
+    if (n == 0) return std::numeric_limits<double>::infinity();
+    std::sort(calib_scores.begin(), calib_scores.end());
+    double raw = std::ceil((double)(n + 1) * (1.0 - alpha));      // 1 基秩
+    if (raw > (double)n) return std::numeric_limits<double>::infinity();
+    long rank = (long)raw;
+    if (rank < 1) rank = 1;
+    return calib_scores[(size_t)rank - 1];
+}
+
+/** 保形决策：预测当且仅当测试非一致性分 ≤ 阈值，否则弃权。 */
+inline bool conformal_should_predict(double test_score, double threshold) {
+    return test_score <= threshold;
+}
+
 using ToolFn = std::function<json(const json& params)>;
 
 /** D104 — MCP 工具注解（2025-11-25 spec，信任/安全元数据）。
@@ -3015,6 +3456,101 @@ private:
         return server_id + "::" + tool;
     }
     std::unordered_map<std::string, uint64_t> pinned_;
+};
+
+// ════════════════════════════════════════════════════════════════
+// D131 — 跨服务器工具名遮蔽守卫（MCP tool-name collision / shadowing）
+//   MCP 工具名是扁平命名空间、无强制前缀；接入多个 MCP 服务器时，恶意服务器可
+//   注册与可信服务器同名的工具（search / read_file…）来「遮蔽」后者（执行注册表
+//   last-write-wins，甚至无需被调用即可劫持路由）。Microsoft Research 实测 775 个
+//   工具里 "search" 跨 32 个服务器重名；Invariant 的 WhatsApp PoC 即「潜伏」遮蔽。
+//   MCP SECURITY.md 视之为应用层问题 → 需宿主自建控制。守卫记录每个工具名的来源
+//   服务器集合，检测跨服务器重名，fail-closed 采「首个注册者胜」。纯逻辑、可离线
+//   单测；与 ToolPinStore(D118, 检测同一工具的漂移) 互补。
+// ════════════════════════════════════════════════════════════════
+
+class ToolShadowGuard {
+public:
+    enum class Decision { Register, Shadowed };   // 首见→Register；已被别的服务器占→Shadowed
+
+    /** 记录某服务器提供某工具并给出决定。首个提供该名的服务器胜（Register）；
+     *  之后其他服务器提供同名工具一律判 Shadowed（fail-closed，不静默覆盖）。
+     *  同一服务器重复注册同名工具仍判 Register（非跨服务器遮蔽）。 */
+    Decision observe(const std::string& server_id, const std::string& tool) {
+        providers_[tool].insert(server_id);
+        std::string& owner = owners_[tool];
+        if (owner.empty()) { owner = server_id; return Decision::Register; }
+        return owner == server_id ? Decision::Register : Decision::Shadowed;
+    }
+    /** 该工具名是否被多于一个服务器提供（存在遮蔽风险）。 */
+    bool is_shadowed(const std::string& tool) const {
+        auto it = providers_.find(tool);
+        return it != providers_.end() && it->second.size() > 1;
+    }
+    /** 该工具名的合法所有者（首个注册者），未知返回空串。 */
+    std::string owner_of(const std::string& tool) const {
+        auto it = owners_.find(tool);
+        return it == owners_.end() ? std::string() : it->second;
+    }
+    size_t distinct_providers(const std::string& tool) const {
+        auto it = providers_.find(tool);
+        return it == providers_.end() ? 0 : it->second.size();
+    }
+    /** 命名空间限定名，从根本上避免遮蔽（Claude Code 风格 <server>::<tool>）。 */
+    static std::string namespaced(const std::string& server_id, const std::string& tool) {
+        return server_id + "::" + tool;
+    }
+    void reset() { owners_.clear(); providers_.clear(); }
+private:
+    std::unordered_map<std::string, std::string>           owners_;     // tool → 首个所有者
+    std::unordered_map<std::string, std::set<std::string>> providers_;  // tool → 提供者集合
+};
+
+// ════════════════════════════════════════════════════════════════
+// D132 — 工具调用预算 + 多智能体派生深度/扇出守卫（LLM10 无界消耗 / T4/T5）
+//   Ariadne 有 token 预算与迭代上限，但缺：(a) 每会话「工具调用次数」硬上限
+//   （与 token 无关的「钱包拒绝」防线）、(b) 多智能体「派生深度 + 扇出宽度」上限
+//   （agent→agent→agent 的 fork-bomb 面；DepthGuard(D93) 只护子工作流注册表）。
+//   业界收敛默认：Codex agents.max_depth=1 / max_threads=6；OWASP LLM10 建议对
+//   「排队动作数与总动作数」限流。纯逻辑、线程安全、可离线单测。
+// ════════════════════════════════════════════════════════════════
+
+/** 每会话工具调用计数预算（线程安全）。max_calls<=0 表示不限。 */
+class ToolCallBudget {
+public:
+    explicit ToolCallBudget(long max_calls = 0) : max_(max_calls) {}
+    /** 尝试消费一次调用额度：允许→返回 true 并计数；超限→返回 false（不计数）。 */
+    bool try_consume() {
+        if (max_ <= 0) return true;
+        long prev = used_.fetch_add(1, std::memory_order_relaxed);
+        if (prev >= max_) { used_.fetch_sub(1, std::memory_order_relaxed); return false; }
+        return true;
+    }
+    long used()      const { return used_.load(std::memory_order_relaxed); }
+    long remaining() const { return max_ <= 0 ? -1 : std::max(0L, max_ - used()); }
+    bool exhausted() const { return max_ > 0 && used() >= max_; }
+    void reset() { used_.store(0, std::memory_order_relaxed); }
+private:
+    long              max_;
+    std::atomic<long> used_{0};
+};
+
+/** 多智能体派生守卫：限制派生「深度」与每层「扇出宽度」（fail-closed）。 */
+class SpawnGuard {
+public:
+    explicit SpawnGuard(int max_depth = 1, int max_fanout = 6)
+        : max_depth_(max_depth), max_fanout_(max_fanout) {}
+    /** 在 current_depth 层再派生 fanout_count 个子智能体是否允许？
+     *  子代落在 current_depth+1 层；超深度或超单层扇出即拒绝。 */
+    bool allow(int current_depth, int fanout_count = 1) const {
+        if (current_depth + 1 > max_depth_) return false;
+        if (fanout_count > max_fanout_)      return false;
+        return true;
+    }
+    int max_depth()  const { return max_depth_; }
+    int max_fanout() const { return max_fanout_; }
+private:
+    int max_depth_, max_fanout_;
 };
 
 class ToolRegistry {
@@ -3632,6 +4168,8 @@ public:
     virtual void send(const json& message) = 0;
     virtual json receive() = 0;
     virtual void close() = 0;
+    /** D126 — 记录协商后的协议版本（仅 HTTP 传输据此设请求头；stdio 空实现）。 */
+    virtual void set_protocol_version(const std::string& /*v*/) {}
 };
 
 /** HTTP 传输：通过 HTTP POST 与 MCP 服务器通信 (Streamable HTTP) */
@@ -3641,11 +4179,17 @@ public:
     void send(const json& message) override;
     json receive() override;
     void close() override;
+    /** D126 — McpClient 在 initialize 协商后调用，使后续请求头回带协商版本。 */
+    void set_protocol_version(const std::string& v) override { if (!v.empty()) protocol_version_ = v; }
+    /** D126 — 服务器下发的会话 ID（诊断/测试用）。 */
+    const std::string& session_id() const { return session_id_; }
 private:
     std::string url_;
     std::string api_key_;
     json pending_response_;
     bool has_pending_ = false;
+    std::string session_id_;                              // D126 — Mcp-Session-Id（initialize 响应下发，后续回带）
+    std::string protocol_version_ = MCP_PROTOCOL_VERSION; // D126 — 协商后版本（默认=客户端首选）
 };
 
 /** Stdio 传输：通过子进程 stdin/stdout 通信 */
@@ -3765,6 +4309,35 @@ inline json mcp_extract_sse_message(const std::string& body) {
     return found;
 }
 
+/** 从原始 HTTP 响应头串中提取某头字段值（D126）。头名大小写不敏感（HTTP 规范），
+ *  值两端空白裁剪；找不到返回空串。用于 Streamable-HTTP 捕获服务器下发的
+ *  Mcp-Session-Id（有状态远程服务器要求后续请求回带此头，否则 400/404）。
+ *  纯函数，可离线单测。 */
+inline std::string mcp_parse_header_value(const std::string& raw_headers,
+                                          const std::string& name) {
+    auto lower = [](std::string s) {
+        for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    };
+    const std::string want = lower(name);
+    size_t i = 0, n = raw_headers.size();
+    while (i < n) {
+        size_t eol = raw_headers.find('\n', i);
+        std::string line = raw_headers.substr(i, (eol == std::string::npos ? n : eol) - i);
+        i = (eol == std::string::npos ? n : eol + 1);
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t colon = line.find(':');
+        if (colon == std::string::npos) continue;             // 状态行/续行忽略
+        if (lower(line.substr(0, colon)) != want) continue;
+        std::string v = line.substr(colon + 1);
+        size_t b = v.find_first_not_of(" \t");
+        if (b == std::string::npos) return "";
+        size_t e = v.find_last_not_of(" \t");
+        return v.substr(b, e - b + 1);
+    }
+    return "";
+}
+
 /** MCP 客户端：初始化 → 工具/资源/提示发现 → 调用 */
 class McpClient {
 public:
@@ -3804,11 +4377,12 @@ private:
 };
 
 // ════════════════════════════════════════════════════════════════
-// D92 — A2A (Agent2Agent) Client — Linux Foundation A2A v1.0
+// D92 — A2A (Agent2Agent) Client — Linux Foundation A2A（v1.0.1，2026-05）
 //   跨框架 agent 互操作（150+ 组织、3 大云）：AgentCard 发现 +
-//   JSON-RPC 2.0 over HTTP（message/send）。规范数据模型：
-//   AgentCard / AgentSkill / Message / Part / Task。
-//   实现 JSON-RPC over HTTP 绑定（小写 role/state、kebab task state）。
+//   JSON-RPC 2.0 over HTTP。规范数据模型：AgentCard/AgentSkill/Message/Part/Task。
+//   ⚠️ A2A v1.0（2026-03 官网 latest）为破坏性重写：JSON-RPC 方法名改 PascalCase
+//   （SendMessage/GetTask/CancelTask，原 message/send 等已废弃，D127），TaskState
+//   线值改 ProtoJSON `TASK_STATE_*`（a2a_parse_state 对新旧两版都宽容解析，D127）。
 // ════════════════════════════════════════════════════════════════
 
 /** A2A 消息部件（text / file / data 三选一）。 */
@@ -3899,15 +4473,24 @@ enum class A2ATaskState {
     Submitted, Working, InputRequired, AuthRequired,
     Completed, Failed, Canceled, Rejected, Unknown
 };
+/** 解析 A2A TaskState（D127 — 对 v0.3.0 与 v1.0 两种线格式都宽容）。
+ *  A2A v1.0（2026-03，官网 latest）改用 ProtoJSON 枚举名 `TASK_STATE_WORKING…`
+ *  （全大写下划线）；v0.3.0 用小写 kebab `working` / `input-required`。若只认后者，
+ *  对 v1.0 服务器会把每个任务解析成 Unknown → poll_until_terminal 空转到上限。
+ *  归一化：剥离可选 `TASK_STATE_` 前缀 → 小写 → '-'→'_'；取消态兼容 canceled/cancelled。 */
 inline A2ATaskState a2a_parse_state(const std::string& s) {
-    if (s == "submitted")      return A2ATaskState::Submitted;
-    if (s == "working")        return A2ATaskState::Working;
-    if (s == "input-required") return A2ATaskState::InputRequired;
-    if (s == "auth-required")  return A2ATaskState::AuthRequired;
-    if (s == "completed")      return A2ATaskState::Completed;
-    if (s == "failed")         return A2ATaskState::Failed;
-    if (s == "canceled")       return A2ATaskState::Canceled;
-    if (s == "rejected")       return A2ATaskState::Rejected;
+    std::string k = s;
+    const std::string pfx = "TASK_STATE_";
+    if (k.rfind(pfx, 0) == 0) k = k.substr(pfx.size());  // v1.0 ProtoJSON 前缀
+    for (auto& c : k) { c = (char)std::tolower((unsigned char)c); if (c == '-') c = '_'; }
+    if (k == "submitted")                      return A2ATaskState::Submitted;
+    if (k == "working")                        return A2ATaskState::Working;
+    if (k == "input_required")                 return A2ATaskState::InputRequired;
+    if (k == "auth_required")                  return A2ATaskState::AuthRequired;
+    if (k == "completed")                      return A2ATaskState::Completed;
+    if (k == "failed")                         return A2ATaskState::Failed;
+    if (k == "canceled" || k == "cancelled")   return A2ATaskState::Canceled;
+    if (k == "rejected")                       return A2ATaskState::Rejected;
     return A2ATaskState::Unknown;
 }
 inline bool a2a_is_terminal(A2ATaskState s) {

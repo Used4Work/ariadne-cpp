@@ -386,6 +386,7 @@ static void apply_openai_params(json& body, const ProviderConfig& cfg, double te
     }
     if (!cfg.reasoning_effort.empty()) body["reasoning_effort"] = cfg.reasoning_effort;
     if (!cfg.verbosity.empty())        body["verbosity"]        = cfg.verbosity;
+    if (!cfg.service_tier.empty())     body["service_tier"]     = cfg.service_tier;  // D125
 }
 
 std::string OpenAIChatProvider::complete(const std::string& prompt,
@@ -842,7 +843,7 @@ std::string GeminiProvider::complete(const std::string& prompt,
     if (!sys.empty())
         body["systemInstruction"] = {{"parts",{{{"text", sys}}}}};
     json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
-    { auto tl = gemini_thinking_level(cfg_.reasoning_effort);
+    { auto tl = gemini_thinking_level(cfg_.reasoning_effort, cfg_.model);  // D125 — 按模型族分档
       if (!tl.empty()) gen_config["thinking_level"] = tl; }  // Gemini 3 推理深度 (D83)
     if (!output_schema.is_null() && !output_schema.empty()) {
         gen_config["responseMimeType"] = "application/json";
@@ -895,7 +896,7 @@ LLMResponse GeminiProvider::complete_chat(const std::vector<ChatMessage>& messag
 
     json body = {{"contents", contents}};
     json gen_config = {{"temperature", temperature}, {"maxOutputTokens", cfg_.max_tokens}};
-    { auto tl = gemini_thinking_level(cfg_.reasoning_effort);
+    { auto tl = gemini_thinking_level(cfg_.reasoning_effort, cfg_.model);  // D125 — 按模型族分档
       if (!tl.empty()) gen_config["thinking_level"] = tl; }  // Gemini 3 推理深度 (D83)
     // Structured output via responseSchema
     if (!output_schema.is_null() && !output_schema.empty()) {
@@ -956,7 +957,7 @@ void GeminiProvider::complete_stream(const std::string& prompt,
     if (!sys.empty())
         body["systemInstruction"] = {{"parts",{{{"text", sys}}}}};
     json gen_config = {{"temperature", temp}, {"maxOutputTokens", cfg_.max_tokens}};
-    { auto tl = gemini_thinking_level(cfg_.reasoning_effort);
+    { auto tl = gemini_thinking_level(cfg_.reasoning_effort, cfg_.model);  // D125 — 按模型族分档
       if (!tl.empty()) gen_config["thinking_level"] = tl; }  // Gemini 3 推理深度 (D83)
     body["generationConfig"] = gen_config;
 
@@ -4181,10 +4182,13 @@ void HttpTransport::send(const json& message) {
     CURL* c = curl.get();
     std::string body = message.dump();
     std::string resp_body;
+    std::string resp_headers;   // D126 — 捕获响应头以读取 Mcp-Session-Id
     struct curl_slist* h = nullptr;
     h = curl_slist_append(h, "Content-Type: application/json");
     h = curl_slist_append(h, "Accept: application/json, text/event-stream");  // D116/CF1 — 必须同时声明 JSON 与 SSE
-    h = curl_slist_append(h, ("MCP-Protocol-Version: " + std::string(MCP_PROTOCOL_VERSION)).c_str()); // D96
+    h = curl_slist_append(h, ("MCP-Protocol-Version: " + protocol_version_).c_str()); // D96/D126 — 用协商后版本
+    if (!session_id_.empty())                                                          // D126 — 有状态服务器要求回带会话 ID
+        h = curl_slist_append(h, ("Mcp-Session-Id: " + session_id_).c_str());
     if (!api_key_.empty())
         h = curl_slist_append(h, ("Authorization: Bearer " + api_key_).c_str());
     auto write_cb = [](char* p, size_t s, size_t n, void* u) -> size_t {
@@ -4196,13 +4200,25 @@ void HttpTransport::send(const json& message) {
     curl_easy_setopt(c, CURLOPT_POSTFIELDSIZE,  (long)body.size());
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION,  +write_cb);
     curl_easy_setopt(c, CURLOPT_WRITEDATA,      &resp_body);
+    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, +write_cb);   // D126 — 复用同一回调收集响应头
+    curl_easy_setopt(c, CURLOPT_HEADERDATA,     &resp_headers);
     curl_easy_setopt(c, CURLOPT_TIMEOUT,        30L);
     curl_easy_setopt(c, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(c, CURLOPT_NOSIGNAL,       1L);
     CURLcode rc = curl_easy_perform(c);
+    long http_code = 0;
+    curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &http_code);
     curl_slist_free_all(h);
     if (rc != CURLE_OK)
         throw McpError(std::string("MCP HTTP: ") + curl_easy_strerror(rc));
+    // D126 — 会话管理：initialize 响应会下发 Mcp-Session-Id，之后每次请求必须回带；
+    //   HTTP 404 表示服务器已丢弃该会话，清空以便上层重新 initialize（规范要求）。
+    if (http_code == 404) {
+        session_id_.clear();
+    } else {
+        std::string sid = mcp_parse_header_value(resp_headers, "mcp-session-id");
+        if (!sid.empty()) session_id_ = sid;
+    }
     if (resp_body.empty()) {
         pending_response_ = json::object();
         has_pending_ = true;
@@ -4395,6 +4411,9 @@ json McpClient::initialize(const std::string& client_name, const std::string& ve
     for (const char* v : kSupported) if (negotiated_version_ == v) supported = true;
     if (!supported)
         throw McpError("MCP: server negotiated unsupported protocol version: " + negotiated_version_);
+    // D126 — 之后所有请求头改用协商后的版本（HTTP 传输；stdio 空实现）。
+    //   会话 ID（Mcp-Session-Id）已在上面 initialize 的响应头里被 send() 自动捕获。
+    transport_->set_protocol_version(negotiated_version_);
     // Send required initialized notification
     transport_->send({{"jsonrpc","2.0"},{"method","notifications/initialized"}});
     initialized_ = true;
@@ -4676,7 +4695,7 @@ A2AAgentCard A2AClient::fetch_agent_card() {
 
 json A2AClient::send_message(const A2AMessage& msg) {
     json params = {{"message", msg.to_json()}};
-    json req    = make_rpc(next_id_++, "message/send", params);
+    json req    = make_rpc(next_id_++, "SendMessage", params);   // D127 — A2A v1.0 PascalCase 方法名（原 message/send 已废弃）
     json resp   = a2a_http_post(endpoint(), api_key_, req);
     if (resp.contains("error") && !resp["error"].is_null()) {
         json e = resp["error"];
@@ -4704,7 +4723,7 @@ std::string A2AClient::ask(const std::string& text) {
 A2ATask A2AClient::get_task(const std::string& task_id, int history_length) {
     json params = {{"id", task_id}};
     if (history_length > 0) params["historyLength"] = history_length;
-    json req  = make_rpc(next_id_++, "tasks/get", params);
+    json req  = make_rpc(next_id_++, "GetTask", params);        // D127 — A2A v1.0 PascalCase
     json resp = a2a_http_post(endpoint(), api_key_, req);
     if (resp.contains("error") && !resp["error"].is_null()) {
         json e = resp["error"];
@@ -4714,7 +4733,7 @@ A2ATask A2AClient::get_task(const std::string& task_id, int history_length) {
 }
 
 A2ATask A2AClient::cancel_task(const std::string& task_id) {
-    json req  = make_rpc(next_id_++, "tasks/cancel", {{"id", task_id}});
+    json req  = make_rpc(next_id_++, "CancelTask", {{"id", task_id}});   // D127 — A2A v1.0 PascalCase
     json resp = a2a_http_post(endpoint(), api_key_, req);
     if (resp.contains("error") && !resp["error"].is_null()) {
         json e = resp["error"];
