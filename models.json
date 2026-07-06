@@ -1,5 +1,5 @@
 {
-  "_updated": "2026-06-29",
+  "_updated": "2026-07-06",
   "providers": {
     "anthropic": {
       "api_endpoint": "https://api.anthropic.com/v1/messages",
@@ -141,6 +141,31 @@
         },
         {
           "id": "microsoft/phi-4-multimodal-instruct",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "microsoft/phi-4-reasoning",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "mistral-ai/codestral-2501",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "mistral-ai/ministral-3b",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "mistral-ai/mistral-medium-2505",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "mistral-ai/mistral-small-2503",
           "role": "subagent",
           "note": "auto"
         }
