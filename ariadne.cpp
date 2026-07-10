@@ -387,6 +387,7 @@ static void apply_openai_params(json& body, const ProviderConfig& cfg, double te
     if (!cfg.reasoning_effort.empty()) body["reasoning_effort"] = cfg.reasoning_effort;
     if (!cfg.verbosity.empty())        body["verbosity"]        = cfg.verbosity;
     if (!cfg.service_tier.empty())     body["service_tier"]     = cfg.service_tier;  // D125
+    apply_openai_prompt_cache(body, cfg);  // D145 — GPT-5.6+ 显式提示缓存（opt-in）
 }
 
 std::string OpenAIChatProvider::complete(const std::string& prompt,
@@ -4649,7 +4650,8 @@ static json a2a_http_post(const std::string& url, const std::string& api_key, co
     std::string resp;
     struct curl_slist* h = nullptr;
     h = curl_slist_append(h, "Content-Type: application/json");
-    h = curl_slist_append(h, "Accept: application/json");
+    h = curl_slist_append(h, "Accept: application/json, application/a2a+json");
+    h = curl_slist_append(h, "A2A-Version: 1.0");
     if (!api_key.empty())
         h = curl_slist_append(h, ("Authorization: Bearer " + api_key).c_str());
     curl_easy_setopt(c, CURLOPT_URL,            url.c_str());
@@ -4740,6 +4742,28 @@ A2ATask A2AClient::cancel_task(const std::string& task_id) {
         throw A2AError("A2A RPC error: " + e.value("message", e.dump()));
     }
     return A2ATask::from_json(resp.value("result", json::object()));
+}
+
+A2AListTasksResult A2AClient::list_tasks(const A2AListTasksParams& params) {
+    json req  = make_rpc(next_id_++, "ListTasks", params.to_json());
+    json resp = a2a_http_post(endpoint(), api_key_, req);
+    if (resp.contains("error") && !resp["error"].is_null()) {
+        json e = resp["error"];
+        throw A2AError("A2A RPC error: " + e.value("message", e.dump()));
+    }
+    return A2AListTasksResult::from_json(resp.value("result", json::object()));
+}
+
+A2AAgentCard A2AClient::get_extended_agent_card(const std::string& tenant) {
+    json params = json::object();
+    if (!tenant.empty()) params["tenant"] = tenant;
+    json req  = make_rpc(next_id_++, "GetExtendedAgentCard", params);
+    json resp = a2a_http_post(endpoint(), api_key_, req);
+    if (resp.contains("error") && !resp["error"].is_null()) {
+        json e = resp["error"];
+        throw A2AError("A2A RPC error: " + e.value("message", e.dump()));
+    }
+    return A2AAgentCard::from_json(resp.value("result", json::object()));
 }
 
 A2ATask A2AClient::poll_until_terminal(const std::string& task_id, int poll_ms, int max_polls) {

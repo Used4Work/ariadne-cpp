@@ -2,6 +2,29 @@
 
 All notable changes to Ariadne are documented here. Format: [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.14.0] - 2026-07-10
+
+Theme: **A2A v1.0 data-model completion, agentic-auth/security primitives, sampling economics & OpenAI caching.** Researched against live July 2026 primary sources: a week-delta sweep (only wire change: OpenAI GPT-5.6, 2026-07-09), plus two deep-verification passes that pinned every A2A v1.0.1 wire shape (proto diffed byte-identical against the `v1.0.1` tag + generated JSON Schema) and every RFC/Unicode/statistics test vector (RFC 4231/7636/9728, Unicode confusables 17.0.0, exact incomplete-beta anchors). All test vectors are asserted against their authoritative source values.
+
+### Added — A2A v1.0 (D136–D137)
+- **A2A v1.0 Tier-2 canonical model** (D136): `A2APart` now parses the flattened v1.0 shape (`text`/`raw`/`url`/`data` by member presence, top-level `mediaType`/`filename`/`metadata`) while remaining backward-compatible with v0.3.0 (`kind` + nested `file`); `a2a_parse_role` accepts ProtoJSON `ROLE_USER`/`ROLE_AGENT`, integer enums, and lowercase; `A2AAgentCard` reads v1.0 `supportedInterfaces[]`/`signatures[]` with fallback to the removed top-level `url`/`protocolVersion`/`signature`; stream frames discriminate by `statusUpdate`/`artifactUpdate` member (fallback to old `kind`). The `A2A-Version: 1.0` request header (a v1.0 MUST) is now sent.
+- **A2A new RPCs** (D137): `A2AClient::list_tasks()` (`ListTasks` — pagination + filters → `{tasks, nextPageToken, …}`) and `get_extended_agent_card()` (`GetExtendedAgentCard`).
+
+### Added — agentic auth & security (D138–D142)
+- **MCP OAuth offline helpers** (D138): `parse_www_authenticate()` (RFC 9728 `resource_metadata`), `oauth_protected_resource_url()` (well-known path insertion, path-aware), `pkce_s256_challenge()` (RFC 7636 S256), `canonical_resource_uri()` (RFC 8707). Pure functions — the correctness core of a future full OAuth flow, usable now by a host's own OAuth stack. Full browser/token flow deliberately out of scope.
+- **HMAC-SHA256 + AgentCard pinning** (D139): `hmac_sha256_hex()` (RFC 2104, reusing the existing self-contained SHA-256; RFC 4231 vectors asserted) for inter-agent message integrity (Agentic T12); `agent_card_hash()` + `AgentCardPinStore` (Unknown/Unchanged/Drifted) against A2A Agent-Card poisoning, generalizing D118's pinning.
+- **Value-authorization gate** (D140): `ValueAuthorizationPolicy` — deterministic, **fail-closed** (default deny-unknown), per-tool predicates over *argument values* (not just tier). Closes the "capability gates are not authorization" confused-deputy gap (arXiv 2606.28679); orthogonal to D107 (risk-tier) and D107's `approval_checksum` (replay).
+- **Confusable fold + mixed-script detection** (D141): `confusable_fold()` (Cyrillic/Greek → ASCII from Unicode confusables 17.0.0 + fullwidth via −0xFEE0) and `is_mixed_script()` (Latin+Cyrillic/Greek in one token; CJK+Latin deliberately *not* flagged). A normalizer to run *before* the word-level checks (D117/D133) that homoglyphs otherwise bypass — not a standalone injection scorer (research killed those as ~60% near-random).
+- **Egress secret/PII scanner** (D142): `EgressScanner` flags API-key prefixes, PEM, Luhn-valid card numbers, IBAN (mod-97), structural SSNs, and high-entropy tokens (detect-secrets 4.5/3.0-bit thresholds) in outbound text. **Explicitly probabilistic** — must pair with the D119 egress allowlist (the structural control); labeled as such per the Silent-Egress finding (arXiv 2602.22450) that sharded exfiltration evades output checks.
+
+### Added — reliability & provider (D143–D145)
+- **Adaptive-consistency early-stop** (D143): `should_stop()` stops self-consistency/voting once P(leader holds) = `I_0.5(v2+1, v1+1)` ≥ threshold (arXiv 2305.11860, up to 7.9× fewer samples). Integer votes use an exact binomial-sum `incomplete_beta_half_integer()`; a general `regularized_incomplete_beta()` (Lentz continued fraction) ships too. Plus `esc_window_converged()` (cheap all-equal window).
+- **Error-taxonomy retry policy** (D144): `classify_error_structural()` (deterministic mapping over exception/HTTP/schema/loop/timeout signals + optional injected semantic classifier) → `AgentErrorClass`; `RetryPolicy` maps class → action (Retry/Backoff/Reformulate/Escalate/Degrade/Abort), **fail-closed** (unknown → single retry then escalate, never infinite). Agent-layer complement to the HTTP-only D22/D43 backoff (arXiv 2509.25370).
+- **OpenAI explicit prompt caching** (D145): opt-in `ProviderConfig` fields → `apply_openai_prompt_cache()` injects `prompt_cache_options` (`mode`/`ttl`), `prompt_cache_key`, and per-block `prompt_cache_breakpoint` (≤4, on the stable prefix) for GPT-5.6 (2026-07-09). Counterpart to Anthropic's D114. `reasoning_effort: "max"` (new GPT-5.6 tier) already passed through.
+
+### Delivery
+- 10 new tests (293 total), all asserting authoritative RFC/Unicode/statistics vectors. Clean build (Linux/Windows/macOS + ASan/UBSan + cppcheck). This release's implementation was delegated to a Codex subagent against a pinned spec, then reviewed diff-by-diff (RFC vectors re-checked against primary sources; a `passedByValue` cppcheck risk fixed in review).
+
 ## [2.13.0] - 2026-07-03
 
 Theme: **Provider/protocol correctness + reliability economics + structural security + RAG.** Researched against live July 2026 primary sources across five parallel passes (OpenAI/Anthropic/Gemini provider docs, MCP 2025-11-25 spec + 2026-07-28 RC, A2A v1.0.1 spec + changelog, 2025–26 agent-reliability arXiv, OWASP GenAI/Agentic + IFC security), each adversarially verified; the three correctness fixes were independently re-verified against primary docs before flipping prior decisions.

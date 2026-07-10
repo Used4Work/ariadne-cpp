@@ -8,7 +8,7 @@
 [![Eval](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml/badge.svg)](https://github.com/Used4Work/ariadne-cpp/actions/workflows/eval.yml)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](#build)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-283%20passed-brightgreen)](#tests)
+[![Tests](https://img.shields.io/badge/tests-293%20passed-brightgreen)](#tests)
 
 </div>
 
@@ -49,6 +49,8 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Cost-of-Pass economics** -- `cost_of_pass()` (expected \$ per correct answer) + `frontier_cost_of_pass()` bridge `ModelPricing` and `pass_at_k` (arXiv 2504.13359)
 - **Best-of-N selection** -- `best_of_n()` picks a winning candidate over `(answer, score)` pairs (MaxScore/WeightedVote/Majority/Borda) + `prm_aggregate()` (Min/Product/Mean/Last) — distinct from verdict-scoring ensembles
 - **Conformal abstention** -- `conformal_threshold()` calibrates a split-conformal selective-prediction threshold with a distribution-free risk bound (arXiv 2405.01563, DeepMind); nonconformity score injected
+- **Adaptive-consistency early-stop** -- `should_stop()` halts self-consistency/voting once P(leader holds) ≥ threshold via an exact half-integer incomplete-beta (arXiv 2305.11860, up to 7.9× fewer samples); `esc_window_converged()` for the cheap all-equal case
+- **Error-taxonomy retry** -- `classify_error_structural()` → `AgentErrorClass` + `RetryPolicy` (Retry/Backoff/Reformulate/Escalate/Degrade/Abort), fail-closed; agent-layer complement to HTTP-only backoff (arXiv 2509.25370)
 
 ### Dynamic Workflow (Ultracode-level)
 - `parallel()` -- fan-out N tasks, barrier wait
@@ -68,7 +70,7 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Token budget** -- enforcement with `TokenBudgetError` on exceed
 - **Semantic cache** -- `SemanticCache` keys responses by embedding cosine similarity (pluggable `EmbedFn`), not exact-match hashing
 - **JSON repair** -- `repair_json()` deterministically fixes fenced/single-quoted/trailing-comma/truncated LLM JSON (fallback in plan + agent-action parsing)
-- **Prompt caching** -- opt-in Anthropic `cache_control` breakpoints on the stable prefix (tools + system) — 90% input-cost reduction on cache reads
+- **Prompt caching** -- opt-in Anthropic `cache_control` and OpenAI GPT-5.6 `prompt_cache_options`/`prompt_cache_breakpoint` breakpoints on the stable prefix (tools + system) — large input-cost reduction on cache reads
 
 ### Observability
 - **Structured logging** -- `ILogger` interface, zero stdout/stderr by default
@@ -109,13 +111,17 @@ C++17 LLM workflow orchestration library. Automatic DAG planning, ReACT agents, 
 - **Cross-server tool-shadow guard** -- `ToolShadowGuard` detects when two MCP servers offer the same tool name (flat-namespace shadowing) and is fail-closed first-provider-wins (Microsoft "search"×32 / Invariant WhatsApp PoC; OWASP LLM03)
 - **Tool-call budget + spawn guard** -- `ToolCallBudget` (per-session tool-call cap, distinct from token budget) + `SpawnGuard` (multi-agent depth/fan-out cap, 1/6 default) — LLM10 unbounded-consumption / T5 cascading-failure
 - **Hidden-markup stripping** -- `strip_hidden_markup()` removes HTML comments + `<script>`/`<style>` (the CamoLeak / CVE-2025-59145 channel); `extract_markdown_urls()` now also extracts HTML `src=`/`href=` so `<img>`-pixel exfil is caught by the egress allowlist
+- **Value-authorization gate** -- `ValueAuthorizationPolicy` — fail-closed, per-tool deterministic predicates over *argument values* (not just risk tier); closes the confused-deputy "capability gates ≠ authorization" gap (arXiv 2606.28679)
+- **Confusable fold + mixed-script** -- `confusable_fold()` (Cyrillic/Greek→ASCII + fullwidth) and `is_mixed_script()` normalize/flag homoglyph identifiers *before* the word-level injection checks (D117/D133) that homoglyphs bypass (Unicode TR39; CJK+Latin not flagged)
+- **Egress secret/PII scanner** -- `EgressScanner` flags API-key/PEM prefixes, Luhn cards, IBAN (mod-97), SSNs, and high-entropy tokens in outbound text — *probabilistic*, pairs with the structural egress allowlist (D119)
+- **Inter-agent integrity** -- `hmac_sha256_hex()` (RFC 2104/4231, reusing the self-contained SHA-256) for signed inter-agent messages; `AgentCardPinStore` pins A2A Agent-Cards against poisoning (Unknown/Unchanged/Drifted)
 - **Human-in-the-loop** -- `InterruptError` + `set_interrupt_hook()`
 - **Cancellation** -- `cancel()` + `set_deadline()`
 - **Thread-safe** -- `shared_mutex` on ToolRegistry, atomic flags
 
 ### Integration
-- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0); paginated `tools` / `resources` / `prompts` + tool annotations; SSE-aware responses + negotiated-version validation; **session-id capture/echo + negotiated-version headers** (stateful remote servers)
-- **A2A client** -- Agent2Agent **v1.0** (Linux Foundation) interop: AgentCard discovery, `SendMessage`, task lifecycle (`GetTask`/`CancelTask`), `message/stream` SSE frame parsing; lenient `TASK_STATE_*` + kebab state parsing
+- **MCP client** -- Model Context Protocol 2025-11-25 (stdio + Streamable HTTP, JSON-RPC 2.0); paginated `tools` / `resources` / `prompts` + tool annotations; SSE-aware responses + negotiated-version validation; session-id capture/echo + negotiated-version headers (stateful remote servers); **OAuth offline helpers** (`parse_www_authenticate` / `oauth_protected_resource_url` / `pkce_s256_challenge` — RFC 9728/7636/8707)
+- **A2A client** -- Agent2Agent **v1.0** (Linux Foundation) interop: AgentCard discovery, `SendMessage`/`GetTask`/`CancelTask`/`ListTasks`/`GetExtendedAgentCard`, `message/stream` SSE frames. Full v1.0 data model (flattened `Part`, `supportedInterfaces[]`, `signatures[]`, ProtoJSON `ROLE_*`/`TASK_STATE_*`) with v0.3.0 backward-compat + `A2A-Version` header
 - **Ariadne Studio** -- visual workflow editor (localhost web UI)
 - **Streaming** -- SSE token delivery
 - **CMake** -- FetchContent, find_package, pkg-config
@@ -163,7 +169,7 @@ int main() {
 sudo apt install libcurl4-openssl-dev nlohmann-json3-dev  # or brew install
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 4
-./build/unit_tests          # 283 tests
+./build/unit_tests          # 293 tests
 ./build/ariadne-studio      # visual editor at localhost:8080
 
 # Windows (vcpkg)
@@ -225,7 +231,7 @@ AriadneError
 
 | Workflow | Trigger | What |
 |---|---|---|
-| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 283 tests |
+| `ci.yml` | every push | Build (Linux+Windows+macOS+ASan/UBSan) + 293 tests |
 | `eval.yml` | push to main + weekly | 5 eval cases via GitHub Models |
 | `release.yml` | tag `v*` | Cross-platform binaries -> GitHub Releases |
 

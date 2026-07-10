@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cctype>
 #include <cstdint>
+#include <array>
 #include <set>
 #include <random>
 #include <limits>
@@ -56,7 +57,7 @@ inline long estimate_tokens(const std::string& text) {
 #include "ariadne_version_gen.hpp"
 constexpr const char* ARIADNE_VERSION = ARIADNE_VERSION_STRING;
 #else
-constexpr const char* ARIADNE_VERSION = "2.13.0";
+constexpr const char* ARIADNE_VERSION = "2.14.0";
 #endif
 inline std::string version() { return ARIADNE_VERSION; }
 
@@ -451,6 +452,253 @@ inline std::string strip_hidden_markup(const std::string& text) {
     return out;
 }
 
+struct Utf8Decoded {
+    unsigned cp = 0;
+    int len = 0;
+    bool valid = false;
+};
+
+inline Utf8Decoded utf8_decode_one(const std::string& s, size_t i) {
+    Utf8Decoded r;
+    if (i >= s.size()) return r;
+    unsigned char b0 = (unsigned char)s[i];
+    if      (b0 < 0x80)         { r.cp = b0;         r.len = 1; }
+    else if ((b0 >> 5) == 0x6)  { r.cp = b0 & 0x1Fu; r.len = 2; }
+    else if ((b0 >> 4) == 0xE)  { r.cp = b0 & 0x0Fu; r.len = 3; }
+    else if ((b0 >> 3) == 0x1E) { r.cp = b0 & 0x07u; r.len = 4; }
+    else return r;
+    if (i + (size_t)r.len > s.size()) { r.len = 0; return r; }
+    for (int k = 1; k < r.len; ++k) {
+        unsigned char bk = (unsigned char)s[i + (size_t)k];
+        if ((bk >> 6) != 0x2) { r.len = 0; return r; }
+        r.cp = (r.cp << 6) | (bk & 0x3Fu);
+    }
+    r.valid = true;
+    return r;
+}
+
+inline const char* confusable_ascii(unsigned cp) {
+    switch (cp) {
+        case 0x0430: return "a"; case 0x0435: return "e"; case 0x043E: return "o";
+        case 0x0440: return "p"; case 0x0441: return "c"; case 0x0443: return "y";
+        case 0x0445: return "x"; case 0x0456: return "i"; case 0x0455: return "s";
+        case 0x0458: return "j"; case 0x051B: return "q"; case 0x051D: return "w";
+        case 0x04BB: return "h"; case 0x0501: return "d"; case 0x0475: return "v";
+        case 0x0433: return "r"; case 0x04CF: return "l"; case 0x042C: return "b";
+        case 0x0410: return "A"; case 0x0412: return "B"; case 0x0415: return "E";
+        case 0x041A: return "K"; case 0x041C: return "M"; case 0x041D: return "H";
+        case 0x041E: return "O"; case 0x0420: return "P"; case 0x0421: return "C";
+        case 0x0422: return "T"; case 0x0425: return "X"; case 0x0405: return "S";
+        case 0x0408: return "J"; case 0x0423: return "Y";
+        case 0x03B1: return "a"; case 0x03BF: return "o"; case 0x03BD: return "v";
+        case 0x03B9: return "i"; case 0x03C1: return "p"; case 0x03C5: return "u";
+        case 0x03F2: return "c"; case 0x0391: return "A"; case 0x0392: return "B";
+        case 0x0395: return "E"; case 0x0397: return "H"; case 0x039A: return "K";
+        case 0x039C: return "M"; case 0x039D: return "N"; case 0x039F: return "O";
+        case 0x03A1: return "P"; case 0x03A4: return "T"; case 0x03A5: return "Y";
+        case 0x03A7: return "X"; case 0x0396: return "Z";
+        default: return nullptr;
+    }
+}
+
+// D141：常见同形字折叠。仅做归一化，不做“注入评分”；小写 Greek chi 无映射，避免误折叠。
+inline std::string confusable_fold(const std::string& utf8) {
+    std::string out;
+    out.reserve(utf8.size());
+    for (size_t i = 0; i < utf8.size();) {
+        Utf8Decoded d = utf8_decode_one(utf8, i);
+        if (!d.valid) { out += utf8[i++]; continue; }
+        if (d.cp >= 0xFF01 && d.cp <= 0xFF5E) {
+            out += (char)(d.cp - 0xFEE0);
+        } else if (const char* a = confusable_ascii(d.cp)) {
+            out += a;
+        } else {
+            out.append(utf8, i, (size_t)d.len);
+        }
+        i += (size_t)d.len;
+    }
+    return out;
+}
+
+inline bool is_latin_script_cp(unsigned cp) {
+    return (cp >= 0x0041 && cp <= 0x005A) || (cp >= 0x0061 && cp <= 0x007A);
+}
+inline bool is_cyrillic_script_cp(unsigned cp) { return cp >= 0x0400 && cp <= 0x04FF; }
+inline bool is_greek_script_cp(unsigned cp) { return cp >= 0x0370 && cp <= 0x03FF; }
+
+inline bool is_mixed_script(const std::string& utf8) {
+    bool latin = false, cyrillic = false, greek = false;
+    for (size_t i = 0; i < utf8.size();) {
+        Utf8Decoded d = utf8_decode_one(utf8, i);
+        if (!d.valid) { latin = cyrillic = greek = false; ++i; continue; }
+        bool target = false;
+        if (is_latin_script_cp(d.cp))    { latin = true; target = true; }
+        if (is_cyrillic_script_cp(d.cp)) { cyrillic = true; target = true; }
+        if (is_greek_script_cp(d.cp))    { greek = true; target = true; }
+        if (latin && (cyrillic || greek)) return true;
+        // CJK+Latin 是中文代码库常态，不算可疑；CJK 不清空 token 状态，仍能捕获 Latin+Cyrillic 夹杂。
+        if (!target && d.cp < 128 && !std::isalnum((unsigned char)d.cp))
+            latin = cyrillic = greek = false;
+        i += (size_t)d.len;
+    }
+    return false;
+}
+
+struct EgressFinding {
+    std::string kind;
+    std::string preview;
+};
+
+inline std::string egress_preview(const std::string& s) {
+    if (s.size() <= 8) return "***";
+    return s.substr(0, 4) + "***" + s.substr(s.size() - 4);
+}
+
+inline bool luhn_valid(const std::string& digits) {
+    int sum = 0;
+    bool dbl = false;
+    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+        if (!std::isdigit((unsigned char)*it)) return false;
+        int d = *it - '0';
+        if (dbl) { d *= 2; if (d > 9) d -= 9; }
+        sum += d;
+        dbl = !dbl;
+    }
+    return !digits.empty() && sum % 10 == 0;
+}
+
+inline bool iban_valid(const std::string& iban) {
+    std::string compact;
+    for (char c : iban) if (!std::isspace((unsigned char)c)) compact += (char)std::toupper((unsigned char)c);
+    if (compact.size() < 15 || compact.size() > 34) return false;
+    if (!std::isalpha((unsigned char)compact[0]) || !std::isalpha((unsigned char)compact[1])
+        || !std::isdigit((unsigned char)compact[2]) || !std::isdigit((unsigned char)compact[3])) return false;
+    std::string rearranged = compact.substr(4) + compact.substr(0, 4);
+    int mod = 0;
+    for (char c : rearranged) {
+        if (std::isdigit((unsigned char)c)) {
+            mod = (mod * 10 + (c - '0')) % 97;
+        } else if (std::isalpha((unsigned char)c)) {
+            int v = std::toupper((unsigned char)c) - 'A' + 10;
+            mod = (mod * 10 + v / 10) % 97;
+            mod = (mod * 10 + v % 10) % 97;
+        } else return false;
+    }
+    return mod == 1;
+}
+
+inline bool ssn_structurally_valid(const std::string& s) {
+    if (s.size() != 11 || s[3] != '-' || s[6] != '-') return false;
+    for (size_t i : {0u,1u,2u,4u,5u,7u,8u,9u,10u})
+        if (!std::isdigit((unsigned char)s[i])) return false;
+    int area = std::stoi(s.substr(0, 3));
+    int group = std::stoi(s.substr(4, 2));
+    int serial = std::stoi(s.substr(7, 4));
+    return area != 0 && area != 666 && area < 900 && group != 0 && serial != 0;
+}
+
+inline double shannon_entropy(const std::string& s) {
+    if (s.empty()) return 0.0;
+    std::map<char, int> counts;
+    for (char c : s) counts[c]++;
+    double h = 0.0;
+    for (const auto& kv : counts) {
+        double p = (double)kv.second / (double)s.size();
+        h -= p * std::log2(p);
+    }
+    return h;
+}
+
+class EgressScanner {
+public:
+    // D142：概率性出口扫描，只拦显式大块泄漏；必须与 D119 结构性出口白名单配对。
+    std::vector<EgressFinding> scan(const std::string& text) const {
+        std::vector<EgressFinding> out;
+        scan_prefixes(text, out);
+        scan_cards(text, out);
+        scan_ibans(text, out);
+        scan_ssns(text, out);
+        scan_entropy(text, out);
+        return out;
+    }
+
+private:
+    static bool secret_char(char c) {
+        return std::isalnum((unsigned char)c) || c == '_' || c == '-' || c == '.' || c == '/' || c == '+';
+    }
+    static void add(std::vector<EgressFinding>& out, const std::string& kind, const std::string& value) {
+        out.push_back({kind, egress_preview(value)});
+    }
+    static void scan_prefixes(const std::string& text, std::vector<EgressFinding>& out) {
+        static const char* prefixes[] = {
+            "Bearer ", "x-api-key: ", "x-goog-api-key: ", "sk-", "sk-ant-", "ghp_", "gho_", "ghs_",
+            "github_pat_", "AIza", "xai-", "gsk_", "AKIA", "ASIA", "sk_live_", "rk_live_"
+        };
+        for (const char* p : prefixes) {
+            std::string pre = p;
+            for (size_t pos = text.find(pre); pos != std::string::npos; pos = text.find(pre, pos + pre.size())) {
+                size_t end = pos + pre.size();
+                while (end < text.size() && secret_char(text[end])) ++end;
+                if (end > pos + pre.size()) add(out, "api_key", text.substr(pos, end - pos));
+            }
+        }
+        if (text.find("-----BEGIN ") != std::string::npos && text.find("PRIVATE KEY-----") != std::string::npos)
+            add(out, "pem", "-----BEGIN PRIVATE KEY-----");
+    }
+    static void scan_cards(const std::string& text, std::vector<EgressFinding>& out) {
+        for (size_t i = 0; i < text.size(); ++i) {
+            if (!std::isdigit((unsigned char)text[i])) continue;
+            std::string digits;
+            size_t j = i;
+            while (j < text.size() && (std::isdigit((unsigned char)text[j]) || text[j] == ' ' || text[j] == '-')) {
+                if (std::isdigit((unsigned char)text[j])) digits += text[j];
+                ++j;
+            }
+            if (digits.size() >= 13 && digits.size() <= 19 && luhn_valid(digits))
+                add(out, "credit_card", digits);
+            i = j;
+        }
+    }
+    static void scan_ibans(const std::string& text, std::vector<EgressFinding>& out) {
+        for (size_t i = 0; i < text.size();) {
+            while (i < text.size() && !std::isalnum((unsigned char)text[i])) ++i;
+            size_t j = i;
+            while (j < text.size() && std::isalnum((unsigned char)text[j])) ++j;
+            if (j > i) {
+                std::string tok = text.substr(i, j - i);
+                if (iban_valid(tok)) add(out, "iban", tok);
+            }
+            i = j + 1;
+        }
+    }
+    static void scan_ssns(const std::string& text, std::vector<EgressFinding>& out) {
+        for (size_t i = 0; i + 11 <= text.size(); ++i) {
+            std::string s = text.substr(i, 11);
+            if (ssn_structurally_valid(s)) add(out, "ssn", s);
+        }
+    }
+    static void scan_entropy(const std::string& text, std::vector<EgressFinding>& out) {
+        auto is_hex = [](const std::string& s) {
+            for (char c : s) if (!std::isxdigit((unsigned char)c)) return false;
+            return true;
+        };
+        auto is_b64 = [](char c) {
+            return std::isalnum((unsigned char)c) || c == '+' || c == '/' || c == '_' || c == '-' || c == '=';
+        };
+        for (size_t i = 0; i < text.size();) {
+            while (i < text.size() && !is_b64(text[i])) ++i;
+            size_t j = i;
+            while (j < text.size() && is_b64(text[j])) ++j;
+            std::string tok = text.substr(i, j - i);
+            if (tok.size() >= 20) {
+                if (is_hex(tok) && shannon_entropy(tok) > 3.0) add(out, "high_entropy_hex", tok);
+                else if (shannon_entropy(tok) > 4.5) add(out, "high_entropy_base64", tok);
+            }
+            i = j + 1;
+        }
+    }
+};
+
 // ════════════════════════════════════════════════════════════════
 // 致命三元组污点追踪 (Lethal-trifecta taint tracking) — 结构化注入防御 (D106)
 //   Spotlighting (D100) 是概率性防御；CaMeL/Simon Willison「致命三元组」给出
@@ -693,6 +941,42 @@ private:
     std::map<std::string, ToolRiskLevel> levels_;
 };
 
+// D140 — 值域授权门。D107 管“哪个工具能跑”，本类管“本次参数值能不能跑”；
+// approval_checksum 仍用于把人工批准绑定到具体 tool+args，三者正交组合。
+using ValuePredicate = std::function<std::optional<std::string>(const json& args)>;
+
+class ValueAuthorizationPolicy {
+public:
+    explicit ValueAuthorizationPolicy(bool deny_unknown = true)
+        : deny_unknown_(deny_unknown) {} // 默认 fail-closed；只做 deny-list 时显式传 false。
+
+    void set_predicate(const std::string& tool, ValuePredicate pred) {
+        predicates_[tool] = std::move(pred);
+    }
+    void allow(const std::string& tool) {
+        predicates_[tool] = [](const json&) -> std::optional<std::string> { return std::nullopt; };
+    }
+    void deny(const std::string& tool, std::string reason = "value authorization denied") {
+        predicates_[tool] = [reason = std::move(reason)](const json&) -> std::optional<std::string> {
+            return reason;
+        };
+    }
+
+    std::optional<std::string> check(const std::string& tool, const json& args) const {
+        auto it = predicates_.find(tool);
+        if (it == predicates_.end())
+            return deny_unknown_ ? std::optional<std::string>("unregistered tool: " + tool)
+                                 : std::nullopt;
+        if (!it->second) return "invalid value predicate";
+        return it->second(args);
+    }
+    bool deny_unknown() const { return deny_unknown_; }
+
+private:
+    bool deny_unknown_;
+    std::map<std::string, ValuePredicate> predicates_;
+};
+
 // ════════════════════════════════════════════════════════════════
 // SHA-256 + 防篡改审计日志 (Tamper-evident audit log) — OWASP Agentic T8 (D120)
 //   「否认与不可追溯」(Repudiation & Untraceability) 是 OWASP Agentic 头部威胁；
@@ -747,6 +1031,192 @@ inline std::string sha256_hex(const std::string& msg) {
     for (int i = 0; i < 8; ++i)
         for (int j = 7; j >= 0; --j) out += hx[(h[i] >> (j * 4)) & 0xF];
     return out;
+}
+
+inline std::array<unsigned char, 32> sha256_bytes(const std::string& msg) {
+    std::array<unsigned char, 32> out{};
+    std::string hx = sha256_hex(msg);
+    auto val = [](char c) -> unsigned char {
+        if (c >= '0' && c <= '9') return (unsigned char)(c - '0');
+        if (c >= 'a' && c <= 'f') return (unsigned char)(c - 'a' + 10);
+        if (c >= 'A' && c <= 'F') return (unsigned char)(c - 'A' + 10);
+        return 0;
+    };
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = (unsigned char)((val(hx[i * 2]) << 4) | val(hx[i * 2 + 1]));
+    return out;
+}
+
+inline std::string hex_lower(const std::vector<unsigned char>& bytes) {
+    static const char* hx = "0123456789abcdef";
+    std::string out; out.reserve(bytes.size() * 2);
+    for (unsigned char b : bytes) {
+        out += hx[(b >> 4) & 0xF];
+        out += hx[b & 0xF];
+    }
+    return out;
+}
+
+inline std::string hex_lower(const std::array<unsigned char, 32>& bytes) {
+    return hex_lower(std::vector<unsigned char>(bytes.begin(), bytes.end()));
+}
+
+inline std::string hmac_sha256_hex(const std::string& key, const std::string& msg) {
+    std::vector<unsigned char> k(key.begin(), key.end());
+    if (k.size() > 64) {
+        auto d = sha256_bytes(key);
+        k.assign(d.begin(), d.end());
+    }
+    k.resize(64, 0);
+    std::string inner, outer;
+    inner.reserve(64 + msg.size());
+    outer.reserve(96);
+    for (unsigned char b : k) {
+        inner.push_back((char)(b ^ 0x36));
+        outer.push_back((char)(b ^ 0x5c));
+    }
+    inner += msg;
+    auto inner_digest = sha256_bytes(inner);
+    outer.append((const char*)inner_digest.data(), inner_digest.size());
+    return hex_lower(sha256_bytes(outer));
+}
+
+inline std::string base64url_no_pad(const unsigned char* data, size_t n) {
+    static const char* T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve(((n + 2) / 3) * 4);
+    for (size_t i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)data[i] << 16;
+        bool two = i + 1 < n, three = i + 2 < n;
+        if (two)   v |= (unsigned)data[i + 1] << 8;
+        if (three) v |= (unsigned)data[i + 2];
+        out += T[(v >> 18) & 0x3F];
+        out += T[(v >> 12) & 0x3F];
+        if (two)   out += T[(v >> 6) & 0x3F];
+        if (three) out += T[v & 0x3F];
+    }
+    return out;
+}
+
+inline std::string pkce_s256_challenge(const std::string& verifier) {
+    auto d = sha256_bytes(verifier);
+    return base64url_no_pad(d.data(), d.size());
+}
+
+struct WwwAuthenticate {
+    std::string scheme;
+    std::map<std::string, std::string> params;
+    std::string get(const std::string& key) const {
+        auto it = params.find(key);
+        return it == params.end() ? std::string() : it->second;
+    }
+    std::string resource_metadata() const { return get("resource_metadata"); }
+    std::string scope() const { return get("scope"); }
+    std::string error() const { return get("error"); }
+};
+
+inline WwwAuthenticate parse_www_authenticate(const std::string& header) {
+    WwwAuthenticate out;
+    size_t i = 0, n = header.size();
+    while (i < n && std::isspace((unsigned char)header[i])) ++i;
+    while (i < n && !std::isspace((unsigned char)header[i]) && header[i] != ',')
+        out.scheme += header[i++];
+    for (auto& c : out.scheme) c = (char)std::tolower((unsigned char)c);
+    while (i < n) {
+        while (i < n && (std::isspace((unsigned char)header[i]) || header[i] == ',')) ++i;
+        std::string key;
+        while (i < n && header[i] != '=' && header[i] != ',') {
+            if (!std::isspace((unsigned char)header[i]))
+                key += (char)std::tolower((unsigned char)header[i]);
+            ++i;
+        }
+        if (key.empty() || i >= n || header[i] != '=') {
+            while (i < n && header[i] != ',') ++i;
+            continue;
+        }
+        ++i;
+        std::string val;
+        if (i < n && header[i] == '"') {
+            ++i;
+            while (i < n) {
+                char c = header[i++];
+                if (c == '\\' && i < n) { val += header[i++]; continue; }
+                if (c == '"') break;
+                val += c;
+            }
+        } else {
+            while (i < n && header[i] != ',') {
+                if (!std::isspace((unsigned char)header[i])) val += header[i];
+                ++i;
+            }
+        }
+        out.params[key] = val;
+    }
+    return out;
+}
+
+struct UrlParts {
+    std::string scheme, host, port, path;
+    bool valid = false;
+};
+
+inline UrlParts parse_url_parts(const std::string& url) {
+    UrlParts p;
+    size_t sep = url.find("://");
+    if (sep == std::string::npos) return p;
+    p.scheme = url.substr(0, sep);
+    for (auto& c : p.scheme) c = (char)std::tolower((unsigned char)c);
+    size_t hs = sep + 3;
+    size_t he = url.find_first_of("/?#", hs);
+    std::string auth = he == std::string::npos ? url.substr(hs) : url.substr(hs, he - hs);
+    size_t at = auth.find('@');
+    if (at != std::string::npos) auth = auth.substr(at + 1);
+    size_t colon = auth.rfind(':');
+    if (colon != std::string::npos) {
+        p.host = auth.substr(0, colon);
+        p.port = auth.substr(colon + 1);
+    } else {
+        p.host = auth;
+    }
+    for (auto& c : p.host) c = (char)std::tolower((unsigned char)c);
+    p.path = (he == std::string::npos || url[he] != '/') ? "" : url.substr(he);
+    size_t q = p.path.find_first_of("?#");
+    if (q != std::string::npos) p.path = p.path.substr(0, q);
+    p.valid = !p.scheme.empty() && !p.host.empty();
+    return p;
+}
+
+inline std::string canonical_resource_uri(const std::string& resource_url) {
+    UrlParts p = parse_url_parts(resource_url);
+    if (!p.valid) return resource_url;
+    bool default_port = (p.scheme == "https" && p.port == "443")
+                     || (p.scheme == "http"  && p.port == "80");
+    std::string out = p.scheme + "://" + p.host;
+    if (!p.port.empty() && !default_port) out += ":" + p.port;
+    std::string path = p.path;
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    if (path == "/") path.clear();
+    out += path;
+    return out;
+}
+
+inline std::string oauth_protected_resource_url(const std::string& resource_url) {
+    UrlParts p = parse_url_parts(resource_url);
+    if (!p.valid) return "";
+    std::string origin = p.scheme + "://" + p.host;
+    if (!p.port.empty()) origin += ":" + p.port;
+    std::string path = p.path;
+    if (path == "/") path.clear();
+    return origin + "/.well-known/oauth-protected-resource" + path;
+}
+
+inline bool oauth_metadata_matches_resource(const json& metadata, const std::string& resource_url) {
+    if (!metadata.is_object() || !metadata.contains("resource") || !metadata["resource"].is_string())
+        return false;
+    if (!metadata.contains("authorization_servers") || !metadata["authorization_servers"].is_array())
+        return false;
+    return canonical_resource_uri(metadata["resource"].get<std::string>())
+        == canonical_resource_uri(resource_url);
 }
 
 /** 审计日志中的一条记录（哈希链节点）。 */
@@ -1007,6 +1477,11 @@ struct ProviderConfig {
     bool         prompt_caching   = false;// D114 — Anthropic cache_control 缓存断点（默认关）
     std::string  service_tier     = "";   // D125 — OpenAI service_tier: auto|default|flex|priority（空=不设置）
 
+    std::string  openai_prompt_cache_mode = ""; // D145：GPT-5.6+；""=不注入，implicit|explicit
+    std::string  openai_prompt_cache_ttl  = ""; // D145：当前仅 "30m"，留空不发 ttl
+    std::string  openai_prompt_cache_key  = ""; // D145：顶层 prompt_cache_key
+    int          openai_prompt_cache_breakpoints = 0; // D145：explicit 写点数，上限 4
+
     static ProviderConfig anthropic(const std::string& key,
                                      const std::string& model = "claude-opus-4-8") {
         ProviderConfig c{ProviderType::ANTHROPIC, key, model, "", 4096, 60.0, ""};
@@ -1165,6 +1640,50 @@ inline void apply_anthropic_cache_control(json& body) {
         } else if (body["system"].is_array() && !body["system"].empty()) {
             body["system"].back()["cache_control"] = cc;
         }
+    }
+}
+
+inline void apply_openai_prompt_cache(json& body, const ProviderConfig& cfg) {
+    if (cfg.openai_prompt_cache_mode.empty() && cfg.openai_prompt_cache_key.empty())
+        return;
+    if (!cfg.openai_prompt_cache_mode.empty()) {
+        json opts = {{"mode", cfg.openai_prompt_cache_mode}};
+        if (!cfg.openai_prompt_cache_ttl.empty()) opts["ttl"] = cfg.openai_prompt_cache_ttl;
+        body["prompt_cache_options"] = opts;
+    }
+    if (!cfg.openai_prompt_cache_key.empty())
+        body["prompt_cache_key"] = cfg.openai_prompt_cache_key;
+    if (cfg.openai_prompt_cache_mode != "explicit") return;
+
+    // D145：仅 GPT-5.6+ 支持。这里是 opt-in 形状注入；误用于旧模型由服务端报错。
+    int remaining = std::min(4, std::max(0, cfg.openai_prompt_cache_breakpoints));
+    auto mark = [&](json& block) {
+        if (remaining <= 0 || !block.is_object()) return;
+        block["prompt_cache_breakpoint"] = {{"mode", "explicit"}};
+        --remaining;
+    };
+    if (body.contains("tools") && body["tools"].is_array() && !body["tools"].empty())
+        mark(body["tools"].back());
+    if (body.contains("messages") && body["messages"].is_array()) {
+        for (auto& msg : body["messages"]) {
+            if (remaining <= 0) break;
+            if (!msg.is_object() || msg.value("role", "") != "system" || !msg.contains("content")) continue;
+            json& content = msg["content"];
+            if (content.is_string()) {
+                std::string text = content.get<std::string>();
+                content = json::array({{{"type", "text"}, {"text", text}}});
+            }
+            if (content.is_array() && !content.empty())
+                mark(content.back());
+        }
+    }
+    if (body.contains("system")) {
+        if (body["system"].is_string()) {
+            std::string sys = body["system"].get<std::string>();
+            body["system"] = json::array({{{"type", "text"}, {"text", sys}}});
+        }
+        if (body["system"].is_array() && !body["system"].empty())
+            mark(body["system"].back());
     }
 }
 
@@ -3080,6 +3599,179 @@ inline BootstrapResult paired_bootstrap(const std::vector<double>& deltas,
     return r;
 }
 
+inline double beta_continued_fraction(double a, double b, double x) {
+    const int max_iter = 100;
+    const double eps = 3e-14;
+    const double fpmin = 1e-300;
+    double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+    double c = 1.0, d = 1.0 - qab * x / qap;
+    if (std::fabs(d) < fpmin) d = fpmin;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= max_iter; ++m) {
+        int m2 = 2 * m;
+        double aa = (double)m * (b - (double)m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d; if (std::fabs(d) < fpmin) d = fpmin;
+        c = 1.0 + aa / c; if (std::fabs(c) < fpmin) c = fpmin;
+        d = 1.0 / d; h *= d * c;
+        aa = -(a + (double)m) * (qab + (double)m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d; if (std::fabs(d) < fpmin) d = fpmin;
+        c = 1.0 + aa / c; if (std::fabs(c) < fpmin) c = fpmin;
+        d = 1.0 / d;
+        double del = d * c;
+        h *= del;
+        if (std::fabs(del - 1.0) < eps) break;
+    }
+    return h;
+}
+
+inline double incomplete_beta_half_integer(int a, int b) {
+    if (a <= 0 || b <= 0) return 0.0;
+    int n = a + b - 1;
+    double p = std::ldexp(1.0, -n);
+    double term = p;
+    for (int j = 0; j < a; ++j)
+        term *= (double)(n - j) / (double)(j + 1);
+    double sum = 0.0;
+    for (int j = a; j <= n; ++j) {
+        sum += term;
+        if (j < n) term *= (double)(n - j) / (double)(j + 1);
+    }
+    return sum;
+}
+
+inline double regularized_incomplete_beta(double a, double b, double x) {
+    if (a <= 0.0 || b <= 0.0) return std::numeric_limits<double>::quiet_NaN();
+    if (x <= 0.0) return 0.0;
+    if (x >= 1.0) return 1.0;
+    if (std::fabs(x - 0.5) < 1e-15 && std::fabs(a - std::round(a)) < 1e-12
+        && std::fabs(b - std::round(b)) < 1e-12)
+        return incomplete_beta_half_integer((int)std::round(a), (int)std::round(b));
+    if (std::fabs(a - 1.0) < 1e-15) return 1.0 - std::pow(1.0 - x, b);
+    if (std::fabs(b - 1.0) < 1e-15) return std::pow(x, a);
+    double bt = std::exp(std::lgamma(a + b) - std::lgamma(a) - std::lgamma(b)
+                         + a * std::log(x) + b * std::log(1.0 - x));
+    if (x < (a + 1.0) / (a + b + 2.0))
+        return bt * beta_continued_fraction(a, b, x) / a;
+    return 1.0 - bt * beta_continued_fraction(b, a, 1.0 - x) / b;
+}
+
+inline double adaptive_consistency_confidence(int v1, int v2) {
+    if (v1 < 0 || v2 < 0) return 0.0;
+    return incomplete_beta_half_integer(v2 + 1, v1 + 1);
+}
+
+inline bool should_stop(const std::map<std::string, int>& counts,
+                        double thresh = 0.95,
+                        int min_samples = 1) {
+    int total = 0, first = 0, second = 0;
+    for (const auto& kv : counts) {
+        int c = std::max(0, kv.second);
+        total += c;
+        if (c > first) { second = first; first = c; }
+        else if (c > second) second = c;
+    }
+    if (total < min_samples || first <= second) return false;
+    return adaptive_consistency_confidence(first, second) >= thresh;
+}
+
+template <class T>
+inline bool esc_window_converged(const std::vector<T>& window) {
+    if (window.empty()) return false;
+    for (const auto& v : window) if (!(v == window.front())) return false;
+    return true;
+}
+
+enum class AgentErrorClass {
+    ToolNotFound, InvalidArgs, ToolTimeout, ToolHttpError, OutputSchemaViolation,
+    LoopDetected, MaxIterations, PlanningError, ReflectionError, MemoryError,
+    SystemError, Unknown
+};
+
+struct AgentErrorSignal {
+    std::string exception_type;
+    std::string message;
+    int http_status = 0;
+    bool timeout = false;
+    bool schema_violation = false;
+    bool loop_detected = false;
+    bool max_iterations = false;
+    bool tool_not_found = false;
+    bool invalid_args = false;
+    bool memory_error = false;
+};
+
+using SemanticErrorClassifier =
+    std::function<std::optional<AgentErrorClass>(const AgentErrorSignal&)>;
+
+inline AgentErrorClass classify_error_structural(
+        const AgentErrorSignal& e,
+        const SemanticErrorClassifier& semantic = SemanticErrorClassifier()) {
+    if (e.tool_not_found || e.exception_type.find("ToolNotFound") != std::string::npos)
+        return AgentErrorClass::ToolNotFound;
+    if (e.invalid_args || e.exception_type.find("InvalidArg") != std::string::npos)
+        return AgentErrorClass::InvalidArgs;
+    if (e.timeout || e.exception_type.find("Timeout") != std::string::npos)
+        return AgentErrorClass::ToolTimeout;
+    if (e.schema_violation) return AgentErrorClass::OutputSchemaViolation;
+    if (e.loop_detected) return AgentErrorClass::LoopDetected;
+    if (e.max_iterations) return AgentErrorClass::MaxIterations;
+    if (e.memory_error) return AgentErrorClass::MemoryError;
+    if (e.http_status > 0) return AgentErrorClass::ToolHttpError;
+    if (e.exception_type.find("System") != std::string::npos)
+        return AgentErrorClass::SystemError;
+    if (semantic) {
+        auto cls = semantic(e);
+        if (cls) return *cls;
+    }
+    return AgentErrorClass::Unknown;
+}
+
+enum class RetryAction { Retry, RetryWithBackoff, Reformulate, Escalate, Degrade, Abort };
+
+struct RetryRule {
+    int max_attempts = 1;
+    RetryAction action = RetryAction::Retry;
+    RetryAction exhausted_action = RetryAction::Escalate;
+    int backoff_ms = 0;
+};
+
+struct RetryDecision {
+    RetryAction action = RetryAction::Escalate;
+    int backoff_ms = 0;
+};
+
+class RetryPolicy {
+public:
+    RetryPolicy() {
+        set_rule(AgentErrorClass::ToolTimeout, {2, RetryAction::RetryWithBackoff, RetryAction::Escalate, 500});
+        set_rule(AgentErrorClass::ToolHttpError, {2, RetryAction::RetryWithBackoff, RetryAction::Escalate, 500});
+        set_rule(AgentErrorClass::InvalidArgs, {1, RetryAction::Reformulate, RetryAction::Escalate, 0});
+        set_rule(AgentErrorClass::OutputSchemaViolation, {1, RetryAction::Reformulate, RetryAction::Escalate, 0});
+        set_rule(AgentErrorClass::LoopDetected, {0, RetryAction::Abort, RetryAction::Abort, 0});
+        set_rule(AgentErrorClass::MaxIterations, {0, RetryAction::Escalate, RetryAction::Escalate, 0});
+        set_rule(AgentErrorClass::ToolNotFound, {0, RetryAction::Degrade, RetryAction::Degrade, 0});
+    }
+
+    void set_rule(AgentErrorClass cls, RetryRule rule) { rules_[cls] = rule; }
+
+    RetryDecision decide(AgentErrorClass cls, int attempt_no) const {
+        RetryRule r = rule_for(cls);
+        if (attempt_no < r.max_attempts)
+            return {r.action, r.action == RetryAction::RetryWithBackoff ? r.backoff_ms : 0};
+        return {r.exhausted_action, 0};
+    }
+
+    RetryRule rule_for(AgentErrorClass cls) const {
+        auto it = rules_.find(cls);
+        if (it != rules_.end()) return it->second;
+        return {1, RetryAction::Retry, RetryAction::Escalate, 0}; // fail-closed：未知类最多重试一次
+    }
+
+private:
+    std::map<AgentErrorClass, RetryRule> rules_;
+};
+
 // ════════════════════════════════════════════════════════════════
 // 轨迹评测 (Trajectory evaluation) — D110
 //   除了对「最终输出」打分，还要对 agent 走过的「工具调用序列」打分
@@ -4386,6 +5078,21 @@ private:
 // ════════════════════════════════════════════════════════════════
 
 /** A2A 消息部件（text / file / data 三选一）。 */
+inline std::string a2a_string_alias(const json& j, const char* camel, const char* snake = nullptr) {
+    if (j.contains(camel) && j[camel].is_string()) return j[camel].get<std::string>();
+    if (snake && j.contains(snake) && j[snake].is_string()) return j[snake].get<std::string>();
+    return "";
+}
+
+inline std::vector<std::string> a2a_string_array_alias(const json& j, const char* camel, const char* snake = nullptr) {
+    std::vector<std::string> out;
+    const json* a = nullptr;
+    if (j.contains(camel) && j[camel].is_array()) a = &j[camel];
+    else if (snake && j.contains(snake) && j[snake].is_array()) a = &j[snake];
+    if (a) for (const auto& x : *a) if (x.is_string()) out.push_back(x.get<std::string>());
+    return out;
+}
+
 struct A2APart {
     std::string kind = "text";   // "text" | "file" | "data"
     std::string text;            // kind==text
@@ -4393,6 +5100,9 @@ struct A2APart {
     std::string file_uri;        // kind==file
     std::string file_bytes;      // kind==file（base64）
     std::string media_type;      // kind==file 可选 MIME
+
+    std::string filename;        // D136 v1.0 Part.filename
+    json        metadata;        // D136 v1.0 Part.metadata
 
     static A2APart from_text(const std::string& t) { A2APart p; p.kind = "text"; p.text = t; return p; }
     static A2APart from_data(const json& d) { A2APart p; p.kind = "data"; p.data = d; return p; }
@@ -4408,30 +5118,59 @@ struct A2APart {
             if (!media_type.empty()) f["mimeType"] = media_type;
             j["file"] = f;
         }
+        if (!metadata.is_null() && !metadata.empty()) j["metadata"] = metadata;
+        if (!filename.empty()) j["filename"] = filename;
         return j;
     }
     static A2APart from_json(const json& j) {
         A2APart p;
-        p.kind = j.value("kind", "text");
-        if (p.kind == "text") p.text = j.value("text", "");
-        else if (p.kind == "data") p.data = j.value("data", json());
-        else if (p.kind == "file") {
+        p.metadata   = j.value("metadata", json());
+        p.filename   = j.value("filename", "");
+        p.media_type = a2a_string_alias(j, "mediaType", "mime_type");
+        if (j.contains("text")) {
+            p.kind = "text"; p.text = j.value("text", "");
+        } else if (j.contains("raw")) {
+            p.kind = "file"; p.file_bytes = j.value("raw", "");
+        } else if (j.contains("url")) {
+            p.kind = "file"; p.file_uri = j.value("url", "");
+        } else if (j.contains("data")) {
+            p.kind = "data"; p.data = j["data"];
+        } else if (j.value("kind", "text") == "data") {
+            p.kind = "data"; p.data = j.value("data", json());
+        } else if (j.value("kind", "text") == "file") {
+            p.kind = "file";
             json f = j.value("file", json::object());
             p.file_uri   = f.value("uri", "");
             p.file_bytes = f.value("bytes", "");
-            p.media_type = f.value("mimeType", "");
+            p.media_type = f.value("mimeType", f.value("mediaType", p.media_type));
+            if (p.filename.empty()) p.filename = f.value("filename", "");
+        } else {
+            p.kind = "text";
+            p.text = j.value("text", "");
         }
         return p;
     }
 };
 
 /** A2A 消息（role: "user" | "agent"）。 */
+inline std::string a2a_parse_role(const json& v) {
+    if (v.is_number_integer()) return v.get<int>() == 2 ? "agent" : "user";
+    std::string role = v.is_string() ? v.get<std::string>() : "agent";
+    if (role == "ROLE_USER") return "user";
+    if (role == "ROLE_AGENT") return "agent";
+    for (auto& c : role) c = (char)std::tolower((unsigned char)c);
+    return role;
+}
+
 struct A2AMessage {
     std::string          role = "user";
     std::vector<A2APart> parts;
     std::string          message_id;
     std::string          task_id;
     std::string          context_id;
+    json                 metadata;
+    std::vector<std::string> extensions;
+    std::vector<std::string> reference_task_ids;
 
     static A2AMessage user_text(const std::string& text, const std::string& msg_id = "") {
         A2AMessage m; m.role = "user";
@@ -4454,14 +5193,20 @@ struct A2AMessage {
         if (!message_id.empty()) j["messageId"] = message_id;
         if (!task_id.empty())    j["taskId"]    = task_id;
         if (!context_id.empty()) j["contextId"] = context_id;
+        if (!metadata.is_null() && !metadata.empty()) j["metadata"] = metadata;
+        if (!extensions.empty()) j["extensions"] = extensions;
+        if (!reference_task_ids.empty()) j["referenceTaskIds"] = reference_task_ids;
         return j;
     }
     static A2AMessage from_json(const json& j) {
         A2AMessage m;
-        m.role       = j.value("role", "agent");
-        m.message_id = j.value("messageId", "");
-        m.task_id    = j.value("taskId", "");
-        m.context_id = j.value("contextId", "");
+        m.role       = j.contains("role") ? a2a_parse_role(j["role"]) : "agent";
+        m.message_id = a2a_string_alias(j, "messageId", "message_id");
+        m.task_id    = a2a_string_alias(j, "taskId", "task_id");
+        m.context_id = a2a_string_alias(j, "contextId", "context_id");
+        m.metadata   = j.value("metadata", json());
+        m.extensions = a2a_string_array_alias(j, "extensions");
+        m.reference_task_ids = a2a_string_array_alias(j, "referenceTaskIds", "reference_task_ids");
         if (j.contains("parts") && j["parts"].is_array())
             for (const auto& p : j["parts"]) m.parts.push_back(A2APart::from_json(p));
         return m;
@@ -4493,30 +5238,90 @@ inline A2ATaskState a2a_parse_state(const std::string& s) {
     if (k == "rejected")                       return A2ATaskState::Rejected;
     return A2ATaskState::Unknown;
 }
+inline A2ATaskState a2a_parse_state_value(const json& v) {
+    if (v.is_string()) return a2a_parse_state(v.get<std::string>());
+    if (!v.is_number_integer()) return A2ATaskState::Unknown;
+    switch (v.get<int>()) {
+        case 1: return A2ATaskState::Submitted;
+        case 2: return A2ATaskState::Working;
+        case 3: return A2ATaskState::Completed;
+        case 4: return A2ATaskState::Failed;
+        case 5: return A2ATaskState::Canceled;
+        case 6: return A2ATaskState::InputRequired;
+        case 7: return A2ATaskState::Rejected;
+        case 8: return A2ATaskState::AuthRequired;
+        default: return A2ATaskState::Unknown;
+    }
+}
 inline bool a2a_is_terminal(A2ATaskState s) {
     return s == A2ATaskState::Completed || s == A2ATaskState::Failed
         || s == A2ATaskState::Canceled  || s == A2ATaskState::Rejected;
 }
 
 /** A2A 任务。 */
+struct A2AArtifact {
+    std::string id, name, description;
+    std::vector<A2APart> parts;
+    json metadata;
+    std::vector<std::string> extensions;
+    json raw;
+
+    static A2AArtifact from_json(const json& j) {
+        A2AArtifact a;
+        a.raw = j;
+        a.id = a2a_string_alias(j, "artifactId", "artifact_id");
+        a.name = j.value("name", "");
+        a.description = j.value("description", "");
+        a.metadata = j.value("metadata", json());
+        a.extensions = a2a_string_array_alias(j, "extensions");
+        if (j.contains("parts") && j["parts"].is_array())
+            for (const auto& p : j["parts"]) a.parts.push_back(A2APart::from_json(p));
+        return a;
+    }
+};
+
+struct A2ATaskStatus {
+    A2ATaskState state = A2ATaskState::Unknown;
+    A2AMessage message;
+    std::string timestamp;
+    json raw;
+
+    static A2ATaskStatus from_json(const json& j) {
+        A2ATaskStatus s;
+        s.raw = j;
+        if (j.contains("state")) s.state = a2a_parse_state_value(j["state"]);
+        if (j.contains("message") && j["message"].is_object())
+            s.message = A2AMessage::from_json(j["message"]);
+        s.timestamp = j.value("timestamp", "");
+        return s;
+    }
+};
+
 struct A2ATask {
     std::string             id;
     std::string             context_id;
     A2ATaskState            state = A2ATaskState::Unknown;
     std::vector<A2AMessage> history;
     json                    artifacts = json::array();
+    std::vector<A2AArtifact> artifact_list;
+    A2ATaskStatus           status;
+    json                    metadata;
     json                    raw;   // 完整原始 JSON
 
     static A2ATask from_json(const json& j) {
         A2ATask t;
         t.raw        = j;
-        t.id         = j.value("id", "");
-        t.context_id = j.value("contextId", "");
+        t.id         = a2a_string_alias(j, "id");
+        t.context_id = a2a_string_alias(j, "contextId", "context_id");
+        t.metadata   = j.value("metadata", json());
         json status  = j.value("status", json::object());
-        t.state      = a2a_parse_state(status.value("state", ""));
+        t.status     = A2ATaskStatus::from_json(status);
+        t.state      = t.status.state;
         if (j.contains("history") && j["history"].is_array())
             for (const auto& m : j["history"]) t.history.push_back(A2AMessage::from_json(m));
         t.artifacts  = j.value("artifacts", json::array());
+        if (t.artifacts.is_array())
+            for (const auto& a : t.artifacts) t.artifact_list.push_back(A2AArtifact::from_json(a));
         return t;
     }
 };
@@ -4537,16 +5342,37 @@ struct A2AAgentSkill {
 };
 
 /** A2A Agent Card — agent 身份/能力/技能/服务端点元数据文档。 */
+struct A2AAgentEndpoint {
+    std::string url, protocol_binding, tenant, protocol_version;
+    json raw;
+    static A2AAgentEndpoint from_json(const json& j) {
+        A2AAgentEndpoint ep;
+        ep.raw = j;
+        ep.url = j.value("url", "");
+        ep.protocol_binding = j.value("protocolBinding", j.value("preferredTransport", ""));
+        ep.tenant = j.value("tenant", "");
+        ep.protocol_version = j.value("protocolVersion", "");
+        return ep;
+    }
+};
+
 struct A2AAgentCard {
     std::string                name, description, url, version, protocol_version;
     std::vector<std::string>   default_input_modes, default_output_modes;
     std::vector<A2AAgentSkill> skills;
+    std::vector<A2AAgentEndpoint> supported_interfaces;
     bool                       streaming = false;           // capabilities.streaming
     bool                       push_notifications = false;  // capabilities.pushNotifications (D105)
     bool                       extended_agent_card = false; // capabilities.extendedAgentCard (v1.0 移到此处)
     std::string                preferred_transport;         // preferredTransport (JSONRPC/GRPC/HTTP+JSON)
     json                       signature;                   // AgentCardSignature（v1.0 签名卡，原样保留供校验）
     json                       security_schemes;            // securitySchemes（原样保留）
+    json                       signatures = json::array();  // D136：v1.0 signatures[]
+    json                       security_requirements;        // D136：v1.0 securityRequirements / 旧 security 原样保留
+    json                       capabilities;
+    json                       provider;
+    std::string                documentation_url;
+    std::string                icon_url;
     json                       raw;
 
     static A2AAgentCard from_json(const json& j) {
@@ -4558,12 +5384,38 @@ struct A2AAgentCard {
         c.version          = j.value("version", "");
         c.protocol_version = j.value("protocolVersion", "");
         json caps          = j.value("capabilities", json::object());
+        c.capabilities     = caps;
+        c.provider         = j.value("provider", json::object());
+        c.documentation_url = j.value("documentationUrl", "");
+        c.icon_url         = j.value("iconUrl", "");
         c.streaming           = caps.value("streaming", false);
         c.push_notifications  = caps.value("pushNotifications", false);   // D105
         c.extended_agent_card = caps.value("extendedAgentCard", false);   // D105: v1.0 在 capabilities 下
         c.preferred_transport = j.value("preferredTransport", "");        // D105
-        if (j.contains("signature"))       c.signature        = j["signature"];        // D105: 签名卡
+        if (j.contains("supportedInterfaces") && j["supportedInterfaces"].is_array()) {
+            for (const auto& ep : j["supportedInterfaces"])
+                c.supported_interfaces.push_back(A2AAgentEndpoint::from_json(ep));
+            if (!c.supported_interfaces.empty()) {
+                c.url = c.supported_interfaces.front().url;
+                c.protocol_version = c.supported_interfaces.front().protocol_version;
+                c.preferred_transport = c.supported_interfaces.front().protocol_binding;
+            }
+        } else if (!c.url.empty()) {
+            c.supported_interfaces.push_back(A2AAgentEndpoint::from_json({
+                {"url", c.url},
+                {"protocolBinding", c.preferred_transport},
+                {"protocolVersion", c.protocol_version}
+            }));
+        }
+        if (j.contains("signature")) {
+            c.signatures = json::array({j["signature"]});
+            c.signature = j["signature"];        // D105: 签名卡
+            c.signatures = json::array({j["signature"]});
+        }
+        if (j.contains("signatures"))      c.signatures       = j["signatures"];
         if (j.contains("securitySchemes")) c.security_schemes = j["securitySchemes"];  // D105
+        if (j.contains("securityRequirements")) c.security_requirements = j["securityRequirements"];
+        else if (j.contains("security"))        c.security_requirements = j["security"];
         auto arr_str = [](const json& a) {
             std::vector<std::string> v;
             if (a.is_array()) for (const auto& x : a) if (x.is_string()) v.push_back(x.get<std::string>());
@@ -4575,6 +5427,59 @@ struct A2AAgentCard {
             for (const auto& s : j["skills"]) c.skills.push_back(A2AAgentSkill::from_json(s));
         return c;
     }
+};
+
+inline std::string agent_card_hash(const A2AAgentCard& card) {
+    json src = card.raw.is_object() ? card.raw : json::object();
+    json canon = json::object();
+    static const char* keys[] = {
+        "name", "description", "url", "supportedInterfaces", "provider", "version",
+        "protocolVersion", "preferredTransport", "documentationUrl", "capabilities",
+        "securitySchemes", "securityRequirements", "security", "defaultInputModes",
+        "defaultOutputModes", "skills", "signatures", "signature", "iconUrl"
+    };
+    for (const char* k : keys) if (src.contains(k)) canon[k] = src[k];
+    if (!canon.contains("supportedInterfaces") && !card.supported_interfaces.empty()) {
+        json a = json::array();
+        for (const auto& ep : card.supported_interfaces) {
+            json e = {{"url", ep.url}, {"protocolBinding", ep.protocol_binding},
+                      {"protocolVersion", ep.protocol_version}};
+            if (!ep.tenant.empty()) e["tenant"] = ep.tenant;
+            a.push_back(e);
+        }
+        canon["supportedInterfaces"] = a;
+    }
+    if (!canon.contains("name")) canon["name"] = card.name;
+    if (!canon.contains("description")) canon["description"] = card.description;
+    if (!canon.contains("version")) canon["version"] = card.version;
+    if (!canon.contains("url") && !card.url.empty()) canon["url"] = card.url;
+    if (!canon.contains("capabilities") && !card.capabilities.is_null()) canon["capabilities"] = card.capabilities;
+    if (!canon.contains("securitySchemes") && !card.security_schemes.is_null()) canon["securitySchemes"] = card.security_schemes;
+    if (!canon.contains("securityRequirements") && !card.security_requirements.is_null()) canon["securityRequirements"] = card.security_requirements;
+    if (!canon.contains("skills")) {
+        json skills = json::array();
+        for (const auto& s : card.skills)
+            skills.push_back({{"id", s.id}, {"name", s.name}, {"description", s.description}, {"tags", s.tags}});
+        canon["skills"] = skills;
+    }
+    return sha256_hex(canon.dump());
+}
+
+class AgentCardPinStore {
+public:
+    enum class Status { Unknown, Unchanged, Drifted };
+    void pin(const std::string& agent_id, const A2AAgentCard& card) {
+        pinned_[agent_id] = agent_card_hash(card);
+    }
+    Status verify(const std::string& agent_id, const A2AAgentCard& card) const {
+        auto it = pinned_.find(agent_id);
+        if (it == pinned_.end()) return Status::Unknown;
+        return it->second == agent_card_hash(card) ? Status::Unchanged : Status::Drifted;
+    }
+    bool is_pinned(const std::string& agent_id) const { return pinned_.count(agent_id) > 0; }
+    size_t size() const { return pinned_.size(); }
+private:
+    std::unordered_map<std::string, std::string> pinned_;
 };
 
 // ── D105 — A2A 流式事件（message/stream SSE 帧解析） ──────────
@@ -4600,32 +5505,78 @@ inline A2AStreamEvent a2a_parse_stream_frame(const json& result) {
     A2AStreamEvent ev;
     ev.raw        = result;
     std::string kind = result.value("kind", "");
-    ev.task_id    = result.value("taskId", result.value("id", std::string()));
-    ev.context_id = result.value("contextId", "");
+    json payload = result;
+    if (result.contains("task")) { kind = "task"; payload = result["task"]; }
+    else if (result.contains("message")) { kind = "message"; payload = result["message"]; }
+    else if (result.contains("statusUpdate")) { kind = "status-update"; payload = result["statusUpdate"]; }
+    else if (result.contains("artifactUpdate")) { kind = "artifact-update"; payload = result["artifactUpdate"]; }
+    ev.task_id    = payload.value("taskId", payload.value("id", std::string()));
+    ev.context_id = payload.value("contextId", "");
     if (kind == "task") {
         ev.type = A2AStreamEventType::Task;
-        json status = result.value("status", json::object());
-        ev.state    = a2a_parse_state(status.value("state", ""));
+        json status = payload.value("status", json::object());
+        ev.state    = status.contains("state") ? a2a_parse_state_value(status["state"]) : A2ATaskState::Unknown;
         ev.terminal = a2a_is_terminal(ev.state);
     } else if (kind == "status-update") {
         ev.type = A2AStreamEventType::StatusUpdate;
-        json status = result.value("status", json::object());
-        ev.state    = a2a_parse_state(status.value("state", ""));
+        json status = payload.value("status", json::object());
+        ev.state    = status.contains("state") ? a2a_parse_state_value(status["state"]) : A2ATaskState::Unknown;
         ev.terminal = a2a_is_terminal(ev.state);       // v1.0：由 state 推断
         if (result.contains("final") && result["final"].is_boolean())
             ev.terminal = ev.terminal || result["final"].get<bool>();  // 兼容旧 final
     } else if (kind == "message") {
         ev.type    = A2AStreamEventType::Message;
-        ev.message = A2AMessage::from_json(result);
+        ev.message = A2AMessage::from_json(payload);
     } else if (kind == "artifact-update") {
         ev.type     = A2AStreamEventType::ArtifactUpdate;
-        ev.artifact = result.value("artifact", json::object());
+        ev.artifact = payload.value("artifact", json::object());
     }
     return ev;
 }
 
 /** A2A 客户端：AgentCard 发现 + message/send（JSON-RPC 2.0 over HTTP）。
  *  发现端点：GET {base}/.well-known/agent-card.json。 */
+struct A2AListTasksParams {
+    std::string context_id;
+    std::string status;
+    int page_size = 0;
+    std::string page_token;
+    int history_length = 0;
+    std::string status_timestamp_after;
+    bool include_artifacts = false;
+
+    json to_json() const {
+        json p = json::object();
+        if (!context_id.empty()) p["contextId"] = context_id;
+        if (!status.empty()) p["status"] = status;
+        if (page_size > 0) p["pageSize"] = std::min(100, page_size);
+        if (!page_token.empty()) p["pageToken"] = page_token;
+        if (history_length > 0) p["historyLength"] = history_length;
+        if (!status_timestamp_after.empty()) p["statusTimestampAfter"] = status_timestamp_after;
+        if (include_artifacts) p["includeArtifacts"] = true;
+        return p;
+    }
+};
+
+struct A2AListTasksResult {
+    std::vector<A2ATask> tasks;
+    std::string next_page_token;
+    int page_size = 0;
+    int total_size = 0;
+    json raw;
+
+    static A2AListTasksResult from_json(const json& j) {
+        A2AListTasksResult r;
+        r.raw = j;
+        r.next_page_token = j.value("nextPageToken", "");
+        r.page_size = j.value("pageSize", 0);
+        r.total_size = j.value("totalSize", 0);
+        if (j.contains("tasks") && j["tasks"].is_array())
+            for (const auto& t : j["tasks"]) r.tasks.push_back(A2ATask::from_json(t));
+        return r;
+    }
+};
+
 class A2AClient {
 public:
     /** base_url: A2A 服务器根 URL（如 https://host）；api_key 可选（Bearer）。 */
@@ -4645,6 +5596,10 @@ public:
     A2ATask get_task(const std::string& task_id, int history_length = 0);
     /** D105 — 取消任务（method=tasks/cancel）。返回更新后的 Task（state→canceled）。 */
     A2ATask cancel_task(const std::string& task_id);
+    /** D137 — v1.0 ListTasks 分页枚举任务。 */
+    A2AListTasksResult list_tasks(const A2AListTasksParams& params = A2AListTasksParams());
+    /** D137 — v1.0 GetExtendedAgentCard；tenant 可选。 */
+    A2AAgentCard get_extended_agent_card(const std::string& tenant = "");
     /** D105 — 轮询直到终态：每 poll_ms 调一次 get_task，最多 max_polls 次。 */
     A2ATask poll_until_terminal(const std::string& task_id, int poll_ms = 1000, int max_polls = 60);
 

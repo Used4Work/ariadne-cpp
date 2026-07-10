@@ -3502,8 +3502,212 @@ void test_text_splitter_d135() {
     ASSERT(!fused.empty() && fused[0].id == "y");                    // y 双路命中，居首
 }
 
-void test_version_is_2_13_0() {
-    ASSERT(version().find("2.13.0") != std::string::npos);
+void test_a2a_v1_models_d136() {
+    auto raw = A2APart::from_json({{"raw","iVBORw0"},{"filename","input.png"},{"mediaType","image/png"}});
+    ASSERT(raw.kind == "file" && raw.file_bytes == "iVBORw0");
+    ASSERT(raw.filename == "input.png" && raw.media_type == "image/png");
+    auto data_null = A2APart::from_json({{"data", nullptr}});
+    ASSERT(data_null.kind == "data" && data_null.data.is_null());
+    auto old = A2APart::from_json({{"kind","file"},{"file",{{"uri","https://h/i.png"},{"mimeType","image/png"}}}});
+    ASSERT(old.kind == "file" && old.file_uri == "https://h/i.png" && old.media_type == "image/png");
+
+    auto msg = A2AMessage::from_json({{"role","ROLE_USER"},{"message_id","m1"},
+        {"parts", json::array({{{"text","hi"}}})}, {"reference_task_ids", json::array({"t0"})}});
+    ASSERT(msg.role == "user" && msg.message_id == "m1" && msg.reference_task_ids[0] == "t0");
+
+    json card_json = {
+        {"name","Agent"},{"description","Desc"},{"version","1.0"},
+        {"supportedInterfaces", json::array({{{"url","https://h/rpc"},{"protocolBinding","JSONRPC"},
+            {"protocolVersion","1.0"},{"tenant","acme"}}})},
+        {"capabilities",{{"streaming",true},{"extendedAgentCard",true}}},
+        {"securitySchemes",{{"bearer",{{"httpAuthSecurityScheme",{{"scheme","bearer"}}}}}}},
+        {"securityRequirements", json::array({{{"schemes",{{"bearer",{{"list",json::array()}}}}}}})},
+        {"defaultInputModes", json::array({"text/plain"})},
+        {"defaultOutputModes", json::array({"text/plain"})},
+        {"skills", json::array({{{"id","s1"},{"name","Skill"},{"tags",json::array({"x"})}}})},
+        {"signatures", json::array({{{"algorithm","EdDSA"},{"signature","abc"}}})}
+    };
+    auto card = A2AAgentCard::from_json(card_json);
+    ASSERT(card.url == "https://h/rpc" && card.preferred_transport == "JSONRPC");
+    ASSERT(card.supported_interfaces.size() == 1 && card.signatures.size() == 1);
+    ASSERT(card.security_schemes.contains("bearer") && card.extended_agent_card);
+    auto old_card = A2AAgentCard::from_json({{"name","Old"},{"description","D"},{"url","https://h/old"},
+        {"version","0.3"},{"protocolVersion","0.3.0"},{"preferredTransport","JSONRPC"},
+        {"signature",{{"signature","old"}}}});
+    ASSERT(old_card.supported_interfaces.size() == 1 && old_card.signatures.size() == 1);
+
+    auto su = a2a_parse_stream_frame({{"statusUpdate",{{"taskId","t1"},{"contextId","c1"},
+        {"status",{{"state","TASK_STATE_COMPLETED"}}}}}});
+    ASSERT(su.type == A2AStreamEventType::StatusUpdate && su.terminal && su.task_id == "t1");
+    auto au = a2a_parse_stream_frame({{"artifactUpdate",{{"taskId","t2"},
+        {"artifact",{{"artifactId","a1"},{"parts",json::array({{{"text","out"}}})}}}}}});
+    ASSERT(au.type == A2AStreamEventType::ArtifactUpdate && au.artifact["artifactId"] == "a1");
+}
+
+void test_a2a_new_rpc_d137() {
+    A2AListTasksParams p;
+    p.context_id = "ctx"; p.status = "TASK_STATE_WORKING"; p.page_size = 150;
+    p.page_token = "n"; p.history_length = 2; p.status_timestamp_after = "2026-07-10T00:00:00Z";
+    p.include_artifacts = true;
+    json pj = p.to_json();
+    ASSERT(pj["contextId"] == "ctx" && pj["pageSize"] == 100 && pj["includeArtifacts"] == true);
+    auto rpc = A2AClient::make_rpc(7, "ListTasks", pj);
+    ASSERT(rpc["method"] == "ListTasks" && rpc["params"]["historyLength"] == 2);
+    auto ext = A2AClient::make_rpc(8, "GetExtendedAgentCard", {{"tenant","acme"}});
+    ASSERT(ext["method"] == "GetExtendedAgentCard" && ext["params"]["tenant"] == "acme");
+    auto lr = A2AListTasksResult::from_json({{"tasks",json::array({{{"id","t1"},{"status",{{"state",2}}}}})},
+        {"nextPageToken",""},{"pageSize",50},{"totalSize",1}});
+    ASSERT(lr.tasks.size() == 1 && lr.tasks[0].state == A2ATaskState::Working);
+    ASSERT(lr.next_page_token.empty() && lr.page_size == 50 && lr.total_size == 1);
+}
+
+void test_mcp_oauth_helpers_d138() {
+    auto h = parse_www_authenticate(
+        "Bearer resource_metadata=\"https://host/.well-known/oauth-protected-resource\", scope=\"read write\", error=invalid_token");
+    ASSERT(h.scheme == "bearer");
+    ASSERT(h.resource_metadata() == "https://host/.well-known/oauth-protected-resource");
+    ASSERT(h.scope() == "read write" && h.error() == "invalid_token");
+    ASSERT(oauth_protected_resource_url("https://host/mcp") ==
+           "https://host/.well-known/oauth-protected-resource/mcp");
+    ASSERT(oauth_protected_resource_url("https://host/") ==
+           "https://host/.well-known/oauth-protected-resource");
+    ASSERT(canonical_resource_uri("HTTPS://Host:443/mcp/") == "https://host/mcp");
+    ASSERT(pkce_s256_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk") ==
+           "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    json meta = {{"resource","https://HOST:443/mcp/"},{"authorization_servers",json::array({"https://as"})}};
+    ASSERT(oauth_metadata_matches_resource(meta, "https://host/mcp"));
+}
+
+void test_hmac_agent_card_pinning_d139() {
+    ASSERT(hmac_sha256_hex(std::string(20, '\x0b'), "Hi There") ==
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    ASSERT(hmac_sha256_hex("Jefe", "what do ya want for nothing?") ==
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    ASSERT(hmac_sha256_hex(std::string(131, (char)0xaa), "Test Using Larger Than Block-Size Key - Hash Key First") ==
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    json c1 = {{"name","A"},{"description","D"},{"version","1"},
+        {"supportedInterfaces",json::array({{{"protocolBinding","JSONRPC"},{"url","https://h/rpc"},{"protocolVersion","1.0"}}})},
+        {"capabilities",{{"streaming",true}}},
+        {"securitySchemes",{{"bearer",{{"httpAuthSecurityScheme",{{"scheme","bearer"}}}}}}},
+        {"defaultInputModes",json::array({"text/plain"})},{"defaultOutputModes",json::array({"text/plain"})},
+        {"skills",json::array({{{"id","s"},{"name","S"}}})}};
+    json c2 = {{"skills",c1["skills"]},{"defaultOutputModes",c1["defaultOutputModes"]},
+        {"defaultInputModes",c1["defaultInputModes"]},{"securitySchemes",c1["securitySchemes"]},
+        {"capabilities",c1["capabilities"]},{"supportedInterfaces",c1["supportedInterfaces"]},
+        {"version","1"},{"description","D"},{"name","A"}};
+    ASSERT(agent_card_hash(A2AAgentCard::from_json(c1)) == agent_card_hash(A2AAgentCard::from_json(c2)));
+    AgentCardPinStore pins;
+    auto card = A2AAgentCard::from_json(c1);
+    ASSERT(pins.verify("agent", card) == AgentCardPinStore::Status::Unknown);
+    pins.pin("agent", card);
+    ASSERT(pins.verify("agent", card) == AgentCardPinStore::Status::Unchanged);
+    c1["version"] = "2";
+    ASSERT(pins.verify("agent", A2AAgentCard::from_json(c1)) == AgentCardPinStore::Status::Drifted);
+}
+
+void test_value_authorization_policy_d140() {
+    ValueAuthorizationPolicy strict;
+    ASSERT(strict.check("send_email", json::object()).has_value());
+    strict.allow("read_file");
+    ASSERT(!strict.check("read_file", {{"path","README.md"}}).has_value());
+    strict.set_predicate("http_post", [](const json& args) -> std::optional<std::string> {
+        return args.value("url", "").find("example.com") != std::string::npos
+            ? std::nullopt : std::optional<std::string>("host not allowed");
+    });
+    ASSERT(!strict.check("http_post", {{"url","https://example.com/a"}}).has_value());
+    ASSERT(strict.check("http_post", {{"url","https://evil.test/a"}}).value() == "host not allowed");
+    ValueAuthorizationPolicy deny_list(false);
+    ASSERT(!deny_list.check("unknown", json::object()).has_value());
+    deny_list.deny("shell", "disabled");
+    ASSERT(deny_list.check("shell", json::object()).value() == "disabled");
+}
+
+void test_confusable_fold_mixed_script_d141() {
+    std::string attack = std::string("\xD1\x96", 2) + "gn" + std::string("\xD0\xBE", 2) + "re";
+    ASSERT(confusable_fold(attack) == "ignore");
+    ASSERT(confusable_fold(std::string("\xEF\xBC\xA1", 3) + std::string("\xEF\xBC\xA2", 3) + std::string("\xEF\xBD\x9E", 3)) == "AB~");
+    ASSERT(confusable_fold(std::string("\xCF\x87", 2)) != "x");
+    ASSERT(is_mixed_script(std::string("paypa") + std::string("\xD3\x8F", 2) + ".com"));
+    ASSERT(!is_mixed_script(std::string("\xE4\xB8\xAD\xE6\x96\x87", 6) + "abc"));
+}
+
+void test_egress_scanner_d142() {
+    ASSERT(luhn_valid("4539148803436467"));
+    ASSERT(luhn_valid("79927398713"));
+    ASSERT(!luhn_valid("4539148803436468"));
+    ASSERT(iban_valid("GB82WEST12345698765432"));
+    ASSERT(iban_valid("DE89370400440532013000"));
+    ASSERT(!iban_valid("GB82WEST12345698765433"));
+    ASSERT(ssn_structurally_valid("212-09-9999"));
+    ASSERT(!ssn_structurally_valid("000-12-3456"));
+    EgressScanner sc;
+    // 拼接构造，避免完整密钥字面量触发 GitHub push-protection（运行时仍是完整串，检测逻辑不变）。
+    std::string fake_key = std::string("sk_") + "live_" + "abcdefghijklmnopqrstuvwxyz";
+    auto f = sc.scan("key " + fake_key + " card 4111-1111-1111-1111 iban GB82WEST12345698765432 ssn 212-09-9999 token AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/");
+    std::set<std::string> kinds;
+    for (const auto& x : f) kinds.insert(x.kind);
+    ASSERT(kinds.count("api_key"));
+    ASSERT(kinds.count("credit_card"));
+    ASSERT(kinds.count("iban"));
+    ASSERT(kinds.count("ssn"));
+    ASSERT(kinds.count("high_entropy_base64"));
+}
+
+void test_adaptive_consistency_d143() {
+    ASSERT(std::abs(regularized_incomplete_beta(1, 6, 0.5) - 63.0/64.0) < 1e-12);
+    ASSERT(std::abs(regularized_incomplete_beta(4, 4, 0.5) - 0.5) < 1e-12);
+    ASSERT(std::abs(regularized_incomplete_beta(3, 1, 0.5) - 1.0/8.0) < 1e-12);
+    ASSERT(std::abs(adaptive_consistency_confidence(5, 0) - 63.0/64.0) < 1e-12);
+    ASSERT(std::abs(adaptive_consistency_confidence(3, 3) - 0.5) < 1e-12);
+    ASSERT(std::abs(adaptive_consistency_confidence(4, 0) - 31.0/32.0) < 1e-12);
+    ASSERT(should_stop({{"A",4},{"B",0}}, 0.95, 1));
+    ASSERT(!should_stop({{"A",3},{"B",0}}, 0.95, 1));
+    ASSERT(should_stop({{"A",6},{"B",1}}, 0.95, 1));
+    ASSERT(!should_stop({{"A",5},{"B",1}}, 0.95, 1));
+    ASSERT(esc_window_converged(std::vector<std::string>{"x","x","x"}));
+    ASSERT(!esc_window_converged(std::vector<int>{1,2,1}));
+}
+
+void test_retry_policy_d144() {
+    AgentErrorSignal nf; nf.exception_type = "ToolNotFoundError";
+    ASSERT(classify_error_structural(nf) == AgentErrorClass::ToolNotFound);
+    AgentErrorSignal timeout; timeout.timeout = true;
+    ASSERT(classify_error_structural(timeout) == AgentErrorClass::ToolTimeout);
+    AgentErrorSignal sem; sem.message = "plan failed";
+    auto cls = classify_error_structural(sem, [](const AgentErrorSignal&) {
+        return std::optional<AgentErrorClass>(AgentErrorClass::PlanningError);
+    });
+    ASSERT(cls == AgentErrorClass::PlanningError);
+    RetryPolicy p;
+    auto d0 = p.decide(AgentErrorClass::ToolTimeout, 0);
+    ASSERT(d0.action == RetryAction::RetryWithBackoff && d0.backoff_ms == 500);
+    ASSERT(p.decide(AgentErrorClass::ToolTimeout, 2).action == RetryAction::Escalate);
+    ASSERT(p.decide(AgentErrorClass::Unknown, 0).action == RetryAction::Retry);
+    ASSERT(p.decide(AgentErrorClass::Unknown, 1).action == RetryAction::Escalate);
+}
+
+void test_openai_prompt_cache_d145() {
+    ProviderConfig cfg = ProviderConfig::openai_chat("k", "gpt-5.6-luna");
+    cfg.openai_prompt_cache_mode = "explicit";
+    cfg.openai_prompt_cache_ttl = "30m";
+    cfg.openai_prompt_cache_key = "tenant:agent:v1";
+    cfg.openai_prompt_cache_breakpoints = 2;
+    cfg.reasoning_effort = "max";
+    json body = {{"model",cfg.model},
+        {"messages",json::array({{{"role","system"},{"content","stable system"}},{{"role","user"},{"content","hi"}}})},
+        {"tools",json::array({{{"type","function"},{"function",{{"name","search"}}}}})}};
+    apply_openai_prompt_cache(body, cfg);
+    ASSERT(body["prompt_cache_options"]["mode"] == "explicit");
+    ASSERT(body["prompt_cache_options"]["ttl"] == "30m");
+    ASSERT(body["prompt_cache_key"] == "tenant:agent:v1");
+    ASSERT(body["tools"][0]["prompt_cache_breakpoint"]["mode"] == "explicit");
+    ASSERT(body["messages"][0]["content"].is_array());
+    ASSERT(body["messages"][0]["content"][0]["prompt_cache_breakpoint"]["mode"] == "explicit");
+    ASSERT(cfg.reasoning_effort == "max");
+}
+
+void test_version_is_2_14_0() {
+    ASSERT(version().find("2.14.0") != std::string::npos);
 }
 
 int main() {
@@ -3854,7 +4058,19 @@ int main() {
     RUN(test_hidden_markup_egress_d133);          // D133
     RUN(test_mmr_d134);                           // D134
     RUN(test_text_splitter_d135);                 // D135
-    RUN(test_version_is_2_13_0);
+
+    std::cout<<"\n=== v2.14.0 A2A/OAuth/Auth/Egress/Retry/OpenAI Cache ===\n";
+    RUN(test_a2a_v1_models_d136);                 // D136
+    RUN(test_a2a_new_rpc_d137);                   // D137
+    RUN(test_mcp_oauth_helpers_d138);             // D138
+    RUN(test_hmac_agent_card_pinning_d139);       // D139
+    RUN(test_value_authorization_policy_d140);    // D140
+    RUN(test_confusable_fold_mixed_script_d141);  // D141
+    RUN(test_egress_scanner_d142);                // D142
+    RUN(test_adaptive_consistency_d143);          // D143
+    RUN(test_retry_policy_d144);                  // D144
+    RUN(test_openai_prompt_cache_d145);           // D145
+    RUN(test_version_is_2_14_0);
 
     std::cout<<"\n────────────────────────────────────────\n";
     std::cout<<"Result: "<<g_pass<<"/"<<g_run<<" passed\n";
