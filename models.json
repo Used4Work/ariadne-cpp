@@ -1,5 +1,5 @@
 {
-  "_updated": "2026-07-20",
+  "_updated": "2026-07-27",
   "providers": {
     "anthropic": {
       "api_endpoint": "https://api.anthropic.com/v1/messages",
@@ -216,6 +216,31 @@
         },
         {
           "id": "openai/o1-preview",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "openai/o3",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "openai/o3-mini",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "openai/o4-mini",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "openai/text-embedding-3-large",
+          "role": "subagent",
+          "note": "auto"
+        },
+        {
+          "id": "openai/text-embedding-3-small",
           "role": "subagent",
           "note": "auto"
         }
