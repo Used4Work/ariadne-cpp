@@ -1,5 +1,5 @@
 {
-  "_updated": "2026-08-24",
+  "_updated": "2026-08-31",
   "providers": {
     "anthropic": {
       "api_endpoint": "https://api.anthropic.com/v1/messages",
